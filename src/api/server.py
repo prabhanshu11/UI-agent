@@ -272,51 +272,148 @@ async def amazon_add_to_cart(request: AmazonAddToCartRequest):
 @app.get("/amazon/cart")
 async def amazon_get_cart():
     """
-    Get Amazon cart contents.
+    Get Amazon cart contents (both Regular and Fresh carts combined).
 
-    Navigates to cart page and extracts items.
+    Returns items from:
+    1. Regular Amazon cart (active items only, excludes "Saved for Later")
+    2. Amazon Fresh cart (if any items exist)
     """
     browser = await get_browser()
 
     try:
+        # First, get regular Amazon cart
         await browser.navigate("https://www.amazon.in/gp/cart/view.html", wait_until="networkidle")
 
-        items_script = """
+        # IMPORTANT: Scope to #sc-active-cart to exclude "Saved for Later" items
+        active_cart_script = """
         () => {
             const items = [];
-            const cartItems = document.querySelectorAll('[data-asin]');
+            // Only look within the active cart container, NOT saved-for-later
+            const activeCart = document.querySelector('#sc-active-cart');
+            if (!activeCart) {
+                return { items: [], isEmpty: true };
+            }
+
+            const cartItems = activeCart.querySelectorAll('[data-asin]');
             cartItems.forEach(item => {
                 const asin = item.getAttribute('data-asin');
                 if (asin) {
-                    const titleEl = item.querySelector('.sc-product-title');
-                    const priceEl = item.querySelector('.sc-product-price');
-                    const quantityEl = item.querySelector('.sc-quantity-textfield input');
+                    const titleEl = item.querySelector('.sc-product-title, .a-truncate-cut');
+                    const priceEl = item.querySelector('.sc-product-price, .sc-price');
+                    const quantityEl = item.querySelector('.sc-quantity-textfield input, select[name*="quantity"]');
+                    const imageEl = item.querySelector('.sc-product-image img');
+
                     items.push({
                         asin: asin,
                         title: titleEl ? titleEl.textContent.trim() : '',
                         price: priceEl ? priceEl.textContent.trim() : '',
-                        quantity: quantityEl ? parseInt(quantityEl.value) : 1,
+                        quantity: quantityEl ? parseInt(quantityEl.value || quantityEl.selectedOptions?.[0]?.value || '1') : 1,
+                        image_url: imageEl ? imageEl.src : null,
                     });
                 }
             });
-            return items;
+            return { items: items, isEmpty: items.length === 0 };
         }
         """
+        regular_result = await browser.evaluate(active_cart_script)
+        regular_items = regular_result.get("items", [])
 
-        items = await browser.evaluate(items_script)
-
+        # Get regular cart subtotal
         subtotal_script = """
         () => {
             const el = document.querySelector('#sc-subtotal-amount-activecart');
             return el ? el.textContent.trim() : null;
         }
         """
-        subtotal = await browser.evaluate(subtotal_script)
+        regular_subtotal = await browser.evaluate(subtotal_script)
+
+        # Also get "Saved for Later" items separately for reference
+        saved_for_later_script = """
+        () => {
+            const items = [];
+            const savedCart = document.querySelector('#sc-saved-cart');
+            if (!savedCart) {
+                return items;
+            }
+
+            const cartItems = savedCart.querySelectorAll('[data-asin]');
+            cartItems.forEach(item => {
+                const asin = item.getAttribute('data-asin');
+                if (asin) {
+                    const titleEl = item.querySelector('.sc-product-title, .a-truncate-cut');
+                    const priceEl = item.querySelector('.sc-product-price, .sc-price');
+                    const imageEl = item.querySelector('.sc-product-image img');
+
+                    items.push({
+                        asin: asin,
+                        title: titleEl ? titleEl.textContent.trim() : '',
+                        price: priceEl ? priceEl.textContent.trim() : '',
+                        image_url: imageEl ? imageEl.src : null,
+                    });
+                }
+            });
+            return items;
+        }
+        """
+        saved_for_later_items = await browser.evaluate(saved_for_later_script)
+
+        # Now get Amazon Fresh cart
+        await browser.navigate("https://www.amazon.in/gp/cart/view.html?ref=nav_cart_fresh", wait_until="networkidle")
+
+        fresh_cart_script = """
+        () => {
+            const items = [];
+            // Fresh cart may use different selectors
+            const freshItems = document.querySelectorAll('[data-asin], .fresh-cart-item, .sc-list-item');
+            const activeCart = document.querySelector('#sc-active-cart, .sc-list-body');
+
+            if (activeCart) {
+                const cartItems = activeCart.querySelectorAll('[data-asin]');
+                cartItems.forEach(item => {
+                    const asin = item.getAttribute('data-asin');
+                    if (asin) {
+                        const titleEl = item.querySelector('.sc-product-title, .a-truncate-cut, .sc-product-link');
+                        const priceEl = item.querySelector('.sc-product-price, .sc-price');
+                        const quantityEl = item.querySelector('.sc-quantity-textfield input, select[name*="quantity"]');
+                        const imageEl = item.querySelector('.sc-product-image img');
+
+                        items.push({
+                            asin: asin,
+                            title: titleEl ? titleEl.textContent.trim() : '',
+                            price: priceEl ? priceEl.textContent.trim() : '',
+                            quantity: quantityEl ? parseInt(quantityEl.value || quantityEl.selectedOptions?.[0]?.value || '1') : 1,
+                            image_url: imageEl ? imageEl.src : null,
+                            is_fresh: true,
+                        });
+                    }
+                });
+            }
+            return items;
+        }
+        """
+        fresh_items = await browser.evaluate(fresh_cart_script)
+
+        # Get Fresh cart subtotal
+        fresh_subtotal = await browser.evaluate(subtotal_script)
 
         return {
-            "items": items,
-            "subtotal": subtotal,
-            "item_count": len(items),
+            "regular_cart": {
+                "items": regular_items,
+                "subtotal": regular_subtotal,
+                "item_count": len(regular_items),
+                "cart_type": "regular",
+            },
+            "fresh_cart": {
+                "items": fresh_items,
+                "subtotal": fresh_subtotal,
+                "item_count": len(fresh_items),
+                "cart_type": "fresh",
+            },
+            "saved_for_later": {
+                "items": saved_for_later_items,
+                "item_count": len(saved_for_later_items),
+            },
+            "combined_item_count": len(regular_items) + len(fresh_items),
         }
 
     except Exception as e:
@@ -419,4 +516,181 @@ async def amazon_search(query: str, limit: int = 10):
 
     except Exception as e:
         logger.error("Failed to search: %s", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/amazon/orders/cancelled")
+async def amazon_get_cancelled_orders(limit: int = 20):
+    """
+    Get cancelled orders from Amazon order history.
+
+    Returns full details including:
+    - Order items
+    - Cancellation reason
+    - Cancellation date
+    - Payment status
+    - Refund information
+    """
+    browser = await get_browser()
+
+    try:
+        # Navigate to cancelled orders page
+        cancelled_url = "https://www.amazon.in/gp/your-account/order-history?orderFilter=cancelled"
+        await browser.navigate(cancelled_url, wait_until="networkidle")
+
+        # Extract cancelled orders
+        orders_script = f"""
+        () => {{
+            const orders = [];
+            const orderCards = document.querySelectorAll('.order-card, .order, [data-order-id]');
+            let count = 0;
+
+            // Try different order container selectors
+            const containers = document.querySelectorAll('.order-card, .a-box-group.order, .yo-container');
+
+            containers.forEach(container => {{
+                if (count >= {limit}) return;
+
+                // Order ID
+                const orderIdEl = container.querySelector('[data-order-id], .yohtmlc-order-id span:last-child, a[href*="order-details"]');
+                const orderId = orderIdEl ?
+                    (orderIdEl.getAttribute('data-order-id') || orderIdEl.textContent.trim().replace('Order #', '').trim()) :
+                    null;
+
+                if (!orderId) return;
+
+                // Order date
+                const dateEl = container.querySelector('.order-info .value, .yohtmlc-order-date .value, span[class*="date"]');
+                const orderDate = dateEl ? dateEl.textContent.trim() : null;
+
+                // Order total
+                const totalEl = container.querySelector('.order-info .value:last-of-type, .yohtmlc-order-total .value');
+                const total = totalEl ? totalEl.textContent.trim() : null;
+
+                // Items in order
+                const items = [];
+                const itemEls = container.querySelectorAll('.shipment .a-link-normal[href*="/gp/product/"], .yohtmlc-item, .product-image');
+                itemEls.forEach(itemEl => {{
+                    const titleEl = itemEl.closest('.shipment, .item-box')?.querySelector('.a-link-normal');
+                    const imgEl = itemEl.closest('.shipment, .item-box')?.querySelector('img');
+                    const asinMatch = itemEl.href?.match(/\/dp\/([A-Z0-9]+)/);
+
+                    items.push({{
+                        title: titleEl ? titleEl.textContent.trim() : '',
+                        asin: asinMatch ? asinMatch[1] : null,
+                        image_url: imgEl ? imgEl.src : null,
+                    }});
+                }});
+
+                // Cancellation info
+                const statusEl = container.querySelector('.order-status-message, [class*="cancelled"], .a-color-error');
+                const cancellationStatus = statusEl ? statusEl.textContent.trim() : 'Cancelled';
+
+                // Refund info
+                const refundEl = container.querySelector('[class*="refund"], .a-color-success');
+                const refundInfo = refundEl ? refundEl.textContent.trim() : null;
+
+                orders.push({{
+                    order_id: orderId,
+                    order_date: orderDate,
+                    total: total,
+                    items: items,
+                    status: 'cancelled',
+                    cancellation_info: cancellationStatus,
+                    refund_info: refundInfo,
+                }});
+
+                count++;
+            }});
+
+            return orders;
+        }}
+        """
+
+        orders = await browser.evaluate(orders_script)
+
+        # For each order, try to get detailed cancellation info
+        detailed_orders = []
+        for order in orders[:5]:  # Limit detail fetching to first 5 to avoid slowdown
+            if order.get("order_id"):
+                try:
+                    detail_url = f"https://www.amazon.in/gp/your-account/order-details?orderID={order['order_id']}"
+                    await browser.navigate(detail_url, wait_until="networkidle")
+
+                    detail_script = """
+                    () => {
+                        // Get cancellation reason
+                        const reasonEl = document.querySelector('[class*="cancellation-reason"], .a-alert-content');
+                        const reason = reasonEl ? reasonEl.textContent.trim() : null;
+
+                        // Get cancelled date
+                        const cancelDateEl = document.querySelector('[class*="cancel-date"], .order-date-invoice-item');
+                        const cancelDate = cancelDateEl ? cancelDateEl.textContent.trim() : null;
+
+                        // Payment method
+                        const paymentEl = document.querySelector('.payment-method, [class*="payment"]');
+                        const paymentMethod = paymentEl ? paymentEl.textContent.trim() : null;
+
+                        // Refund status
+                        const refundStatusEl = document.querySelector('[class*="refund-status"], .a-color-success');
+                        const refundStatus = refundStatusEl ? refundStatusEl.textContent.trim() : null;
+
+                        // Refund amount
+                        const refundAmtEl = document.querySelector('[class*="refund-amount"], .grand-total-price');
+                        const refundAmount = refundAmtEl ? refundAmtEl.textContent.trim() : null;
+
+                        // Cancelled by
+                        const cancelledByEl = document.querySelector('[class*="cancelled-by"]');
+                        const cancelledBy = cancelledByEl ? cancelledByEl.textContent.trim() : null;
+
+                        // All items with details
+                        const items = [];
+                        const itemRows = document.querySelectorAll('.shipment-item, .a-fixed-left-grid');
+                        itemRows.forEach(row => {
+                            const titleEl = row.querySelector('.a-link-normal[href*="/gp/product/"]');
+                            const priceEl = row.querySelector('.a-color-price, .item-price');
+                            const qtyEl = row.querySelector('[class*="quantity"]');
+                            const imgEl = row.querySelector('img');
+
+                            if (titleEl) {
+                                const asinMatch = titleEl.href?.match(/\/(?:dp|gp\/product)\/([A-Z0-9]+)/);
+                                items.push({
+                                    title: titleEl.textContent.trim(),
+                                    asin: asinMatch ? asinMatch[1] : null,
+                                    price: priceEl ? priceEl.textContent.trim() : null,
+                                    quantity: qtyEl ? parseInt(qtyEl.textContent.replace(/[^0-9]/g, '') || '1') : 1,
+                                    image_url: imgEl ? imgEl.src : null,
+                                });
+                            }
+                        });
+
+                        return {
+                            cancellation_reason: reason,
+                            cancelled_date: cancelDate,
+                            cancelled_by: cancelledBy,
+                            payment_method: paymentMethod,
+                            refund_status: refundStatus,
+                            refund_amount: refundAmount,
+                            items: items.length > 0 ? items : null,
+                        };
+                    }
+                    """
+
+                    details = await browser.evaluate(detail_script)
+                    order.update({k: v for k, v in details.items() if v is not None})
+                except Exception as e:
+                    logger.warning("Failed to get details for order %s: %s", order.get("order_id"), str(e))
+
+            detailed_orders.append(order)
+
+        # Add remaining orders without extra details
+        detailed_orders.extend(orders[5:])
+
+        return {
+            "cancelled_orders": detailed_orders,
+            "count": len(detailed_orders),
+        }
+
+    except Exception as e:
+        logger.error("Failed to get cancelled orders: %s", str(e))
         raise HTTPException(status_code=500, detail=str(e))
