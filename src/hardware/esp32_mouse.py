@@ -195,6 +195,9 @@ class ESP32Mouse:
     ):
         """Draw a circle pattern.
 
+        WARNING: This uses estimated position. Use safe_circle() for guaranteed
+        on-screen movement.
+
         Args:
             radius: Circle radius in pixels (200+ recommended for visibility).
             steps: Number of segments (24 = 15° per step, good visibility).
@@ -226,6 +229,71 @@ class ESP32Mouse:
                     time.sleep(delay + random.uniform(-0.01, 0.02))
                 else:
                     time.sleep(delay)
+
+    def safe_circle(
+        self,
+        radius: int = 200,
+        steps: int = 24,
+        rotations: int = 1,
+        delay: float = 0.05
+    ):
+        """Draw a circle guaranteed to stay on screen.
+
+        This function:
+        1. First pushes cursor to top-left corner (known position)
+        2. Moves to screen center
+        3. Draws circle with radius clamped to fit within screen
+
+        Args:
+            radius: Desired circle radius (will be reduced if too large).
+            steps: Number of segments.
+            rotations: Number of complete circles.
+            delay: Delay between movements.
+        """
+        # Step 1: Force cursor to top-left corner
+        # Send massive negative movement to guarantee hitting corner
+        print("Calibrating to top-left corner...")
+        overshoot = 3000  # More than any reasonable screen
+        self._send_chunked(-overshoot, -overshoot)
+        time.sleep(0.3)
+
+        # Now we KNOW cursor is at top-left (0,0 clamped by Windows)
+        self.estimated_x = 0
+        self.estimated_y = 0
+
+        # Step 2: Move to screen center
+        center_x = self.screen_width // 2
+        center_y = self.screen_height // 2
+        print(f"Moving to center ({center_x}, {center_y})...")
+        self._send_chunked(center_x, center_y)
+        time.sleep(0.2)
+
+        self.estimated_x = center_x
+        self.estimated_y = center_y
+
+        # Step 3: Clamp radius to fit within screen from center
+        max_radius_x = min(center_x, self.screen_width - center_x) - 50  # 50px margin
+        max_radius_y = min(center_y, self.screen_height - center_y) - 50
+        max_radius = min(max_radius_x, max_radius_y)
+
+        if radius > max_radius:
+            print(f"Reducing radius from {radius} to {max_radius} to fit screen")
+            radius = max_radius
+
+        # Step 4: Draw circle (no boundary checking needed - we're centered)
+        print(f"Drawing circle: radius={radius}, steps={steps}, rotations={rotations}")
+        for rotation in range(rotations):
+            for i in range(steps):
+                angle1 = (2 * math.pi * i) / steps
+                angle2 = (2 * math.pi * (i + 1)) / steps
+
+                dx = int(radius * (math.cos(angle2) - math.cos(angle1)))
+                dy = int(radius * (math.sin(angle2) - math.sin(angle1)))
+
+                self._send_raw(dx, dy)
+                time.sleep(delay)
+
+        print("Circle complete!")
 
     def calibrate_to_corner(self, corner: str = 'top_left'):
         """Calibrate position by moving to a known corner.
