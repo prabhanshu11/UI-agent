@@ -5,5 +5,6 @@ Provides interfaces for USB devices, capture cards, and other hardware periphera
 
 from .usb_capture import USBCaptureCard
 from .esp32_mouse import ESP32Mouse
+from .pi_keyboard import PiKeyboardClient
 
-__all__ = ["USBCaptureCard", "ESP32Mouse"]
+__all__ = ["USBCaptureCard", "ESP32Mouse", "PiKeyboardClient"]
