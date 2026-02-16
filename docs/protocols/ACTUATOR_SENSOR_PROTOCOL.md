@@ -386,6 +386,130 @@ class GeminiVisionHook(AgentHook):
 
 ---
 
+## Implementation: ESP32 Mouse + HDMI Capture (Cursor Detection)
+
+A concrete application of ASMP for detecting cursor position on a multi-monitor
+Windows system using an ESP32 BT HID mouse as the actuator and a USB HDMI
+capture card as the sensor.
+
+### Problem Statement
+
+The ESP32 HID mouse sends relative (dx, dy) movements. On multi-monitor Windows,
+the cursor may be on a different monitor than the one captured by HDMI. We need
+to locate the cursor on the captured screen without absolute positioning.
+
+### Actuator: ESP32 BT HID Mouse
+
+```python
+class ESP32MouseActuator:
+    """ASMP actuator adapter for ESP32Mouse."""
+
+    def __init__(self, mouse: ESP32Mouse):
+        self.mouse = mouse
+
+    def get_position(self) -> Position:
+        x, y = self.mouse.get_position()
+        return Position(coords=(float(x), float(y)))
+
+    def move_continuous(self, velocity: Vector, duration: float):
+        # Move in discrete steps simulating continuous motion
+        dx = int(velocity[0] * duration)
+        dy = int(velocity[1] * duration)
+        self.mouse._send_chunked(dx, dy)
+
+    def move_absolute(self, position: Position):
+        # Relative mouse — uses estimated position for delta calc
+        self.mouse.move_to(int(position.coords[0]), int(position.coords[1]))
+
+    def stop(self):
+        pass  # Relative mouse — no continuous motion to stop
+
+    def get_bounds(self) -> Bounds:
+        # Virtual desktop bounds (may span multiple monitors)
+        return Bounds(
+            min_pos=Position((0.0, 0.0)),
+            max_pos=Position((5000.0, 3000.0)),  # Conservative max
+            dimensions=2
+        )
+```
+
+### Sensor: USB HDMI Capture Card
+
+```python
+class HDMISensor:
+    """ASMP sensor adapter for USB HDMI capture via ffmpeg."""
+
+    def __init__(self, device: str = "/dev/video0",
+                 width: int = 1920, height: int = 1080):
+        self.device = device
+        self.width = width
+        self.height = height
+
+    def capture_passive(self) -> SensorReading:
+        frame = self._capture_frame()
+        return SensorReading(
+            timestamp=time.time(), position=None,
+            data=frame, quality="passive"
+        )
+
+    def capture_active(self) -> SensorReading:
+        time.sleep(0.3)  # Wait for stability after movement
+        # Use 3-frame capture for stable output
+        frame = self._capture_frame(frames=3)
+        return SensorReading(
+            timestamp=time.time(), position=None,
+            data=frame, quality="active"
+        )
+
+    def _capture_frame(self, frames: int = 1) -> np.ndarray:
+        subprocess.run([
+            "ffmpeg", "-y", "-f", "v4l2",
+            "-input_format", "yuyv422",
+            "-video_size", f"{self.width}x{self.height}",
+            "-i", self.device,
+            "-frames:v", str(frames), "-update", "1",
+            "/tmp/hdmi_frame.png"
+        ], capture_output=True)
+        return np.array(Image.open("/tmp/hdmi_frame.png"))
+```
+
+### Detection Strategy: Frame Subtraction
+
+Instead of using LLM vision (overkill for cursor detection), this uses
+deterministic frame subtraction — the cursor is the only thing that changes
+between frames when we control the movement:
+
+```
+Frame 1 (before move)    Frame 2 (after +50,+50)    |Frame 2 - Frame 1|
+┌─────────────────────┐  ┌─────────────────────┐    ┌─────────────────┐
+│                     │  │                     │    │                 │
+│     ↑               │  │                     │    │     ∎ ← cursor  │
+│     cursor          │  │         ↑           │    │       was here  │
+│                     │  │         cursor       │    │         ∎ ← now│
+│                     │  │                     │    │                 │
+└─────────────────────┘  └─────────────────────┘    └─────────────────┘
+```
+
+This maps to ASMP phases:
+- **Coarse sweep**: Move cursor right in 200px steps, check frame-diff at each
+- **Binary refinement**: Not needed — frame-diff gives exact pixel coordinates
+- **Lock & track**: Periodic re-verification via frame-diff before clicks
+
+### Usage
+
+```python
+from src.hardware.cursor_locator import locate_cursor, verified_click
+from src.hardware.esp32_mouse import ESP32Mouse
+
+mouse = ESP32Mouse('/dev/ttyUSB0')
+pos = locate_cursor(mouse)  # Sweep + frame-diff
+if pos:
+    print(f"Cursor found at {pos} on HDMI screen")
+    verified_click(mouse, target_x, target_y)  # Move, verify, click
+```
+
+---
+
 ## Integration Points
 
 ### 1. UI-Agent Action Library
