@@ -5,6 +5,21 @@ Provides mouse control via ESP32 Bluetooth HID emulation with:
 - Position tracking (estimated, since HID mouse is relative-only)
 - Chunked movement for values > 127 (HID limit)
 - Circle and pattern movements
+
+MULTI-MONITOR WARNING:
+    This class assumes screen_width/height maps to a single monitor. On Windows
+    with multiple monitors, HID relative movements operate on the entire virtual
+    desktop (e.g. 3840x1080 for two side-by-side 1920x1080 monitors).
+
+    calibrate_to_corner() will park the cursor at the virtual desktop edge, NOT
+    necessarily the HDMI-captured monitor. If the captured display is the right
+    monitor, the cursor ends up on the wrong screen entirely.
+
+    For multi-monitor setups, use cursor_locator.locate_cursor() which performs
+    a frame-diff sweep across the virtual desktop to find the cursor on the
+    HDMI-captured screen, then calls set_position() with the correct offset.
+
+    See also: docs/MOUSE_CONTROL_LEARNINGS.md
 """
 
 import serial
