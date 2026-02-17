@@ -1,4 +1,4 @@
-"""Multi-Storyline Logger - Agent Zero Compatible.
+"""Multi-Storyline Logger - Agent Zero Compatible + OpenTelemetry.
 
 Tracks multiple parallel narratives of agent activity:
 - Main storyline: Primary task flow
@@ -6,17 +6,32 @@ Tracks multiple parallel narratives of agent activity:
 - Knowledge storyline: Learnings and insights
 - Technical storyline: Code, commands, errors
 
+OTel integration adds trace/span semantics on top — each "experience"
+is an OTel trace, each "step" is a span. Spans nest within storylines,
+and timeline.jsonl entries include trace_id/span_id for correlation.
+
 Based on Agent Zero's hierarchical agent communication patterns.
 https://github.com/agent0ai/agent-zero
 """
 
 import json
 import os
+import socket
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Any
 from enum import Enum
+
+from opentelemetry import trace, context
+from opentelemetry.sdk.trace import TracerProvider, ReadableSpan
+from opentelemetry.sdk.trace.export import (
+    SimpleSpanProcessor,
+    SpanExporter,
+    SpanExportResult,
+)
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.trace import StatusCode
 
 
 class StorylineType(str, Enum):
@@ -52,14 +67,56 @@ class StorylineEntry:
         }
 
 
+class _FileSpanExporter(SpanExporter):
+    """Exports OTel spans as JSON lines to a file alongside storyline entries."""
+
+    def __init__(self, log_dir: Path):
+        self._log_dir = log_dir
+
+    def export(self, spans: list[ReadableSpan]) -> SpanExportResult:
+        spans_file = self._log_dir / "spans.jsonl"
+        with open(spans_file, "a") as f:
+            for span in spans:
+                ctx = span.get_span_context()
+                record = {
+                    "type": "otel_span",
+                    "trace_id": format(ctx.trace_id, "032x"),
+                    "span_id": format(ctx.span_id, "016x"),
+                    "parent_span_id": (
+                        format(span.parent.span_id, "016x")
+                        if span.parent else None
+                    ),
+                    "name": span.name,
+                    "start_time": span.start_time,
+                    "end_time": span.end_time,
+                    "duration_ms": (
+                        (span.end_time - span.start_time) / 1_000_000
+                        if span.end_time and span.start_time else None
+                    ),
+                    "status": span.status.status_code.name,
+                    "attributes": dict(span.attributes) if span.attributes else {},
+                }
+                f.write(json.dumps(record) + "\n")
+        return SpanExportResult.SUCCESS
+
+    def shutdown(self):
+        pass
+
+
 class StorylineLogger:
-    """Multi-storyline logger compatible with Agent Zero patterns.
+    """Multi-storyline logger with OpenTelemetry trace/span integration.
 
     Maintains parallel narratives:
     - Main storyline tracks primary goal progress
     - Knowledge storyline captures learnings for future use
     - Technical storyline records commands, outputs, errors
     - Agent storyline tracks sub-agent dispatches and returns
+
+    OTel integration:
+    - start_experience() creates a root trace span
+    - start_step() creates child spans within the experience
+    - end_step() closes spans with status and attributes
+    - All storyline entries include trace_id/span_id when a span is active
     """
 
     def __init__(
@@ -67,7 +124,7 @@ class StorylineLogger:
         experience_dir: Path,
         session_id: Optional[str] = None
     ):
-        """Initialize logger.
+        """Initialize logger with OTel tracing.
 
         Args:
             experience_dir: Directory to store logs
@@ -86,6 +143,109 @@ class StorylineLogger:
         # Track active context
         self.current_task: Optional[str] = None
         self.active_agents: dict[str, str] = {}  # agent_name -> current_task
+
+        # Initialize OpenTelemetry
+        resource = Resource.create({
+            "service.name": "ui-agent",
+            "host.name": socket.gethostname(),
+            "session.id": self.session_id,
+        })
+        self._tracer_provider = TracerProvider(resource=resource)
+        self._tracer_provider.add_span_processor(
+            SimpleSpanProcessor(_FileSpanExporter(self.log_dir))
+        )
+        self._tracer = self._tracer_provider.get_tracer("ui.experience")
+
+        # Track current OTel context for automatic span parenting
+        self._otel_context: Optional[context.Context] = None
+
+    def start_experience(self, name: str, attributes: dict | None = None) -> trace.Span:
+        """Start a new experience trace (root span).
+
+        Args:
+            name: Experience name (e.g., "pair_k380")
+            attributes: Optional span attributes
+
+        Returns:
+            OTel Span — caller should store this and pass to end_step()
+        """
+        span = self._tracer.start_span(
+            name=name,
+            attributes=attributes or {},
+        )
+        # Store the context so child spans auto-parent
+        self._otel_context = trace.set_span_in_context(span)
+
+        # Also log to main storyline
+        self.log_main("start", f"Starting experience: {name}",
+                       agent_name="navigator")
+        return span
+
+    def start_step(
+        self,
+        name: str,
+        parent: trace.Span | None = None,
+        attributes: dict | None = None,
+    ) -> trace.Span:
+        """Start a step span within an experience.
+
+        Args:
+            name: Step name (e.g., "Open Start Menu")
+            parent: Explicit parent span. If None, parents to current context.
+            attributes: Optional span attributes
+
+        Returns:
+            OTel Span for this step
+        """
+        ctx = self._otel_context
+        if parent is not None:
+            ctx = trace.set_span_in_context(parent)
+
+        span = self._tracer.start_span(
+            name=name,
+            context=ctx,
+            attributes=attributes or {},
+        )
+        # Update context so nested calls auto-parent to this step
+        self._otel_context = trace.set_span_in_context(span)
+        return span
+
+    def end_step(
+        self,
+        span: trace.Span,
+        status: str = "OK",
+        attributes: dict | None = None,
+    ):
+        """End a step span with status and final attributes.
+
+        Args:
+            span: The span to end
+            status: "OK", "ERROR", or "UNSET"
+            attributes: Final attributes to add before closing
+        """
+        if attributes:
+            for k, v in attributes.items():
+                span.set_attribute(k, v)
+
+        status_code = {
+            "OK": StatusCode.OK,
+            "ERROR": StatusCode.ERROR,
+        }.get(status, StatusCode.UNSET)
+        span.set_status(status_code)
+        span.end()
+
+        # Restore parent context if possible
+        parent_ctx = span.parent
+        if parent_ctx:
+            self._otel_context = trace.set_span_in_context(
+                trace.NonRecordingSpan(parent_ctx)
+            )
+
+    def shutdown(self):
+        """Flush and shut down the OTel tracer provider."""
+        self._tracer_provider.shutdown()
+
+    # ── Existing storyline API (unchanged signatures) ─────────────
 
     def log(
         self,
@@ -118,6 +278,14 @@ class StorylineLogger:
             parent_entry_id=parent_entry.entry_id if parent_entry else None,
             agent_name=agent_name
         )
+
+        # Inject OTel trace/span IDs into metadata when a span is active
+        if self._otel_context is not None:
+            current_span = trace.get_current_span(self._otel_context)
+            span_ctx = current_span.get_span_context()
+            if span_ctx.is_valid:
+                entry.metadata["trace_id"] = format(span_ctx.trace_id, "032x")
+                entry.metadata["span_id"] = format(span_ctx.span_id, "016x")
 
         self.storylines[storyline.value].append(entry)
         self._write_entry(entry)
@@ -309,9 +477,15 @@ class StorylineLogger:
             if entries:
                 output += f"## {storyline_type.value.title()} Storyline\n\n"
                 for entry in entries:
-                    output += f"- **{entry.timestamp}** [{entry.event_type}]: {entry.content}\n"
+                    # Include span info if present
+                    span_info = ""
+                    if "trace_id" in entry.metadata:
+                        span_info = f" [span:{entry.metadata['span_id'][:8]}]"
+                    output += f"- **{entry.timestamp}** [{entry.event_type}]{span_info}: {entry.content}\n"
                     if entry.metadata:
                         for k, v in entry.metadata.items():
+                            if k in ("trace_id", "span_id"):
+                                continue  # Already shown in span_info
                             if isinstance(v, str) and len(v) > 100:
                                 v = v[:100] + "..."
                             output += f"  - {k}: {v}\n"
@@ -336,42 +510,22 @@ if __name__ == "__main__":
         session_id="demo_001"
     )
 
-    # Log some events
-    main_entry = logger.log_main("start", "Beginning screenshot extraction task")
+    # Demo OTel integration
+    experience_span = logger.start_experience("demo_experience", {
+        "experience.type": "test",
+    })
 
-    logger.log_technical(
-        "command",
-        "Starting ffmpeg recording",
-        command="ffmpeg -f v4l2 -i /dev/video4 ...",
-    )
+    step1 = logger.start_step("Step 1: Capture Screen")
+    logger.log_perception("screenshot", "Captured desktop screenshot",
+                          screenshot_path="/tmp/frame_001.png")
+    logger.end_step(step1, status="OK")
 
-    logger.log_agent(
-        "screenshot-extractor",
-        "dispatched",
-        "Dispatching screenshot extraction",
-        task="Extract keyframes from recording"
-    )
+    step2 = logger.start_step("Step 2: Find Element")
+    logger.log_perception("element_search", "Looking for Settings button")
+    logger.end_step(step2, status="OK", attributes={"element.found": True})
 
-    logger.log_perception(
-        "screenshot",
-        "Captured Windows 11 desktop - blue wallpaper visible",
-        screenshot_path="/tmp/frame_001.png"
-    )
-
-    logger.log_knowledge(
-        "USB capture card works reliably at 1920x1080 20fps",
-        applies_to=["video_capture", "usb_hdmi"],
-        confidence=0.95
-    )
-
-    logger.log_agent(
-        "screenshot-extractor",
-        "completed",
-        "Extracted 5 keyframes",
-        result="5 frames extracted to keyframes/"
-    )
-
-    logger.log_main("complete", "Screenshot extraction task completed")
+    logger.end_step(experience_span, status="OK")
+    logger.shutdown()
 
     # Save narrative
     narrative_path = logger.save_narrative()

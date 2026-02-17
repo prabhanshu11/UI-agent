@@ -23,6 +23,7 @@ MULTI-MONITOR WARNING:
 """
 
 import serial
+import threading
 import time
 import math
 import random
@@ -78,7 +79,8 @@ class ESP32Mouse:
         return self._ser
 
     def close(self):
-        """Close serial connection."""
+        """Close serial connection and stop heartbeat."""
+        self.stop_heartbeat()
         if self._ser and self._ser.is_open:
             self._ser.close()
 
@@ -108,6 +110,68 @@ class ESP32Mouse:
     def is_connected(self) -> bool:
         """Check if mouse is connected to target device."""
         return self.status() == "CONNECTED"
+
+    def reconnect(self, timeout: float = 5.0) -> bool:
+        """Reset ESP32 via DTR toggle and wait for BLE reconnect.
+
+        The ESP32 BLE HID connection goes stale within ~1s of no activity.
+        When stale, STATUS still reports CONNECTED but cursor doesn't move.
+        A DTR toggle forces a hardware reset → fresh BLE pairing.
+
+        Args:
+            timeout: Max seconds to wait for CONNECTED status after reset.
+
+        Returns:
+            True if reconnected successfully.
+        """
+        ser = self.ser
+        ser.dtr = False
+        time.sleep(0.1)
+        ser.dtr = True
+        ser.reset_input_buffer()
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+            try:
+                if self.is_connected():
+                    return True
+            except serial.SerialException:
+                pass
+        return False
+
+    def start_heartbeat(self, interval: float = 0.1):
+        """Start daemon thread sending zero-movement reports to keep BLE alive.
+
+        Sends MOUSE:0,0 every `interval` seconds. This prevents the BLE HID
+        connection from going stale without actually moving the cursor.
+
+        Args:
+            interval: Seconds between heartbeat reports (0.1 = 100ms).
+        """
+        if hasattr(self, '_heartbeat_stop') and not self._heartbeat_stop.is_set():
+            return  # Already running
+
+        self._heartbeat_stop = threading.Event()
+
+        def _beat():
+            while not self._heartbeat_stop.is_set():
+                try:
+                    self.ser.write(b'MOUSE:0,0\n')
+                    self.ser.flush()
+                except (serial.SerialException, OSError):
+                    break
+                self._heartbeat_stop.wait(interval)
+
+        self._heartbeat_thread = threading.Thread(target=_beat, daemon=True)
+        self._heartbeat_thread.start()
+
+    def stop_heartbeat(self):
+        """Stop the heartbeat daemon thread."""
+        if hasattr(self, '_heartbeat_stop'):
+            self._heartbeat_stop.set()
+            if hasattr(self, '_heartbeat_thread'):
+                self._heartbeat_thread.join(timeout=2)
 
     def _send_raw(self, dx: int, dy: int):
         """Send raw mouse movement command (single HID report).

@@ -14,6 +14,8 @@ from .cursor_detector import (
     match_curve_segment,
 )
 from .cursor_locator import CursorLocator, CursorPosition
+from .experience_logger import ExperienceLogger
+from .cursor_tracker import CursorTracker, TrackedPosition
 
 __all__ = [
     "USBCaptureCard",
@@ -24,6 +26,9 @@ __all__ = [
     "MotionBlob",
     "CursorLocator",
     "CursorPosition",
+    "ExperienceLogger",
+    "CursorTracker",
+    "TrackedPosition",
     "extract_motion_blobs",
     "match_curve_segment",
 ]
