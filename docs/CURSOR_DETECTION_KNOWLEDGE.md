@@ -3,6 +3,32 @@
 > Compiled from sessions 47d0c44b, 911b4a7d, 2c216942, 3095ea66, f0870570
 > (Feb 16-18, 2026). Preserved before context compaction.
 
+## 0. Critical Rule: Unknown Position → Locator Only
+
+> **BINDING CONSTRAINT — All agents and scripts that control the mouse MUST follow this.**
+
+When cursor position is unknown or lost, **ONLY** use `CursorLocator.locate()` (Lissajous sweep) to find it. Do NOT attempt:
+- Random mouse movements
+- Blind clicking at guessed screen positions
+- Moving the cursor "to see what happens"
+- Any motion that is not the structured Lissajous sweep
+
+**The three-tier recovery system handles all cases:**
+
+| Situation | Recovery | Method |
+|-----------|----------|--------|
+| Position recently known (< 10s stale) | Tier 1 — micro-shake (±3px) | Invisible, confirms current position |
+| Tier 1 failed (small drift) | Tier 2 — macro-shake (±15px) | Slightly visible, re-acquires nearby |
+| Position truly unknown | Tier 3 — `CursorLocator.locate()` | Full Lissajous sweep, finds cursor anywhere |
+
+**Why random motions are prohibited:**
+- They produce no useful signal (no analytical curve to match against)
+- They can move the cursor further off-screen or onto a different monitor
+- They waste time — the Lissajous sweep is designed to cover any multi-monitor layout in ~5 seconds
+- Blind clicks can dismiss dialogs, change focus, or trigger unintended actions
+
+**Origin**: K380 pairing session (Feb 18, 2026) — blind clicking and random mouse movements wasted significant time when `CursorLocator.locate()` would have found the cursor in seconds.
+
 ## 1. The Problem
 
 We control a Windows laptop from a Linux desktop via:

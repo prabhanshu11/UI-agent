@@ -1,0 +1,39 @@
+[2026-02-18 07:51:45] Ralph Loop Iteration 1 started
+[2026-02-18 07:50] Prerequisites check:
+  - /dev/ttyUSB0: EXISTS (ESP32 mouse)
+  - /dev/video0: EXISTS (HDMI capture)
+  - Pi (10.55.0.2): UNREACHABLE (100% packet loss)
+  - HDMI screenshot: captured to /tmp/hdmi_screenshot.png
+  - Next: analyze screenshot, diagnose Pi connectivity
+[2026-02-18 07:52] BLOCKER: Pi Zero unreachable
+  - USB gadget interface enp8s0f3u3u4 is UP but has no IPv4 address
+  - Need: sudo ip addr add 10.55.0.1/24 dev enp8s0f3u3u4
+  - Sudo requires fingerprint auth - user needs to run this manually
+  - ESP32 mouse: CONNECTED, heartbeat and anti-sleep running
+  - HDMI capture: working, Windows desktop visible
+
+[2026-02-18 08:55] Ralph Loop Iteration 1 (continued from context restore)
+  - Pi Zero USB gadget IP configured: 10.55.0.1/24 on enp8s0f3u3u4 (via pkexec)
+  - Pi SSH working: sshpass -p raspberry pi@10.55.0.2
+  - bt-keyboard.service: ACTIVE (listening on PSM 17/19)
+  - bt-keyboard-api.service: STARTED (port 8081)
+  - Pi BT: Discoverable=yes, Pairable=yes, Class=0x002540 (Keyboard)
+  - Pi MAC: 4C:B7:49:AA:BB:01, Name: Keyboard-K380
+  - No paired devices on Pi side
+  - HDMI capture: Windows desktop visible (was unlocked after mouse click)
+  - ESP32 mouse: CONNECTED, heartbeat running
+  - Next: Navigate to Windows BT settings to pair K380
+  - Approach: Mouse-only navigation (Start menu → Settings → Bluetooth)
+
+[2026-02-18 09:00] LESSON: Wasted time clicking blindly without verifying:
+  1. ESP32 mouse BT connection to Windows
+  2. Mouse movements actually moving cursor on screen
+  3. Cursor position calibration
+  Following systematic checklist now.
+
+[2026-02-18 09:10] LESSON: Must ALWAYS use cursor tracking system, never raw commands
+  - calibrate_to_corner() → known position at (0,0)
+  - CursorTracker with 3-tier recovery (micro/macro shake, Lissajous)
+  - verified_click() probes position before clicking
+  - ESP32Mouse.move_to() relies on estimated_x/y — must calibrate first
+  - Never send raw MOUSE:x,y without tracking

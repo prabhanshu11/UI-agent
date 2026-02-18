@@ -130,7 +130,7 @@ def main():
     parser = argparse.ArgumentParser(description="K380 Bluetooth Pairing Experience")
     parser.add_argument("--serial", default="/dev/ttyUSB0", help="ESP32 serial port")
     parser.add_argument("--device", default="/dev/video0", help="HDMI capture device")
-    parser.add_argument("--model", default="gpt-4o-mini", help="Vision model for OpenRouter")
+    parser.add_argument("--model", default="gemini-2.5-flash", help="Vision model for OpenRouter (Gemini 2.5 Flash)")
     parser.add_argument("--log-dir", default="logs/experiences", help="Experience log directory")
     args = parser.parse_args()
 
@@ -156,6 +156,11 @@ def main():
         vision=vision,
         logger=storyline,
     )
+
+    # Start anti-sleep jitter (real ±3px movement every 30s to prevent Windows sleep)
+    print("Starting anti-sleep jitter (±3px every 30s)...")
+    mouse.start_heartbeat()
+    mouse.start_anti_sleep()
 
     # Run the experience
     print(f"\nStarting K380 pairing experience...")

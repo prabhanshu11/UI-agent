@@ -79,8 +79,9 @@ class ESP32Mouse:
         return self._ser
 
     def close(self):
-        """Close serial connection and stop heartbeat."""
+        """Close serial connection and stop heartbeat/anti-sleep."""
         self.stop_heartbeat()
+        self.stop_anti_sleep()
         if self._ser and self._ser.is_open:
             self._ser.close()
 
@@ -172,6 +173,46 @@ class ESP32Mouse:
             self._heartbeat_stop.set()
             if hasattr(self, '_heartbeat_thread'):
                 self._heartbeat_thread.join(timeout=2)
+
+    def start_anti_sleep(self, interval: float = 30.0, pixels: int = 3):
+        """Start daemon thread sending real mouse jitter to prevent Windows sleep.
+
+        Unlike heartbeat (MOUSE:0,0 which keeps BLE alive but doesn't move cursor),
+        this sends actual ±Npx movement every `interval` seconds so Windows resets
+        its idle timer and doesn't enter sleep mode.
+
+        The movement is: right N px, pause 100ms, left N px — net zero displacement.
+
+        Args:
+            interval: Seconds between jitter bursts (30s default).
+            pixels: Jitter amplitude in pixels (3px default — invisible to user).
+        """
+        if hasattr(self, '_anti_sleep_stop') and not self._anti_sleep_stop.is_set():
+            return  # Already running
+
+        self._anti_sleep_stop = threading.Event()
+
+        def _jitter():
+            while not self._anti_sleep_stop.is_set():
+                try:
+                    self.ser.write(f'MOUSE:{pixels},0\n'.encode())
+                    self.ser.flush()
+                    time.sleep(0.1)
+                    self.ser.write(f'MOUSE:{-pixels},0\n'.encode())
+                    self.ser.flush()
+                except (serial.SerialException, OSError):
+                    break
+                self._anti_sleep_stop.wait(interval)
+
+        self._anti_sleep_thread = threading.Thread(target=_jitter, daemon=True)
+        self._anti_sleep_thread.start()
+
+    def stop_anti_sleep(self):
+        """Stop the anti-sleep jitter daemon thread."""
+        if hasattr(self, '_anti_sleep_stop'):
+            self._anti_sleep_stop.set()
+            if hasattr(self, '_anti_sleep_thread'):
+                self._anti_sleep_thread.join(timeout=2)
 
     def _send_raw(self, dx: int, dy: int):
         """Send raw mouse movement command (single HID report).

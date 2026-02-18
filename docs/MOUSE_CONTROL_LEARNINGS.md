@@ -50,13 +50,25 @@ enters the captured screen:
 
 See: `src/hardware/cursor_locator.py`
 
-### Workarounds (if sweep is not available)
+### Finding the Cursor When Position Is Unknown
 
-- **User moves cursor manually**: Ask user to move cursor to HDMI-captured
-  screen, then call `mouse.set_position(x, y)` based on observed location
-- **Disable second monitor**: Navigate to Display Settings → "PC screen only"
+> **The locator utility (`cursor_locator.py`) is the ONLY method an agent should use
+> to find the cursor when its position is unknown. Never use random motions, blind
+> clicks, or guessed positions.** See `CURSOR_DETECTION_KNOWLEDGE.md` Section 0.
+
+Call `CursorLocator.locate()` — it runs a Lissajous sweep that covers any
+multi-monitor layout in ~5 seconds and returns a verified cursor position.
+
+### Manual User Workarounds (NOT for agent use)
+
+The following are fallbacks for **manual user intervention only** — an automated
+agent must never attempt these:
+
+- **User moves cursor manually**: User physically moves cursor to HDMI-captured
+  screen, then calls `mouse.set_position(x, y)` based on observed location
+- **Disable second monitor**: User navigates to Display Settings → "PC screen only"
   (requires blind navigation if cursor is on wrong screen)
-- **Known offset**: If monitor arrangement is known, add offset to all
+- **Known offset**: If monitor arrangement is known, user can add offset to all
   coordinates (e.g. `x + 1920` for right-side laptop screen)
 
 ## Relative Mouse Position Drift

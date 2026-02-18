@@ -51,12 +51,14 @@ class LLMVision:
         "gpt-4o": "openai/gpt-4o",
         "gpt-4o-mini": "openai/gpt-4o-mini",
         "gemini-flash": "google/gemini-flash-1.5",
+        "gemini-2-flash": "google/gemini-2.0-flash-001",
+        "gemini-2.5-flash": "google/gemini-2.5-flash",
     }
-    
+
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "gpt-4o-mini",
+        model: str = "gemini-2.5-flash",
         site_url: str = "https://github.com/prabhanshu11/ui-agent",
         site_name: str = "UI-Agent",
     ):

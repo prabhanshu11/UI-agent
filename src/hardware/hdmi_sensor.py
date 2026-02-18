@@ -12,6 +12,7 @@ import os
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Optional, Tuple
@@ -35,20 +36,55 @@ class HDMISensor:
         self.height = height
         self.input_format = input_format
         self._tmp_path = Path(tempfile.mkdtemp()) / "hdmi_frame.png"
+        self._capture_lock = threading.Lock()
+        self._cv_cap: Optional["cv2.VideoCapture"] = None
+
+    def _get_cv_capture(self) -> "cv2.VideoCapture":
+        """Get or create persistent OpenCV VideoCapture for fast reads."""
+        import cv2
+        if self._cv_cap is None or not self._cv_cap.isOpened():
+            self._cv_cap = cv2.VideoCapture(self.device)
+            self._cv_cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            self._cv_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            # Warm-up: discard first frames (V4L2 buffer init)
+            for _ in range(3):
+                self._cv_cap.read()
+        return self._cv_cap
 
     def capture(self, settle_frames: int = 3) -> np.ndarray:
-        """Capture a frame and return as numpy array.
+        """Capture a frame via persistent OpenCV VideoCapture.
+
+        Thread-safe. Uses a persistent cv2.VideoCapture for ~5 FPS throughput
+        instead of spawning ffmpeg per frame (~1 FPS). Falls back to ffmpeg
+        if OpenCV fails.
 
         Args:
-            settle_frames: Number of frames to capture (uses last one).
-                More frames = more stable but slower. 3 is good default.
+            settle_frames: Number of frames to skip before returning one.
 
         Returns:
             numpy array of shape (height, width, 3) in RGB.
 
         Raises:
-            RuntimeError: If ffmpeg capture fails.
+            RuntimeError: If capture fails.
         """
+        import cv2
+        with self._capture_lock:
+            try:
+                cap = self._get_cv_capture()
+                frame = None
+                for _ in range(max(1, settle_frames)):
+                    ret, frame = cap.read()
+                if not ret or frame is None:
+                    raise RuntimeError("OpenCV capture returned empty frame")
+                # OpenCV returns BGR, convert to RGB
+                return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            except Exception:
+                # Fallback to ffmpeg if OpenCV fails
+                self._cv_cap = None
+                return self._capture_ffmpeg(settle_frames)
+
+    def _capture_ffmpeg(self, settle_frames: int = 3) -> np.ndarray:
+        """Fallback: capture via ffmpeg subprocess (slower, ~1 FPS)."""
         result = subprocess.run(
             [
                 "ffmpeg", "-y",
@@ -71,6 +107,12 @@ class HDMISensor:
 
         frame = np.array(Image.open(self._tmp_path).convert("RGB"))
         return frame
+
+    def release(self):
+        """Release persistent OpenCV capture (call before start_recording)."""
+        if self._cv_cap is not None:
+            self._cv_cap.release()
+            self._cv_cap = None
 
     def capture_to_file(self, output_path: str, settle_frames: int = 3) -> bool:
         """Capture a frame and save to file.
