@@ -5,15 +5,15 @@ Windows machine via an ESP32 relative HID mouse. The machine may have
 any number of monitors in any arrangement — we don't know which one the
 HDMI capture card sees or where the cursor currently is.
 
-Approach:
-1. RECORD: ffmpeg captures HDMI to video file continuously
-2. MOVE: ESP32 sends HID reports tracing a Lissajous curve across the
-   entire virtual desktop (space-filling, smooth, analytically known)
-3. ANALYZE: periodically extract frames from the growing video and run
-   curvature matching to detect the Lissajous signature in motion blobs
+Approach (record-then-analyze):
+1. Start ffmpeg recording of HDMI capture
+2. Send HID reports tracing a Lissajous curve across the entire virtual
+   desktop (space-filling, smooth, analytically known)
+3. Stop recording — produces a clean, complete video file
+4. Load all frames and run curvature matching to detect the Lissajous
+   signature in motion blobs
 
-When the analyze step detects the curve, all threads stop. The cursor's
-position is the centroid of the last matched motion blob.
+The cursor's position is the centroid of the last matched motion blob.
 
 Usage:
     from src.hardware.cursor_locator import CursorLocator
@@ -30,15 +30,11 @@ Usage:
         locator.shake()
 """
 
-import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
 
-import numpy as np
-
 from .cursor_detector import (
-    CurveMatch,
     LissajousCurve,
     extract_motion_blobs,
     match_curve_segment,
@@ -61,14 +57,15 @@ class CursorPosition:
 class CursorLocator:
     """Locates cursor via Lissajous sweep + video curvature matching.
 
-    Three concurrent activities:
-    - RECORD: ffmpeg captures HDMI at 30fps to an MKV file
-    - MOVE: ESP32 sends HID reports sampling a Lissajous curve
-    - ANALYZE: periodically loads latest frames, runs motion matching
+    Sequential record-then-analyze pipeline:
+    1. Start ffmpeg recording of HDMI capture
+    2. Run full Lissajous sweep via ESP32 HID reports (blocking)
+    3. Stop recording to produce a clean, complete video file
+    4. Load all frames and run motion blob extraction + curve matching
 
-    When the analyzer detects the Lissajous curvature signature in the
-    video, it signals all threads to stop. Early termination means we
-    don't have to sweep the entire virtual desktop.
+    This approach was proven to work with 0.92 correlation in session
+    47d0c44b. Analyzing a complete file avoids the reliability issues
+    of reading a growing MKV mid-write.
     """
 
     def __init__(
@@ -76,7 +73,7 @@ class CursorLocator:
         mouse: ESP32Mouse,
         sensor: HDMISensor,
         curve: Optional[LissajousCurve] = None,
-        max_duration: float = 10.0,
+        max_duration: float = 5.0,
         video_fps: int = 30,
     ):
         """
@@ -93,17 +90,15 @@ class CursorLocator:
         self.curve = curve or LissajousCurve()
         self.max_duration = max_duration
         self.video_fps = video_fps
-        self._stop_event = threading.Event()
-        self._move_start_time: float = 0.0
 
     def locate(self, verbose: bool = True) -> Optional[CursorPosition]:
         """Locate cursor on the HDMI-captured screen.
 
-        Runs the 3-activity pipeline:
+        Sequential record-then-analyze pipeline:
         1. Start ffmpeg recording
-        2. Start Lissajous movement in a background thread
-        3. Run analysis loop (in calling thread) checking for curve match
-        4. On detection or timeout, stop everything and return
+        2. Run full Lissajous sweep (blocking)
+        3. Stop recording to get a clean, complete video file
+        4. Load all frames and run offline analysis
 
         Args:
             verbose: Print progress to stdout.
@@ -111,31 +106,33 @@ class CursorLocator:
         Returns:
             CursorPosition if found, None if cursor never appeared.
         """
-        self._stop_event.clear()
         video_path = "/tmp/cursor_detect.mkv"
 
         if verbose:
             print("Starting HDMI video recording...")
 
-        # Start continuous recording
         ffmpeg_proc = self.sensor.start_recording(video_path, fps=self.video_fps)
-        time.sleep(0.5)  # Let recording stabilize and capture initial frames
+        time.sleep(0.5)  # Let recording stabilize
 
         if verbose:
-            print(f"Starting Lissajous sweep (max {self.max_duration}s)...")
+            print(f"Running Lissajous sweep ({self.max_duration}s)...")
 
-        # Start mouse movement in background thread
-        self._move_start_time = time.monotonic()
-        move_thread = threading.Thread(target=self._execute_curve, daemon=True)
-        move_thread.start()
+        # Run full sweep — blocking
+        sweep_start = time.monotonic()
+        reports = self.curve.sample_hid_reports(0, self.max_duration)
+        for dx, dy in reports:
+            self.mouse._send_raw(dx, dy)
+        sweep_elapsed = time.monotonic() - sweep_start
 
-        # Run analysis loop in this thread
-        result = self._analyze_loop(video_path, verbose=verbose)
+        if verbose:
+            print(f"Sweep complete ({sweep_elapsed:.1f}s). Stopping recording...")
 
-        # Stop everything
-        self._stop_event.set()
-        move_thread.join(timeout=3)
+        # Stop recording — produces a clean, seekable file
         self.sensor.stop_recording(ffmpeg_proc)
+        time.sleep(1.0)  # Let ffmpeg flush and release V4L2 device
+
+        # Analyze the complete video offline
+        result = self._analyze_offline(video_path, verbose=verbose)
 
         if result and verbose:
             print(f"Cursor detected at ({result.x}, {result.y}) "
@@ -146,89 +143,73 @@ class CursorLocator:
 
         return result
 
-    def _execute_curve(self):
-        """Send Lissajous HID reports until stop_event fires."""
-        reports = self.curve.sample_hid_reports(0, self.max_duration)
-        for dx, dy in reports:
-            if self._stop_event.is_set():
-                break
-            self.mouse._send_raw(dx, dy)
-
-    def _analyze_loop(
+    def _analyze_offline(
         self,
         video_path: str,
-        check_interval: float = 1.0,
         verbose: bool = True,
     ) -> Optional[CursorPosition]:
-        """Periodically load frames from growing video and check for curve match.
-
-        Runs until a match is found, stop_event is set, or max_duration expires.
+        """Load all frames from a complete video and run curve matching.
 
         Args:
-            video_path: Path to the growing MKV file.
-            check_interval: Seconds between analysis attempts.
+            video_path: Path to the finished MKV file.
             verbose: Print progress.
 
         Returns:
             CursorPosition if detected, None otherwise.
         """
-        frames_analyzed = 0
-        start_time = time.monotonic()
+        if verbose:
+            print("Loading video frames...")
 
-        while not self._stop_event.is_set():
-            elapsed = time.monotonic() - start_time
-            if elapsed > self.max_duration + 2:  # Extra 2s for processing
-                if verbose:
-                    print(f"Timeout after {elapsed:.1f}s — cursor not found.")
-                break
-
-            time.sleep(check_interval)
-
-            # Load all frames decoded so far
-            try:
-                all_frames = self.sensor.load_video_frames(video_path)
-            except (RuntimeError, Exception):
-                continue  # File not ready or still being written
-
-            if len(all_frames) < frames_analyzed + 10:
-                continue  # Not enough new frames to analyze
-
+        try:
+            frames = self.sensor.load_video_frames(video_path)
+        except (RuntimeError, Exception) as e:
             if verbose:
-                print(f"  [{elapsed:.1f}s] Analyzing {len(all_frames)} frames "
-                      f"({len(all_frames) - frames_analyzed} new)...")
+                print(f"Failed to load video: {e}")
+            return None
 
-            # Analyze new frames (keep 1 frame overlap for diff continuity)
-            start_idx = max(0, frames_analyzed - 1)
-            new_frames = all_frames[start_idx:]
-            frames_analyzed = len(all_frames)
+        if verbose:
+            print(f"Loaded {len(frames)} frames. Extracting motion blobs...")
 
-            # Extract motion blobs for consecutive frame pairs
-            blobs_seq = []
-            for i in range(len(new_frames) - 1):
-                blobs = extract_motion_blobs(new_frames[i], new_frames[i + 1])
-                blobs_seq.append(blobs)
+        # Extract motion blobs for consecutive frame pairs
+        blobs_seq = []
+        blob_count = 0
+        for i in range(len(frames) - 1):
+            blobs = extract_motion_blobs(frames[i], frames[i + 1])
+            blobs_seq.append(blobs)
+            if blobs:
+                blob_count += 1
 
-            if not blobs_seq:
-                continue
+        if verbose:
+            print(f"Extracted blobs from {len(blobs_seq)} frame pairs "
+                  f"({blob_count} had motion)")
 
-            # Check for Lissajous curve match
-            match = match_curve_segment(
-                blobs_seq,
-                self.curve,
-                fps=float(self.video_fps),
+        if not blobs_seq or blob_count == 0:
+            if verbose:
+                print("No motion detected in video — cursor not visible.")
+            return None
+
+        # Match Lissajous curve signature
+        if verbose:
+            print("Running curve matching...")
+
+        match = match_curve_segment(
+            blobs_seq,
+            self.curve,
+            fps=float(self.video_fps),
+        )
+
+        if match and match.matched:
+            if verbose:
+                print(f"Curve match! correlation={match.correlation:.2f}")
+            return CursorPosition(
+                x=match.screen_pos[0],
+                y=match.screen_pos[1],
+                t_param=match.t_end,
+                correlation=match.correlation,
             )
 
-            if match and match.matched:
-                if verbose:
-                    print(f"  Curve match found! correlation={match.correlation:.2f}")
-                self._stop_event.set()
-                return CursorPosition(
-                    x=match.screen_pos[0],
-                    y=match.screen_pos[1],
-                    t_param=match.t_end,
-                    correlation=match.correlation,
-                )
-
+        if verbose:
+            print("No Lissajous curve signature found in motion blobs.")
         return None
 
     def calibrate(self, verbose: bool = True) -> float:

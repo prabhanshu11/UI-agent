@@ -34,10 +34,10 @@ class LissajousCurve:
     locally, guaranteeing it visits all regions of the virtual desktop.
     """
 
-    amp_x: float = 3000.0      # Half-width of virtual desktop
-    amp_y: float = 1500.0      # Half-height of virtual desktop
-    omega_x: float = math.pi / 8       # Slow horizontal frequency
-    omega_y: float = math.pi * math.sqrt(2) / 8  # Irrational ratio to omega_x
+    amp_x: float = 4300.0      # Half-width: 5x area of 2x1080p (3840*√5 ≈ 8600)
+    amp_y: float = 1200.0      # Half-height: 5x area of 2x1080p (1080*√5 ≈ 2400)
+    omega_x: float = math.pi / 5       # Period=10s, half-cycle in 5s
+    omega_y: float = math.pi * math.sqrt(2) / 5  # Irrational ratio to omega_x
     phi: float = 0.0           # Phase offset
 
     def position(self, t: float) -> tuple[float, float]:
@@ -175,6 +175,7 @@ def extract_motion_blobs(
     threshold: int = 30,
     min_pixels: int = 8,
     max_pixels: int = 4000,
+    cursor_shape_filter: bool = False,
 ) -> list[MotionBlob]:
     """Find clusters of changed pixels between two frames.
 
@@ -188,9 +189,12 @@ def extract_motion_blobs(
         threshold: Per-channel sum threshold for "changed" pixel.
         min_pixels: Minimum pixels for a valid blob (filters noise).
         max_pixels: Maximum pixels (filters screen transitions).
+        cursor_shape_filter: If True, score blobs by cursor-likeness and
+            demote blobs that look like UI animations (spinners, text cursors).
 
     Returns:
-        List of MotionBlob, sorted by pixel_count descending.
+        List of MotionBlob, sorted by pixel_count descending (or by
+        cursor-likeness score if cursor_shape_filter is True).
     """
     diff = np.abs(frame_b.astype(np.int16) - frame_a.astype(np.int16))
     diff_magnitude = diff.sum(axis=2)
@@ -227,9 +231,73 @@ def extract_motion_blobs(
             bbox=bbox,
         ))
 
-    # Sort by pixel count descending (largest first)
-    blobs.sort(key=lambda b: b.pixel_count, reverse=True)
+    if cursor_shape_filter:
+        # Score blobs by how cursor-like their shape is, filter out
+        # blobs that are clearly UI animations (too thin, too round)
+        blobs = [b for b in blobs if _cursor_shape_score(b) > 0.0]
+        blobs.sort(key=lambda b: _cursor_shape_score(b), reverse=True)
+    else:
+        # Default: sort by pixel count descending (largest first)
+        blobs.sort(key=lambda b: b.pixel_count, reverse=True)
+
     return blobs
+
+
+def _cursor_shape_score(blob: MotionBlob) -> float:
+    """Score how cursor-like a motion blob's shape is.
+
+    Windows cursors are roughly triangular arrows (~20x30px):
+    - Fill ratio ~0.3-0.5 (triangle fills ~half its bounding box)
+    - Bbox dimensions: width 10-60px, height 10-80px
+    - Not extremely thin (text cursor) or circular (spinner)
+
+    Returns:
+        Score 0.0-1.0. 0.0 means definitely not a cursor.
+    """
+    x_min, y_min, x_max, y_max = blob.bbox
+    w = x_max - x_min + 1
+    h = y_max - y_min + 1
+    bbox_area = w * h
+
+    if bbox_area < 1:
+        return 0.0
+
+    fill_ratio = blob.pixel_count / bbox_area
+    aspect = min(w, h) / max(w, h)  # 0-1, 1 = square
+
+    # Text cursors: very thin (aspect < 0.15), high fill ratio
+    if aspect < 0.15:
+        return 0.0
+
+    # Large screen transitions or full-element redraws
+    if w > 100 or h > 100:
+        return 0.1  # Low score but don't fully exclude
+
+    # Spinners/circles: high fill ratio (>0.7) and near-square aspect
+    if fill_ratio > 0.75 and aspect > 0.8:
+        return 0.1
+
+    # Cursor-like: moderate fill (triangle ≈ 0.3-0.6), reasonable size
+    score = 1.0
+
+    # Fill ratio: ideal ~0.3-0.5 for arrow shape
+    if 0.2 <= fill_ratio <= 0.6:
+        score *= 1.0
+    elif fill_ratio < 0.2:
+        score *= 0.4  # Too sparse
+    else:
+        score *= 0.6  # Too filled (but motion blur can increase this)
+
+    # Size: cursor is typically 15-50px in each dimension
+    size_score = 1.0
+    max_dim = max(w, h)
+    if max_dim < 8:
+        size_score = 0.3
+    elif max_dim > 80:
+        size_score = 0.5
+    score *= size_score
+
+    return score
 
 
 def _compute_principal_angle(xs: np.ndarray, ys: np.ndarray) -> float:
@@ -361,7 +429,7 @@ def match_curve_segment(
         # Slide window along Lissajous time to find best match
         # The curve runs for up to max_duration seconds; sample at frame intervals
         run_duration = (n - 1) * dt_frame
-        max_t = 12.0  # Search up to 12s into the curve
+        max_t = 7.0  # Search up to 7s into the curve (5s sweep + 2s margin)
         t_step = dt_frame  # Step by one frame interval
 
         t = 0.0
