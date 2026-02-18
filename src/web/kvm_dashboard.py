@@ -53,6 +53,10 @@ class MotionState:
     cursor_y: int = 0
     cursor_method: str = "unknown"
     cursor_age_s: float = 999.0
+    # Secondary cursor (remote participant in meetings)
+    cursor2_x: int = 0
+    cursor2_y: int = 0
+    cursor2_active: bool = False
     tracker_tier: str = "none"
     mouse_connected: bool = False
     heartbeat_active: bool = False
@@ -165,6 +169,7 @@ def _daemon_motion_loop():
             # ── Continuous cursor tracking from daemon blobs ────────
             pos = tracker.position if tracker else None
             cursor_blobs = [b for b in ds.blobs if 5 <= b.pixel_count <= 500]
+            primary_blob = None
             if cursor_blobs:
                 if pos and (now - pos.timestamp < 10):
                     # Position fresh — pick blob closest to last known
@@ -174,17 +179,28 @@ def _daemon_motion_loop():
                     dist = ((best.centroid[0] - pos.x) ** 2 +
                             (best.centroid[1] - pos.y) ** 2) ** 0.5
                     if dist < 200:
+                        primary_blob = best
                         bx, by = best.centroid
                         if tracker:
                             tracker.set_position(bx, by, method="motion_track")
                         pos = tracker.position
                 else:
-                    # Position stale (>10s) — pick smallest as initial guess
-                    best = min(cursor_blobs, key=lambda b: b.pixel_count)
+                    # Position stale (>10s) — pick largest as primary
+                    best = max(cursor_blobs, key=lambda b: b.pixel_count)
+                    primary_blob = best
                     bx, by = best.centroid
                     if tracker:
                         tracker.set_position(bx, by, method="motion_track")
                     pos = tracker.position
+
+            # ── Secondary cursor (meetings: remote participant) ───
+            secondary_pos = None
+            if primary_blob and len(cursor_blobs) > 1:
+                others = [b for b in cursor_blobs if b is not primary_blob]
+                if others:
+                    # Pick the largest remaining cursor-sized blob
+                    sec = max(others, key=lambda b: b.pixel_count)
+                    secondary_pos = (sec.centroid[0], sec.centroid[1])
 
             # ── Update shared state (fast, ~20Hz) ──────────────────
             cursor_pos = (0, 0)
@@ -199,6 +215,12 @@ def _daemon_motion_loop():
                     state.cursor_age_s = now - pos.timestamp
                     state.cursor_method = pos.method
                     cursor_pos = (pos.x, pos.y)
+                if secondary_pos:
+                    state.cursor2_x = secondary_pos[0]
+                    state.cursor2_y = secondary_pos[1]
+                    state.cursor2_active = True
+                else:
+                    state.cursor2_active = False
 
             # ── Render overlayed frame (slow, config.frame_fps) ────
             frame_interval = 1.0 / max(0.1, config.frame_fps)
@@ -621,6 +643,10 @@ async def get_state():
             "method": state.cursor_method,
             "age_s": round(state.cursor_age_s, 1),
         },
+        "cursor2": {
+            "x": state.cursor2_x, "y": state.cursor2_y,
+            "active": state.cursor2_active,
+        },
         "hardware": {
             "mouse_connected": state.mouse_connected,
             "heartbeat_active": state.heartbeat_active,
@@ -950,9 +976,22 @@ DASHBOARD_HTML = r"""
             animation: cursor-pulse 1.5s ease-in-out infinite;
             z-index: 10; display: none;
         }
+        .cursor-dot-secondary {
+            position: absolute; width: 18px; height: 18px;
+            border-radius: 50%; pointer-events: none;
+            background: radial-gradient(circle, #fff 20%, #ff8800 50%, transparent 70%);
+            box-shadow: 0 0 10px #ff8800, 0 0 20px #ff880088;
+            transform: translate(-50%, -50%);
+            animation: cursor2-pulse 2s ease-in-out infinite;
+            z-index: 9; display: none;
+        }
         @keyframes cursor-pulse {
             0%, 100% { opacity: 1; box-shadow: 0 0 12px #00ff00, 0 0 24px #00ff0088; }
             50% { opacity: 0.7; box-shadow: 0 0 20px #00ff00, 0 0 40px #00ff0066; }
+        }
+        @keyframes cursor2-pulse {
+            0%, 100% { opacity: 1; box-shadow: 0 0 10px #ff8800, 0 0 20px #ff880088; }
+            50% { opacity: 0.6; box-shadow: 0 0 16px #ff8800, 0 0 32px #ff880066; }
         }
         .sidebar {
             background: #101018; border-left: 1px solid #222;
@@ -1031,6 +1070,7 @@ DASHBOARD_HTML = r"""
         <div class="feed" id="feed-container">
             <img id="live-frame" src="" alt="Loading...">
             <div class="cursor-dot" id="cursor-dot"></div>
+            <div class="cursor-dot-secondary" id="cursor-dot-2"></div>
         </div>
         <div class="sidebar">
             <div class="panel">
@@ -1041,6 +1081,10 @@ DASHBOARD_HTML = r"""
                         <span id="cursor-method">—</span> |
                         age: <span id="cursor-age">—</span>s
                     </div>
+                </div>
+                <div id="cursor2-row" class="hw-row" style="display:none; margin-top:6px;">
+                    <span class="hw-label" style="color:#ff8800;">Secondary</span>
+                    <span class="hw-value" id="cursor2-coords" style="color:#ff8800;">(?, ?)</span>
                 </div>
                 <div class="tier-indicator">
                     <div class="tier t1" id="tier-1">T1 Micro</div>
@@ -1147,6 +1191,18 @@ DASHBOARD_HTML = r"""
                 document.getElementById('cursor-age').textContent = s.cursor.age_s;
                 updateCursorDot(s.cursor.x, s.cursor.y);
 
+                // Secondary cursor (remote participant in meetings)
+                var c2row = document.getElementById('cursor2-row');
+                if (s.cursor2 && s.cursor2.active) {
+                    c2row.style.display = 'flex';
+                    document.getElementById('cursor2-coords').textContent =
+                        '(' + s.cursor2.x + ', ' + s.cursor2.y + ')';
+                    updateSecondaryCursorDot(s.cursor2.x, s.cursor2.y);
+                } else {
+                    c2row.style.display = 'none';
+                    document.getElementById('cursor-dot-2').style.display = 'none';
+                }
+
                 var m = s.cursor.method;
                 document.getElementById('tier-1').classList.toggle('active',
                     m === 'micro_shake' || m === 'motion_track' || m === 'shape_track');
@@ -1240,23 +1296,45 @@ DASHBOARD_HTML = r"""
             el.className = 'hw-value ' + (ok ? 'ok' : 'err');
         }
 
-        function updateCursorDot(cursorX, cursorY) {
-            var dot = document.getElementById('cursor-dot');
+        function mapCursorToScreen(cursorX, cursorY) {
             var img = document.getElementById('live-frame');
             var container = document.getElementById('feed-container');
-            if (!img.naturalWidth || cursorX <= 0 && cursorY <= 0) {
-                dot.style.display = 'none';
-                return;
-            }
-            // Map 1920x1080 cursor coords to the displayed image position
+            if (!img.naturalWidth) return null;
             var containerRect = container.getBoundingClientRect();
             var imgRect = img.getBoundingClientRect();
             var scaleX = imgRect.width / 1920;
             var scaleY = imgRect.height / 1080;
             var offsetX = imgRect.left - containerRect.left;
             var offsetY = imgRect.top - containerRect.top;
-            dot.style.left = (offsetX + cursorX * scaleX) + 'px';
-            dot.style.top = (offsetY + cursorY * scaleY) + 'px';
+            return {
+                left: (offsetX + cursorX * scaleX) + 'px',
+                top: (offsetY + cursorY * scaleY) + 'px'
+            };
+        }
+
+        function updateCursorDot(cursorX, cursorY) {
+            var dot = document.getElementById('cursor-dot');
+            if (cursorX <= 0 && cursorY <= 0) {
+                dot.style.display = 'none';
+                return;
+            }
+            var pos = mapCursorToScreen(cursorX, cursorY);
+            if (!pos) { dot.style.display = 'none'; return; }
+            dot.style.left = pos.left;
+            dot.style.top = pos.top;
+            dot.style.display = 'block';
+        }
+
+        function updateSecondaryCursorDot(cursorX, cursorY) {
+            var dot = document.getElementById('cursor-dot-2');
+            if (cursorX <= 0 && cursorY <= 0) {
+                dot.style.display = 'none';
+                return;
+            }
+            var pos = mapCursorToScreen(cursorX, cursorY);
+            if (!pos) { dot.style.display = 'none'; return; }
+            dot.style.left = pos.left;
+            dot.style.top = pos.top;
             dot.style.display = 'block';
         }
 
