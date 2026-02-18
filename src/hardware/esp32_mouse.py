@@ -191,12 +191,15 @@ class ESP32Mouse:
             return  # Already running
 
         self._anti_sleep_stop = threading.Event()
+        self._last_jitter_time = 0.0
+        self._jitter_pixels = pixels
 
         def _jitter():
             while not self._anti_sleep_stop.is_set():
                 try:
                     self.ser.write(f'MOUSE:{pixels},0\n'.encode())
                     self.ser.flush()
+                    self._last_jitter_time = time.monotonic()
                     time.sleep(0.1)
                     self.ser.write(f'MOUSE:{-pixels},0\n'.encode())
                     self.ser.flush()

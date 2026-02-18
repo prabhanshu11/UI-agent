@@ -355,7 +355,12 @@ static int open_recording(RecState *rs) {
         return -1;
     }
 
-    const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+    /* Try NVENC (GPU) first, fall back to libx264 (CPU) */
+    const AVCodec *codec = avcodec_find_encoder_by_name("h264_nvenc");
+    int using_nvenc = (codec != NULL);
+    if (!codec) {
+        codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+    }
     if (!codec) {
         fprintf(stderr, "record: H.264 encoder not found\n");
         avformat_free_context(rs->fmt_ctx);
@@ -373,8 +378,17 @@ static int open_recording(RecState *rs) {
     rs->enc_ctx->gop_size    = TARGET_FPS;   /* Keyframe every 1s */
     rs->enc_ctx->max_b_frames = 0;
 
-    av_opt_set(rs->enc_ctx->priv_data, "preset", "ultrafast", 0);
-    av_opt_set(rs->enc_ctx->priv_data, "crf", "23", 0);
+    if (using_nvenc) {
+        /* NVENC: use hardware-accelerated preset + constant quality */
+        av_opt_set(rs->enc_ctx->priv_data, "preset", "p1", 0);  /* fastest */
+        av_opt_set(rs->enc_ctx->priv_data, "rc", "constqp", 0);
+        av_opt_set(rs->enc_ctx->priv_data, "qp", "28", 0);
+        printf("record: using NVENC (GPU) encoder\n");
+    } else {
+        av_opt_set(rs->enc_ctx->priv_data, "preset", "ultrafast", 0);
+        av_opt_set(rs->enc_ctx->priv_data, "crf", "23", 0);
+        printf("record: using libx264 (CPU) encoder\n");
+    }
 
     if (rs->fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER)
         rs->enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;

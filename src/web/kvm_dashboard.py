@@ -22,8 +22,8 @@ from typing import Optional
 
 import cv2
 import numpy as np
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
 import sys
 from pathlib import Path
@@ -72,6 +72,19 @@ class MotionState:
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 state = MotionState()
+
+
+@dataclass
+class DashboardConfig:
+    """Runtime-tunable parameters exposed via /api/config."""
+    frame_fps: float = 1.0          # Overlayed video render rate (Hz)
+    cnn_interval_s: float = 30.0    # CNN validation cycle (seconds)
+    jitter_interval_s: float = 30.0 # Anti-sleep jitter interval
+    jitter_pixels: int = 3          # Jitter amplitude (px)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+config = DashboardConfig()
+
 
 mouse: Optional[ESP32Mouse] = None
 sensor: Optional[HDMISensor] = None
@@ -148,16 +161,17 @@ def frame_to_jpeg(frame: np.ndarray, quality: int = 80) -> bytes:
 def _daemon_motion_loop():
     """Read blobs + frames from C daemon shm. Cursor ID stays in Python.
 
-    The daemon provides fast frame capture, JPEG encoding, and blob extraction.
-    Cursor identification is done here using the tracker's known position —
-    the daemon does NOT identify which blob is the cursor (it can't, because
-    it doesn't control the mouse and can't distinguish cursor motion from
-    UI animations).
+    Two update rates:
+    - State (blobs, cursor dot): ~20Hz — smooth CSS cursor overlay
+    - Frame (JPEG decode + draw overlays + re-encode): config.frame_fps (default 1Hz)
 
-    Cursor position comes from:
-    - tracker.position (set by jitter/Lissajous/probe — known mouse movements)
-    - The anti-sleep jitter (±3px every 30s) is the primary cursor tracker
+    Jitter correlation: when the anti-sleep jitter fires (every 30s),
+    the resulting motion blob is matched to the cursor's last known
+    position. This keeps tracker.position continuously maintained
+    without any extra probe movements.
     """
+    last_frame_time = 0.0
+
     while True:
         try:
             ds = daemon_client.read_state()
@@ -165,25 +179,44 @@ def _daemon_motion_loop():
                 time.sleep(0.05)
                 continue
 
+            now = time.monotonic()
+
+            # ── Update shared state (fast, ~20Hz) ──────────────────
+            pos = tracker.position if tracker else None
+            cursor_pos = (0, 0)
             with state.lock:
                 state.blobs = ds.blobs
                 state.blob_count = ds.blob_count
                 state.fps = ds.fps
                 state.frame_count = ds.frame_count
-                # Cursor position from tracker, NOT from daemon
-                if tracker and tracker.position:
-                    state.cursor_x = tracker.position.x
-                    state.cursor_y = tracker.position.y
-                    state.cursor_age_s = tracker.position.age_s
-                    state.cursor_method = tracker.position.method
+                if pos:
+                    state.cursor_x = pos.x
+                    state.cursor_y = pos.y
+                    state.cursor_age_s = now - pos.timestamp
+                    state.cursor_method = pos.method
+                    cursor_pos = (pos.x, pos.y)
 
-            # Read JPEG frame (already encoded by daemon, no overlay)
-            jpeg = daemon_client.read_jpeg()
-            if jpeg:
-                with state.lock:
-                    state.frame_overlay = jpeg
+            # ── Render overlayed frame (slow, config.frame_fps) ────
+            frame_interval = 1.0 / max(0.1, config.frame_fps)
+            if now - last_frame_time >= frame_interval:
+                jpeg = daemon_client.read_jpeg()
+                if jpeg:
+                    # Decode → draw overlays → re-encode
+                    frame = cv2.imdecode(
+                        np.frombuffer(jpeg, dtype=np.uint8),
+                        cv2.IMREAD_COLOR)
+                    if frame is not None:
+                        # cv2 decodes to BGR; draw_blob_overlay expects RGB
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        overlay = draw_blob_overlay(
+                            frame_rgb, ds.blobs, cursor_pos)
+                        overlay_jpeg = frame_to_jpeg(overlay)
+                        with state.lock:
+                            state.frame_overlay = overlay_jpeg
+                            state.frame_raw = frame_rgb
+                    last_frame_time = now
 
-            time.sleep(0.016)  # ~60Hz polling (daemon runs at 30fps)
+            time.sleep(0.05)  # 20Hz state polling
 
         except Exception as e:
             state.error = str(e)
@@ -356,53 +389,132 @@ def pi_keyboard_monitor_loop():
         time.sleep(5)
 
 
+def _jitter_reacquire(use_daemon):
+    """Jitter re-acquire: move mouse 5px, capture before/after, find cursor.
+
+    This is the fundamental cursor-finding primitive: produce a KNOWN
+    movement, then find which blob matches. Only the cursor moves when
+    we command it — UI animations are independent.
+
+    Returns (x, y) of detected cursor, or None.
+    """
+    if not mouse:
+        return None
+
+    # Capture frame BEFORE jitter
+    if use_daemon:
+        jpeg_before = daemon_client.read_jpeg()
+        if not jpeg_before:
+            return None
+        frame_before = cv2.imdecode(
+            np.frombuffer(jpeg_before, dtype=np.uint8), cv2.IMREAD_COLOR)
+    else:
+        if not sensor:
+            return None
+        frame_before = sensor.capture(settle_frames=1)
+
+    if frame_before is None:
+        return None
+
+    # Jitter: move right 5px
+    mouse._send_raw(5, 0)
+    time.sleep(0.15)
+
+    # Capture frame AFTER jitter
+    if use_daemon:
+        jpeg_after = daemon_client.read_jpeg()
+        if jpeg_after:
+            frame_after = cv2.imdecode(
+                np.frombuffer(jpeg_after, dtype=np.uint8), cv2.IMREAD_COLOR)
+        else:
+            frame_after = None
+    else:
+        frame_after = sensor.capture(settle_frames=1)
+
+    # Undo jitter
+    mouse._send_raw(-5, 0)
+
+    if frame_after is None:
+        return None
+
+    # Find blobs from the intentional movement
+    blobs = extract_motion_blobs(
+        frame_before, frame_after,
+        threshold=15, min_pixels=5, max_pixels=500,
+    )
+    cursor_blobs = [b for b in blobs if 5 <= b.pixel_count <= 500]
+    if not cursor_blobs:
+        return None
+
+    # Pick smallest blob (cursor arrow is small compared to UI elements)
+    best = min(cursor_blobs, key=lambda b: b.pixel_count)
+    bx, by = best.centroid
+
+    # Update tracker
+    if tracker:
+        tracker.set_position(bx, by, method="cnn_reacquire")
+
+    # Save training data from the re-acquired position
+    new_patch = extract_gray_patch(frame_after, bx, by)
+    if new_patch is not None:
+        if recognizer:
+            recognizer.update_cursor_template(new_patch)
+        if collector:
+            collector.collect_from_tracking(frame_after, bx, by, confidence=0.8)
+            state.sample_count_pos = collector.positive_count
+            state.sample_count_neg = collector.negative_count
+
+    return (bx, by)
+
+
 def cursor_validation_loop():
-    """Background thread: periodically validate cursor at known position.
+    """Background thread: validate cursor position + re-acquire if lost.
 
-    Every 30s:
-    1. CNN/template classify_patch at known (x, y)
-    2. If confidence > 0.7: cursor confirmed, update shape template
-    3. If confidence < 0.7: jitter to re-acquire via motion detection,
-       then save training sample from re-acquired position
+    Every cnn_interval_s (default 30s, configurable via /api/config):
 
-    Works in both daemon mode (JPEG from shm) and Python mode (sensor capture).
+    1. If no position or very stale (>60s): jitter re-acquire immediately
+    2. If position fresh: CNN classify_patch at (x, y)
+       - confidence > 0.7: confirmed, update template
+       - confidence < 0.7: jitter re-acquire
+
+    The jitter re-acquire is the fundamental primitive: move 5px,
+    capture before/after, find which blob moved. This ALWAYS finds the
+    cursor because only the cursor responds to our mouse commands.
     """
     while True:
-        time.sleep(30)
-        if not recognizer:
+        time.sleep(config.cnn_interval_s)
+        if not recognizer or not tracker:
             continue
 
         use_daemon = daemon_client and daemon_client.is_running()
-
-        if not use_daemon and (not sensor or not tracker):
+        if not use_daemon and not sensor:
             continue
 
-        # Get cursor position
-        if use_daemon:
-            ds = daemon_client.read_state()
-            if not ds or ds.cursor_age_s > 30.0:
-                continue  # No recent cursor — skip validation
-            cx, cy = ds.cursor_x, ds.cursor_y
-        else:
-            pos = tracker.position
-            if not pos:
-                continue
-            cx, cy = pos.x, pos.y
-
         try:
+            pos = tracker.position
+            now = time.monotonic()
+            position_stale = (not pos) or (now - pos.timestamp > 60)
+
+            if position_stale:
+                # Position unknown or very stale — skip CNN, go straight
+                # to jitter re-acquire. This is the startup path and the
+                # recovery path when cursor is lost.
+                result = _jitter_reacquire(use_daemon)
+                if result:
+                    state.cursor_validated = False  # Need CNN to confirm
+                    state.cnn_confidence = 0.0
+                continue
+
+            # Position is fresh — validate with CNN
+            cx, cy = pos.x, pos.y
             t0 = time.monotonic()
 
-            if use_daemon:
-                import cv2 as _cv2
-                import numpy as _np
-
-            # Get frame
             if use_daemon:
                 jpeg = daemon_client.read_jpeg()
                 if not jpeg:
                     continue
-                frame = _cv2.imdecode(
-                    _np.frombuffer(jpeg, dtype=_np.uint8), _cv2.IMREAD_COLOR)
+                frame = cv2.imdecode(
+                    np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
                 if frame is None:
                     continue
             else:
@@ -423,63 +535,15 @@ def cursor_validation_loop():
                 # Cursor confirmed at known position
                 recognizer.update_cursor_template(patch)
                 state.cursor_validated = True
-
-                # Save positive sample
                 if collector:
-                    collector.collect_from_tracking(frame, cx, cy, confidence=confidence)
+                    collector.collect_from_tracking(
+                        frame, cx, cy, confidence=confidence)
                     state.sample_count_pos = collector.positive_count
                     state.sample_count_neg = collector.negative_count
             else:
-                # Cursor NOT where we think
+                # CNN says cursor NOT here — jitter re-acquire
                 state.cursor_validated = False
-
-                # Jitter re-acquire: intentional micro-movement to produce
-                # a known signal, then re-capture to find the cursor via
-                # motion detection. Works in both daemon and Python mode.
-                if mouse:
-                    mouse._send_raw(5, 0)
-                    time.sleep(0.15)
-
-                    # Capture frame after jitter
-                    if use_daemon:
-                        jpeg_after = daemon_client.read_jpeg()
-                        if jpeg_after:
-                            frame_after = _cv2.imdecode(
-                                _np.frombuffer(jpeg_after, dtype=_np.uint8),
-                                _cv2.IMREAD_COLOR)
-                        else:
-                            frame_after = None
-                    else:
-                        frame_after = sensor.capture(settle_frames=1)
-
-                    mouse._send_raw(-5, 0)
-
-                    if frame_after is not None:
-                        blobs = extract_motion_blobs(
-                            frame, frame_after,
-                            threshold=15, min_pixels=5, max_pixels=500,
-                        )
-                        cursor_blobs = [b for b in blobs
-                                        if 5 <= b.pixel_count <= 500]
-                        if cursor_blobs:
-                            best = min(cursor_blobs,
-                                       key=lambda b: b.pixel_count)
-                            bx, by = best.centroid
-                            if tracker:
-                                tracker.set_position(bx, by,
-                                                     method="cnn_reacquire")
-
-                            # Save training data from re-acquisition
-                            new_patch = extract_gray_patch(
-                                frame_after, bx, by)
-                            if new_patch is not None and collector:
-                                collector.collect_from_tracking(
-                                    frame_after, bx, by, confidence=0.8)
-                                recognizer.update_cursor_template(new_patch)
-                                state.sample_count_pos = \
-                                    collector.positive_count
-                                state.sample_count_neg = \
-                                    collector.negative_count
+                _jitter_reacquire(use_daemon)
 
         except Exception:
             pass  # Non-critical — will retry next cycle
@@ -497,7 +561,7 @@ async def get_frame():
     with state.lock:
         jpeg = state.frame_overlay
     if jpeg:
-        return StreamingResponse(io.BytesIO(jpeg), media_type="image/jpeg")
+        return Response(content=jpeg, media_type="image/jpeg")
     return {"error": "No frame yet"}
 
 
@@ -716,18 +780,83 @@ async def locate_cursor():
 
 @app.get("/api/screenshot")
 async def screenshot(label: str = "capture"):
-    """Capture and save a frame for before/after comparison."""
-    if not sensor:
-        return {"error": "Sensor not initialized"}
+    """Capture and save an overlayed frame (what the user sees).
+
+    In daemon mode, returns the latest overlayed frame (with blob rects
+    and cursor crosshair). This is the same image visible in the dashboard,
+    suitable for the UI agent to see the current screen state.
+    """
     try:
-        frame = sensor.capture(settle_frames=1)
-        path = "/tmp/nav_" + label + ".jpg"
-        import cv2 as _cv2
-        bgr = _cv2.cvtColor(frame, _cv2.COLOR_RGB2BGR)
-        _cv2.imwrite(path, bgr, [_cv2.IMWRITE_JPEG_QUALITY, 90])
-        return {"saved": path, "shape": list(frame.shape)}
+        use_daemon = daemon_client and daemon_client.is_running()
+
+        if use_daemon:
+            # Return the latest overlayed frame from the motion loop
+            with state.lock:
+                jpeg = state.frame_overlay
+            if not jpeg:
+                return {"error": "No frame available yet"}
+            path = "/tmp/nav_" + label + ".jpg"
+            with open(path, "wb") as f:
+                f.write(jpeg)
+            return {"saved": path, "source": "daemon_overlay"}
+        elif sensor:
+            frame = sensor.capture(settle_frames=1)
+            path = "/tmp/nav_" + label + ".jpg"
+            import cv2 as _cv2
+            bgr = _cv2.cvtColor(frame, _cv2.COLOR_RGB2BGR)
+            _cv2.imwrite(path, bgr, [_cv2.IMWRITE_JPEG_QUALITY, 90])
+            return {"saved": path, "shape": list(frame.shape), "source": "sensor"}
+        else:
+            return {"error": "No frame source available"}
     except Exception as e:
         return {"error": str(e)}
+
+
+@app.get("/api/config")
+async def get_config():
+    """Return current dashboard configuration."""
+    return {
+        "frame_fps": config.frame_fps,
+        "cnn_interval_s": config.cnn_interval_s,
+        "jitter_interval_s": config.jitter_interval_s,
+        "jitter_pixels": config.jitter_pixels,
+    }
+
+
+@app.post("/api/config")
+async def set_config(request: Request):
+    """Update dashboard configuration at runtime.
+
+    Accepts JSON body with any subset of config keys. The UI agent
+    can tune these parameters based on the current task needs.
+
+    Example:
+        POST /api/config {"frame_fps": 5, "cnn_interval_s": 10}
+    """
+    data = await request.json()
+
+    if "frame_fps" in data:
+        config.frame_fps = max(0.1, min(30.0, float(data["frame_fps"])))
+    if "cnn_interval_s" in data:
+        config.cnn_interval_s = max(1.0, min(300.0, float(data["cnn_interval_s"])))
+    if "jitter_interval_s" in data:
+        config.jitter_interval_s = max(5.0, min(300.0, float(data["jitter_interval_s"])))
+        # Restart jitter with new interval
+        if mouse:
+            mouse.stop_anti_sleep()
+            mouse.start_anti_sleep(
+                interval=config.jitter_interval_s,
+                pixels=config.jitter_pixels)
+    if "jitter_pixels" in data:
+        config.jitter_pixels = max(1, min(30, int(data["jitter_pixels"])))
+        # Restart jitter with new amplitude
+        if mouse:
+            mouse.stop_anti_sleep()
+            mouse.start_anti_sleep(
+                interval=config.jitter_interval_s,
+                pixels=config.jitter_pixels)
+
+    return await get_config()
 
 
 # ── Dashboard HTML ──────────────────────────────────────────────────
@@ -1089,9 +1218,15 @@ DASHBOARD_HTML = r"""
             dot.style.display = 'block';
         }
 
-        setInterval(updateFrame, 250);
-        setInterval(updateState, 500);
-        updateFrame();
+        // State updates fast (smooth cursor dot), frame updates slow (1fps)
+        // Frame is rendered at config.frame_fps (default 1Hz) so polling
+        // faster just wastes bandwidth returning the same cached JPEG.
+        function scheduleFrame() {
+            updateFrame();
+            setTimeout(scheduleFrame, 1000);  // 1fps — matches default frame_fps
+        }
+        setInterval(updateState, 200);  // 5Hz — smooth cursor dot movement
+        scheduleFrame();
         updateState();
     </script>
 </body>
