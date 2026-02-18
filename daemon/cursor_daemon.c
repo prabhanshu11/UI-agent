@@ -327,59 +327,6 @@ static int extract_blobs(
     return out_count;
 }
 
-/* ── Cursor Tracking ──────────────────────────────────────────── */
-
-static void track_cursor(
-    const ShmBlob *blobs, int blob_count,
-    int32_t *cx, int32_t *cy,
-    float *age, uint8_t *method)
-{
-    int best_idx = -1;
-    int best_dist_sq = 0x7FFFFFFF;
-    int smallest_count = 0x7FFFFFFF;
-    int smallest_idx = -1;
-    int stale = (*age > 10.0f);
-
-    for (int i = 0; i < blob_count; i++) {
-        int pc = blobs[i].pixel_count;
-        if (pc < 5 || pc > 500) continue;
-
-        if (stale) {
-            if (pc < smallest_count) {
-                smallest_count = pc;
-                smallest_idx = i;
-            }
-        } else {
-            int dx = blobs[i].centroid_x - *cx;
-            int dy = blobs[i].centroid_y - *cy;
-            int dist_sq = dx * dx + dy * dy;
-            if (dist_sq < best_dist_sq) {
-                best_dist_sq = dist_sq;
-                best_idx = i;
-            }
-        }
-    }
-
-    if (stale && smallest_idx >= 0) {
-        best_idx = smallest_idx;
-    }
-
-    /* Reject if too far from last known position */
-    if (best_idx >= 0 && !stale) {
-        int dx = blobs[best_idx].centroid_x - *cx;
-        int dy = blobs[best_idx].centroid_y - *cy;
-        if (dx * dx + dy * dy > 600 * 600)
-            best_idx = -1;
-    }
-
-    if (best_idx >= 0) {
-        *cx = blobs[best_idx].centroid_x;
-        *cy = blobs[best_idx].centroid_y;
-        *age = 0.0f;
-        *method = METHOD_MOTION_TRACK;
-    }
-}
-
 /* ── Recording Thread ─────────────────────────────────────────── */
 
 typedef struct {
@@ -893,9 +840,6 @@ int main(int argc, char **argv) {
     }
 
     int has_prev = 0;
-    int32_t cursor_x = 0, cursor_y = 0;
-    float cursor_age = 999.0f;
-    uint8_t cursor_method = METHOD_UNKNOWN;
 
     /* FPS tracking */
     uint64_t fps_start = now_ns();
@@ -961,8 +905,10 @@ int main(int argc, char **argv) {
             blob_count = extract_blobs(diff_mask, labels, w, h,
                                        local_blobs, MAX_BLOBS,
                                        cfg.min_pixels, cfg.max_pixels);
-            track_cursor(local_blobs, blob_count,
-                         &cursor_x, &cursor_y, &cursor_age, &cursor_method);
+            /* Cursor identification is NOT done here — the daemon only
+             * reports raw blobs. Python (which controls the mouse and
+             * knows when jitter/Lissajous fires) identifies which blob
+             * is the cursor by correlating with known movements. */
         }
 
         /* Encode JPEG to shared memory */
@@ -977,10 +923,8 @@ int main(int argc, char **argv) {
         memcpy((void *)&g_shm->seq_begin, &seq, sizeof(seq));
         atomic_thread_fence(memory_order_release);
 
-        g_shm->cursor_x      = cursor_x;
-        g_shm->cursor_y      = cursor_y;
-        g_shm->cursor_age_s  = cursor_age;
-        g_shm->cursor_method = cursor_method;
+        /* Cursor x/y/age/method are NOT set by daemon — Python owns cursor
+         * identification via jitter correlation + CNN validation. */
         g_shm->blob_count    = blob_count;
         memcpy(g_shm->blobs, local_blobs, blob_count * sizeof(ShmBlob));
         g_shm->frame_count++;
@@ -995,17 +939,13 @@ int main(int argc, char **argv) {
         if (elapsed >= 2000000000ULL) { /* Every 2 seconds */
             g_shm->fps = (float)fps_count * 1e9f / (float)elapsed;
             if (cfg.verbose) {
-                printf("  fps=%.1f blobs=%d cursor=(%d,%d) age=%.1f frames=%lu\n",
+                printf("  fps=%.1f blobs=%d frames=%lu\n",
                        g_shm->fps, blob_count,
-                       cursor_x, cursor_y, cursor_age,
                        (unsigned long)g_shm->frame_count);
             }
             fps_count = 0;
             fps_start = now_ns();
         }
-
-        /* Age cursor */
-        cursor_age += 1.0f / TARGET_FPS;
 
         /* Swap Y buffers */
         uint8_t *tmp = y_prev;

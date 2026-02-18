@@ -146,7 +146,18 @@ def frame_to_jpeg(frame: np.ndarray, quality: int = 80) -> bytes:
 
 
 def _daemon_motion_loop():
-    """Read state from C daemon shared memory — no direct V4L2 capture."""
+    """Read blobs + frames from C daemon shm. Cursor ID stays in Python.
+
+    The daemon provides fast frame capture, JPEG encoding, and blob extraction.
+    Cursor identification is done here using the tracker's known position —
+    the daemon does NOT identify which blob is the cursor (it can't, because
+    it doesn't control the mouse and can't distinguish cursor motion from
+    UI animations).
+
+    Cursor position comes from:
+    - tracker.position (set by jitter/Lissajous/probe — known mouse movements)
+    - The anti-sleep jitter (±3px every 30s) is the primary cursor tracker
+    """
     while True:
         try:
             ds = daemon_client.read_state()
@@ -157,12 +168,14 @@ def _daemon_motion_loop():
             with state.lock:
                 state.blobs = ds.blobs
                 state.blob_count = ds.blob_count
-                state.cursor_x = ds.cursor_x
-                state.cursor_y = ds.cursor_y
-                state.cursor_age_s = ds.cursor_age_s
-                state.cursor_method = ds.cursor_method
                 state.fps = ds.fps
                 state.frame_count = ds.frame_count
+                # Cursor position from tracker, NOT from daemon
+                if tracker and tracker.position:
+                    state.cursor_x = tracker.position.x
+                    state.cursor_y = tracker.position.y
+                    state.cursor_age_s = tracker.position.age_s
+                    state.cursor_method = tracker.position.method
 
             # Read JPEG frame (already encoded by daemon, no overlay)
             jpeg = daemon_client.read_jpeg()
@@ -548,27 +561,34 @@ async def probe_cursor(amplitude: int = 30):
     Pauses motion loop, moves mouse by amplitude, captures diff,
     returns detected position. Updates tracker state.
     """
-    if daemon_client and daemon_client.is_running():
-        # Daemon provides always-on cursor tracking — return latest position
-        ds = daemon_client.read_state()
-        if ds:
-            return {
-                "cursor": {"x": ds.cursor_x, "y": ds.cursor_y},
-                "method": ds.cursor_method,
-                "age_s": round(ds.cursor_age_s, 3),
-                "source": "daemon",
-            }
-        return {"error": "Daemon running but state read failed"}
-    if not mouse or not sensor:
+    if not mouse:
+        return {"error": "Mouse not initialized"}
+
+    # In daemon mode, use daemon JPEG frames instead of sensor
+    use_daemon = daemon_client and daemon_client.is_running()
+    if not use_daemon and not sensor:
         return {"error": "Hardware not initialized"}
 
     import cv2 as _cv2
+    import numpy as _np
     try:
-        # Capture two frames back-to-back with mouse movement in between
-        frame_before = sensor.capture(settle_frames=1)
+        # Capture frame before probe
+        if use_daemon:
+            jpeg = daemon_client.read_jpeg()
+            if not jpeg:
+                return {"error": "No frame from daemon"}
+            frame_before = _cv2.imdecode(
+                _np.frombuffer(jpeg, dtype=_np.uint8), _cv2.IMREAD_COLOR)
+        else:
+            frame_before = sensor.capture(settle_frames=1)
         mouse._send_raw(amplitude, 0)
         time.sleep(0.15)
-        frame_after = sensor.capture(settle_frames=1)
+        if use_daemon:
+            jpeg2 = daemon_client.read_jpeg()
+            frame_after = _cv2.imdecode(
+                _np.frombuffer(jpeg2, dtype=_np.uint8), _cv2.IMREAD_COLOR) if jpeg2 else frame_before
+        else:
+            frame_after = sensor.capture(settle_frames=1)
         mouse._send_raw(-amplitude, 0)
 
         # Use cursor shape filter to distinguish cursor from UI changes
@@ -616,31 +636,32 @@ async def locate_cursor():
     that follow both movements. The cursor is the only thing that
     moves consistently in both directions.
     """
-    if daemon_client and daemon_client.is_running():
-        # Daemon provides always-on cursor tracking — return latest position
-        ds = daemon_client.read_state()
-        if ds:
-            return {
-                "cursor": {"x": ds.cursor_x, "y": ds.cursor_y},
-                "method": ds.cursor_method,
-                "age_s": round(ds.cursor_age_s, 3),
-                "blob_count": ds.blob_count,
-                "source": "daemon",
-            }
-        return {"error": "Daemon running but state read failed"}
-    if not mouse or not sensor:
+    if not mouse:
+        return {"error": "Mouse not initialized"}
+
+    use_daemon = daemon_client and daemon_client.is_running()
+    if not use_daemon and not sensor:
         return {"error": "Hardware not initialized"}
 
+    def _capture():
+        if use_daemon:
+            import cv2, numpy as np
+            jpeg = daemon_client.read_jpeg()
+            if jpeg:
+                return cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+            return None
+        return sensor.capture(settle_frames=1)
+
     try:
-        frame_a = sensor.capture(settle_frames=1)
+        frame_a = _capture()
 
         mouse._send_chunked(120, 0)
         time.sleep(0.2)
-        frame_b = sensor.capture(settle_frames=1)
+        frame_b = _capture()
 
         mouse._send_chunked(0, 120)
         time.sleep(0.2)
-        frame_c = sensor.capture(settle_frames=1)
+        frame_c = _capture()
 
         # Return cursor to original position
         mouse._send_chunked(-120, -120)
