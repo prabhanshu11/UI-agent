@@ -127,27 +127,8 @@ def draw_blob_overlay(frame: np.ndarray, blobs: list[MotionBlob],
         cv2.putText(overlay, label, (x_min, y_min - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
-    cx, cy = cursor_pos
-    if 0 <= cx < frame.shape[1] and 0 <= cy < frame.shape[0]:
-        # Bright green dot with glow rings — pointer position marker
-        cv2.circle(overlay, (cx, cy), 18, (0, 255, 0), 2)       # Outer ring
-        cv2.circle(overlay, (cx, cy), 10, (0, 255, 0), -1)      # Filled core
-        cv2.circle(overlay, (cx, cy), 5, (255, 255, 255), -1)    # White center
-        pos_text = "(" + str(cx) + "," + str(cy) + ")"
-        cv2.putText(overlay, pos_text, (cx + 22, cy - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-    hud = "Blobs: " + str(len(blobs)) + " | FPS: " + "{:.1f}".format(state.fps) + " | Frames: " + str(state.frame_count)
-    cv2.putText(overlay, hud, (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-
-    tracker_hud = "Tracker: " + state.cursor_method + " | Age: " + "{:.1f}".format(state.cursor_age_s) + "s"
-    cv2.putText(overlay, tracker_hud, (10, 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-
-    cnn_hud = "CNN: " + "{:.2f}".format(state.cnn_confidence) + " | " + state.cnn_model_version
-    cv2.putText(overlay, cnn_hud, (10, 75),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    # Cursor position and HUD info are shown by the browser-side CSS dot
+    # and sidebar panels respectively — no need to draw on the video frame.
 
     return overlay
 
@@ -181,8 +162,31 @@ def _daemon_motion_loop():
 
             now = time.monotonic()
 
-            # ── Update shared state (fast, ~20Hz) ──────────────────
+            # ── Continuous cursor tracking from daemon blobs ────────
             pos = tracker.position if tracker else None
+            cursor_blobs = [b for b in ds.blobs if 5 <= b.pixel_count <= 500]
+            if cursor_blobs:
+                if pos and (now - pos.timestamp < 10):
+                    # Position fresh — pick blob closest to last known
+                    best = min(cursor_blobs, key=lambda b:
+                        ((b.centroid[0] - pos.x) ** 2 +
+                         (b.centroid[1] - pos.y) ** 2) ** 0.5)
+                    dist = ((best.centroid[0] - pos.x) ** 2 +
+                            (best.centroid[1] - pos.y) ** 2) ** 0.5
+                    if dist < 200:
+                        bx, by = best.centroid
+                        if tracker:
+                            tracker.set_position(bx, by, method="motion_track")
+                        pos = tracker.position
+                else:
+                    # Position stale (>10s) — pick smallest as initial guess
+                    best = min(cursor_blobs, key=lambda b: b.pixel_count)
+                    bx, by = best.centroid
+                    if tracker:
+                        tracker.set_position(bx, by, method="motion_track")
+                    pos = tracker.position
+
+            # ── Update shared state (fast, ~20Hz) ──────────────────
             cursor_pos = (0, 0)
             with state.lock:
                 state.blobs = ds.blobs
@@ -390,81 +394,119 @@ def pi_keyboard_monitor_loop():
 
 
 def _jitter_reacquire(use_daemon):
-    """Jitter re-acquire: move mouse 5px, capture before/after, find cursor.
+    """Dual-direction probe to reliably find cursor position.
 
-    This is the fundamental cursor-finding primitive: produce a KNOWN
-    movement, then find which blob matches. Only the cursor moves when
-    we command it — UI animations are independent.
+    Moves cursor RIGHT then DOWN, captures 3 frames, matches blobs
+    that follow both movements. Only the cursor responds to both —
+    UI animations and video noise don't follow our mouse commands.
+
+    Same proven pattern as /api/locate but with smaller (15px) movements.
 
     Returns (x, y) of detected cursor, or None.
     """
     if not mouse:
         return None
 
-    # Capture frame BEFORE jitter
-    if use_daemon:
-        jpeg_before = daemon_client.read_jpeg()
-        if not jpeg_before:
-            return None
-        frame_before = cv2.imdecode(
-            np.frombuffer(jpeg_before, dtype=np.uint8), cv2.IMREAD_COLOR)
-    else:
-        if not sensor:
-            return None
-        frame_before = sensor.capture(settle_frames=1)
+    amp = 15  # Small enough to not disrupt user, large enough to detect
 
-    if frame_before is None:
+    def _capture():
+        if use_daemon:
+            jpeg = daemon_client.read_jpeg()
+            if jpeg:
+                return cv2.imdecode(
+                    np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+            return None
+        if sensor:
+            return sensor.capture(settle_frames=1)
         return None
 
-    # Jitter: move right 5px
-    mouse._send_raw(5, 0)
+    frame_a = _capture()
+    if frame_a is None:
+        return None
+
+    # Move RIGHT
+    mouse._send_raw(amp, 0)
     time.sleep(0.15)
+    frame_b = _capture()
 
-    # Capture frame AFTER jitter
-    if use_daemon:
-        jpeg_after = daemon_client.read_jpeg()
-        if jpeg_after:
-            frame_after = cv2.imdecode(
-                np.frombuffer(jpeg_after, dtype=np.uint8), cv2.IMREAD_COLOR)
-        else:
-            frame_after = None
-    else:
-        frame_after = sensor.capture(settle_frames=1)
+    # Move DOWN
+    mouse._send_raw(0, amp)
+    time.sleep(0.15)
+    frame_c = _capture()
 
-    # Undo jitter
-    mouse._send_raw(-5, 0)
+    # Undo both movements
+    mouse._send_raw(-amp, -amp)
 
-    if frame_after is None:
+    if frame_b is None or frame_c is None:
         return None
 
-    # Find blobs from the intentional movement
-    blobs = extract_motion_blobs(
-        frame_before, frame_after,
-        threshold=15, min_pixels=5, max_pixels=500,
-    )
-    cursor_blobs = [b for b in blobs if 5 <= b.pixel_count <= 500]
-    if not cursor_blobs:
+    # Extract motion blobs from each direction
+    blobs_ab = extract_motion_blobs(
+        frame_a, frame_b, threshold=15, min_pixels=5, max_pixels=2000)
+    blobs_bc = extract_motion_blobs(
+        frame_b, frame_c, threshold=15, min_pixels=5, max_pixels=2000)
+
+    if not blobs_ab or not blobs_bc:
+        # Fallback: if only one direction got blobs, pick smallest from it
+        fallback_blobs = blobs_ab or blobs_bc
+        if fallback_blobs:
+            small = [b for b in fallback_blobs if b.pixel_count <= 500]
+            if small:
+                best = min(small, key=lambda b: b.pixel_count)
+                bx, by = best.centroid
+                if tracker:
+                    tracker.set_position(bx, by, method="dual_probe")
+                return (bx, by)
         return None
 
-    # Pick smallest blob (cursor arrow is small compared to UI elements)
-    best = min(cursor_blobs, key=lambda b: b.pixel_count)
-    bx, by = best.centroid
+    # Match blob pairs across both directions.
+    # After moving right by amp, cursor blob in A→B is near (original_x + amp/2, original_y).
+    # After moving down by amp, cursor blob in B→C is offset from A→B blob by ~(0, amp/2).
+    half = amp / 2.0
+    best_match = None
+    best_dist = 9999
+    for ba in blobs_ab:
+        for bc in blobs_bc:
+            # B→C blob should be shifted ~(0, +half) from A→B blob
+            dx = bc.centroid[0] - ba.centroid[0]
+            dy = bc.centroid[1] - ba.centroid[1]
+            dist = ((dx - 0) ** 2 + (dy - half) ** 2) ** 0.5
+            if dist < best_dist:
+                best_dist = dist
+                best_match = (ba, bc)
 
-    # Update tracker
-    if tracker:
-        tracker.set_position(bx, by, method="cnn_reacquire")
+    if best_match and best_dist < amp * 3:
+        ba, bc = best_match
+        # Cursor was at: A→B blob centroid minus half the rightward movement
+        cursor_x = ba.centroid[0] - int(half)
+        cursor_y = ba.centroid[1]
 
-    # Save training data from the re-acquired position
-    new_patch = extract_gray_patch(frame_after, bx, by)
-    if new_patch is not None:
-        if recognizer:
-            recognizer.update_cursor_template(new_patch)
-        if collector:
-            collector.collect_from_tracking(frame_after, bx, by, confidence=0.8)
-            state.sample_count_pos = collector.positive_count
-            state.sample_count_neg = collector.negative_count
+        if tracker:
+            tracker.set_position(cursor_x, cursor_y, method="dual_probe")
 
-    return (bx, by)
+        # Save training data
+        new_patch = extract_gray_patch(frame_b, ba.centroid[0], ba.centroid[1])
+        if new_patch is not None:
+            if recognizer:
+                recognizer.update_cursor_template(new_patch)
+            if collector:
+                collector.collect_from_tracking(
+                    frame_b, cursor_x, cursor_y, confidence=0.9)
+                state.sample_count_pos = collector.positive_count
+                state.sample_count_neg = collector.negative_count
+
+        return (cursor_x, cursor_y)
+
+    # No dual match — fallback to smallest blob from A→B diff
+    small_ab = [b for b in blobs_ab if b.pixel_count <= 500]
+    if small_ab:
+        best = min(small_ab, key=lambda b: b.pixel_count)
+        bx, by = best.centroid
+        if tracker:
+            tracker.set_position(bx, by, method="dual_probe")
+        return (bx, by)
+
+    return None
 
 
 def cursor_validation_loop():
@@ -472,14 +514,14 @@ def cursor_validation_loop():
 
     Every cnn_interval_s (default 30s, configurable via /api/config):
 
-    1. If no position or very stale (>60s): jitter re-acquire immediately
+    1. If no position or very stale (>60s): dual-probe re-acquire immediately
     2. If position fresh: CNN classify_patch at (x, y)
        - confidence > 0.7: confirmed, update template
-       - confidence < 0.7: jitter re-acquire
+       - confidence < 0.7: dual-probe re-acquire
 
-    The jitter re-acquire is the fundamental primitive: move 5px,
-    capture before/after, find which blob moved. This ALWAYS finds the
-    cursor because only the cursor responds to our mouse commands.
+    The dual-probe re-acquire moves cursor right then down, captures 3
+    frames, and matches blobs across both directions. Only the real cursor
+    follows both movements — UI noise doesn't.
     """
     while True:
         time.sleep(config.cnn_interval_s)
