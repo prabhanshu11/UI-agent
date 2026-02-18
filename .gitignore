@@ -38,3 +38,11 @@ venv.bak/
 
 # Custom
 progress.md
+progress_actual.md
+
+# CNN cursor recognition data
+data/cursor_samples/*.png
+data/cursor_samples/index.jsonl
+data/cursor_models/*.pt
+data/cursor_models/training_log.jsonl
+data/cursor_models/performance_log.jsonl

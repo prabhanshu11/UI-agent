@@ -75,6 +75,7 @@ class CursorLocator:
         curve: Optional[LissajousCurve] = None,
         max_duration: float = 5.0,
         video_fps: int = 30,
+        collector=None,
     ):
         """
         Args:
@@ -84,12 +85,14 @@ class CursorLocator:
                 virtual desktop with irrational frequency ratio.
             max_duration: Maximum seconds to sweep before giving up.
             video_fps: HDMI capture framerate.
+            collector: Optional CursorSampleCollector for CNN training data.
         """
         self.mouse = mouse
         self.sensor = sensor
         self.curve = curve or LissajousCurve()
         self.max_duration = max_duration
         self.video_fps = video_fps
+        self.collector = collector
 
     def locate(self, verbose: bool = True) -> Optional[CursorPosition]:
         """Locate cursor on the HDMI-captured screen.
@@ -140,6 +143,15 @@ class CursorLocator:
 
         if result:
             self.mouse.set_position(result.x, result.y)
+
+            # Collect high-confidence training sample for CNN
+            if self.collector:
+                try:
+                    sample_frame = self.sensor.capture(settle_frames=1)
+                    self.collector.collect_from_locate(
+                        sample_frame, result.x, result.y, result.correlation)
+                except Exception:
+                    pass  # Non-critical — don't break locate flow
 
         return result
 
