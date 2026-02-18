@@ -18,6 +18,7 @@ from .experience_logger import ExperienceLogger
 from .cursor_tracker import CursorTracker, TrackedPosition
 from .cursor_sample_collector import CursorSampleCollector, extract_gray_patch
 from .cursor_recognizer import CursorRecognizer
+from .daemon_client import DaemonClient, DaemonState
 
 __all__ = [
     "USBCaptureCard",
@@ -36,4 +37,6 @@ __all__ = [
     "extract_motion_blobs",
     "extract_gray_patch",
     "match_curve_segment",
+    "DaemonClient",
+    "DaemonState",
 ]

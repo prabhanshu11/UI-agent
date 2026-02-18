@@ -35,6 +35,7 @@ from src.hardware.cursor_detector import extract_motion_blobs, MotionBlob
 from src.hardware.cursor_tracker import CursorTracker
 from src.hardware.cursor_sample_collector import CursorSampleCollector, extract_gray_patch
 from src.hardware.cursor_recognizer import CursorRecognizer
+from src.hardware.daemon_client import DaemonClient
 
 app = FastAPI(title="KVM Control Dashboard")
 
@@ -77,6 +78,7 @@ sensor: Optional[HDMISensor] = None
 tracker: Optional[CursorTracker] = None
 recognizer: Optional[CursorRecognizer] = None
 collector: Optional[CursorSampleCollector] = None
+daemon_client: Optional[DaemonClient] = None
 
 
 # ── Motion detection service (background thread) ───────────────────
@@ -143,8 +145,50 @@ def frame_to_jpeg(frame: np.ndarray, quality: int = 80) -> bytes:
     return buf.tobytes()
 
 
+def _daemon_motion_loop():
+    """Read state from C daemon shared memory — no direct V4L2 capture."""
+    while True:
+        try:
+            ds = daemon_client.read_state()
+            if ds is None:
+                time.sleep(0.05)
+                continue
+
+            with state.lock:
+                state.blobs = ds.blobs
+                state.blob_count = ds.blob_count
+                state.cursor_x = ds.cursor_x
+                state.cursor_y = ds.cursor_y
+                state.cursor_age_s = ds.cursor_age_s
+                state.cursor_method = ds.cursor_method
+                state.fps = ds.fps
+                state.frame_count = ds.frame_count
+
+            # Read JPEG frame (already encoded by daemon, no overlay)
+            jpeg = daemon_client.read_jpeg()
+            if jpeg:
+                with state.lock:
+                    state.frame_overlay = jpeg
+
+            time.sleep(0.016)  # ~60Hz polling (daemon runs at 30fps)
+
+        except Exception as e:
+            state.error = str(e)
+            time.sleep(1)
+
+
 def motion_detection_loop():
-    """Background thread: continuously capture frames, run motion detection."""
+    """Background thread: uses C daemon if available, else Python capture."""
+    if daemon_client and daemon_client.is_running():
+        print("  Daemon detected — using shared memory for motion detection")
+        _daemon_motion_loop()
+    else:
+        print("  Daemon not running — using Python motion detection")
+        _python_motion_loop()
+
+
+def _python_motion_loop():
+    """Original Python motion detection loop (fallback when daemon not running)."""
     prev_frame = None
     frame_times = []
 
@@ -307,20 +351,51 @@ def cursor_validation_loop():
     2. If confidence > 0.7: cursor confirmed, update shape template
     3. If confidence < 0.7: jitter to re-acquire via motion detection,
        then save training sample from re-acquired position
+
+    Works in both daemon mode (JPEG from shm) and Python mode (sensor capture).
     """
     while True:
         time.sleep(30)
-        if not recognizer or not sensor or not tracker:
+        if not recognizer:
             continue
 
-        pos = tracker.position
-        if not pos:
-            continue  # No known position — let Lissajous handle it
+        use_daemon = daemon_client and daemon_client.is_running()
+
+        if not use_daemon and (not sensor or not tracker):
+            continue
+
+        # Get cursor position
+        if use_daemon:
+            ds = daemon_client.read_state()
+            if not ds or ds.cursor_age_s > 30.0:
+                continue  # No recent cursor — skip validation
+            cx, cy = ds.cursor_x, ds.cursor_y
+        else:
+            pos = tracker.position
+            if not pos:
+                continue
+            cx, cy = pos.x, pos.y
 
         try:
             t0 = time.monotonic()
-            frame = sensor.capture(settle_frames=1)
-            patch = extract_gray_patch(frame, pos.x, pos.y)
+
+            if use_daemon:
+                import cv2 as _cv2
+                import numpy as _np
+
+            # Get frame
+            if use_daemon:
+                jpeg = daemon_client.read_jpeg()
+                if not jpeg:
+                    continue
+                frame = _cv2.imdecode(
+                    _np.frombuffer(jpeg, dtype=_np.uint8), _cv2.IMREAD_COLOR)
+                if frame is None:
+                    continue
+            else:
+                frame = sensor.capture(settle_frames=1)
+
+            patch = extract_gray_patch(frame, cx, cy)
             if patch is None:
                 continue
 
@@ -335,33 +410,63 @@ def cursor_validation_loop():
                 # Cursor confirmed at known position
                 recognizer.update_cursor_template(patch)
                 state.cursor_validated = True
+
+                # Save positive sample
+                if collector:
+                    collector.collect_from_tracking(frame, cx, cy, confidence=confidence)
+                    state.sample_count_pos = collector.positive_count
+                    state.sample_count_neg = collector.negative_count
             else:
-                # Cursor NOT where we think — jitter to re-acquire
+                # Cursor NOT where we think
                 state.cursor_validated = False
+
+                # Jitter re-acquire: intentional micro-movement to produce
+                # a known signal, then re-capture to find the cursor via
+                # motion detection. Works in both daemon and Python mode.
                 if mouse:
                     mouse._send_raw(5, 0)
                     time.sleep(0.15)
-                    frame_after = sensor.capture(settle_frames=1)
+
+                    # Capture frame after jitter
+                    if use_daemon:
+                        jpeg_after = daemon_client.read_jpeg()
+                        if jpeg_after:
+                            frame_after = _cv2.imdecode(
+                                _np.frombuffer(jpeg_after, dtype=_np.uint8),
+                                _cv2.IMREAD_COLOR)
+                        else:
+                            frame_after = None
+                    else:
+                        frame_after = sensor.capture(settle_frames=1)
+
                     mouse._send_raw(-5, 0)
 
-                    blobs = extract_motion_blobs(
-                        frame, frame_after,
-                        threshold=15, min_pixels=5, max_pixels=500,
-                    )
-                    cursor_blobs = [b for b in blobs if 5 <= b.pixel_count <= 500]
-                    if cursor_blobs:
-                        best = min(cursor_blobs, key=lambda b: b.pixel_count)
-                        bx, by = best.centroid
-                        tracker.set_position(bx, by, method="cnn_reacquire")
+                    if frame_after is not None:
+                        blobs = extract_motion_blobs(
+                            frame, frame_after,
+                            threshold=15, min_pixels=5, max_pixels=500,
+                        )
+                        cursor_blobs = [b for b in blobs
+                                        if 5 <= b.pixel_count <= 500]
+                        if cursor_blobs:
+                            best = min(cursor_blobs,
+                                       key=lambda b: b.pixel_count)
+                            bx, by = best.centroid
+                            if tracker:
+                                tracker.set_position(bx, by,
+                                                     method="cnn_reacquire")
 
-                        # Save training data from re-acquisition
-                        new_patch = extract_gray_patch(frame_after, bx, by)
-                        if new_patch is not None and collector:
-                            collector.collect_from_tracking(
-                                frame_after, bx, by, confidence=0.8)
-                            recognizer.update_cursor_template(new_patch)
-                            state.sample_count_pos = collector.positive_count
-                            state.sample_count_neg = collector.negative_count
+                            # Save training data from re-acquisition
+                            new_patch = extract_gray_patch(
+                                frame_after, bx, by)
+                            if new_patch is not None and collector:
+                                collector.collect_from_tracking(
+                                    frame_after, bx, by, confidence=0.8)
+                                recognizer.update_cursor_template(new_patch)
+                                state.sample_count_pos = \
+                                    collector.positive_count
+                                state.sample_count_neg = \
+                                    collector.negative_count
 
         except Exception:
             pass  # Non-critical — will retry next cycle
@@ -443,6 +548,17 @@ async def probe_cursor(amplitude: int = 30):
     Pauses motion loop, moves mouse by amplitude, captures diff,
     returns detected position. Updates tracker state.
     """
+    if daemon_client and daemon_client.is_running():
+        # Daemon provides always-on cursor tracking — return latest position
+        ds = daemon_client.read_state()
+        if ds:
+            return {
+                "cursor": {"x": ds.cursor_x, "y": ds.cursor_y},
+                "method": ds.cursor_method,
+                "age_s": round(ds.cursor_age_s, 3),
+                "source": "daemon",
+            }
+        return {"error": "Daemon running but state read failed"}
     if not mouse or not sensor:
         return {"error": "Hardware not initialized"}
 
@@ -500,6 +616,18 @@ async def locate_cursor():
     that follow both movements. The cursor is the only thing that
     moves consistently in both directions.
     """
+    if daemon_client and daemon_client.is_running():
+        # Daemon provides always-on cursor tracking — return latest position
+        ds = daemon_client.read_state()
+        if ds:
+            return {
+                "cursor": {"x": ds.cursor_x, "y": ds.cursor_y},
+                "method": ds.cursor_method,
+                "age_s": round(ds.cursor_age_s, 3),
+                "blob_count": ds.blob_count,
+                "source": "daemon",
+            }
+        return {"error": "Daemon running but state read failed"}
     if not mouse or not sensor:
         return {"error": "Hardware not initialized"}
 
@@ -953,11 +1081,18 @@ DASHBOARD_HTML = r"""
 # ── Startup ─────────────────────────────────────────────────────────
 
 def init_hardware():
-    global mouse, sensor, tracker, recognizer, collector
+    global mouse, sensor, tracker, recognizer, collector, daemon_client
 
     print("Initializing hardware...")
     mouse = ESP32Mouse('/dev/ttyUSB0', screen_width=1920, screen_height=1080)
-    sensor = HDMISensor('/dev/video0')
+
+    # Check for C cursor daemon before opening V4L2
+    daemon_client = DaemonClient()
+    if daemon_client.is_running():
+        sensor = None  # Daemon owns /dev/video0
+        print("  C daemon detected — sensor owned by daemon")
+    else:
+        sensor = HDMISensor('/dev/video0')
 
     mouse.set_position(6, 15)
     print("  Mouse position: " + str(mouse.get_position()))
