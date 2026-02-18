@@ -49,11 +49,10 @@ OFF_JPEG0_SIZE    = 848
 OFF_JPEG0_DATA    = 852
 OFF_JPEG1_SIZE    = 852 + JPEG_BUF_SIZE          # 525140
 OFF_JPEG1_DATA    = 852 + JPEG_BUF_SIZE + 4      # 525144
-OFF_JPEG_ACTIVE   = 852 + 2 * JPEG_BUF_SIZE + 8  # 1049436
+OFF_JPEG_ACTIVE   = OFF_JPEG1_DATA + JPEG_BUF_SIZE  # 1049432
 
 # Total shm size (must match C sizeof(CursorDaemonShm))
-# Approximate: OFF_JPEG_ACTIVE + 1 rounded up
-SHM_SIZE = OFF_JPEG_ACTIVE + 8  # Small overestimate is fine for mmap
+SHM_SIZE = OFF_JPEG_ACTIVE + 1  # 1049433 = sizeof(CursorDaemonShm)
 
 BLOB_SIZE = 24  # sizeof(ShmBlob)
 

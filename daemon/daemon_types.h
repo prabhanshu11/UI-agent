@@ -130,7 +130,7 @@ typedef struct __attribute__((packed)) {
  * OFF_JPEG0_DATA     =  852
  * OFF_JPEG1_SIZE     =  852 + JPEG_BUF_SIZE
  * OFF_JPEG1_DATA     =  852 + JPEG_BUF_SIZE + 4
- * OFF_JPEG_ACTIVE    =  852 + 2*JPEG_BUF_SIZE + 8
+ * OFF_JPEG_ACTIVE    =  852 + JPEG_BUF_SIZE + 4 + JPEG_BUF_SIZE  (= 1049432)
  */
 
 #endif /* DAEMON_TYPES_H */
