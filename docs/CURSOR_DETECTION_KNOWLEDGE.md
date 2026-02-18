@@ -209,3 +209,13 @@ This knowledge base exists because:
 4. The user had to say: *"current situation reveals that you are not able to recreate experiences effectively... Once a good thing is created, it should not be forgotten."*
 
 **Rule**: When an approach is proven to work, the working code path must be preserved or the replacement must be tested before commit. Conversation history IS the experience log.
+
+## 11. Adaptive Detection Area
+
+Once the cursor is found and stationary, the motion detector doesn't need to analyze the full 1920×1080 frame. It can **concentrate on a small region around the known cursor position** — say a 200×200px window — making frame differencing and blob extraction dramatically cheaper (< 5ms instead of 40ms at half-res).
+
+The region **expands dynamically** when:
+- The cursor is detected to move **beyond the jitter threshold** (> 3px, exceeding the micro-shake range) — the detection area grows to follow the movement trajectory
+- The cursor **disappears** from the monitored region entirely — the area expands progressively (200→400→800→full frame) until the cursor is re-acquired, or a Tier 3 Lissajous re-detect is triggered
+
+This creates an efficient attention mechanism: cheap tight tracking when the cursor is still, adaptive expansion when it moves, full re-detect only when truly lost. Combined with the three-tier daemon (Section 5), this means the system spends most of its time in the cheapest mode.
