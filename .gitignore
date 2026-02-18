@@ -40,6 +40,9 @@ venv.bak/
 progress.md
 progress_actual.md
 
+# C daemon binary (build from source: cd daemon && make)
+daemon/cursor-daemon
+
 # CNN cursor recognition data
 data/cursor_samples/*.png
 data/cursor_samples/index.jsonl
