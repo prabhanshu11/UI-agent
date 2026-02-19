@@ -753,13 +753,21 @@ def jitter_loop():
         use_daemon = daemon_client and daemon_client.is_running()
         now = time.monotonic()
 
-        # Check if sustained low confidence warrants re-acquisition.
-        # Trigger: confidence has been <0.7 for the entire jitter cycle.
-        need_reacquire = (
+        # Check if re-acquisition needed. Two independent triggers:
+        # 1. CNN: confidence < 0.7 for entire jitter cycle
+        # 2. Silhouette: tracker struggling (ROI expanded OR high misses)
+        # Silhouette trigger bypasses CNN false-positive problem.
+        cnn_trigger = (
             _low_confidence_since > 0 and
-            (now - _low_confidence_since) > config.jitter_interval_s and
-            (use_daemon or sensor)
+            (now - _low_confidence_since) > config.jitter_interval_s
         )
+        sil_trigger = (
+            sil_tracker and (
+                sil_tracker.roi_size >= sil_tracker.ROI_MAX or
+                sil_tracker.consecutive_misses >= 10
+            )
+        )
+        need_reacquire = (cnn_trigger or sil_trigger) and (use_daemon or sensor)
 
         if need_reacquire:
             # Correlation probe: the jitter IS the probe signal
@@ -1102,8 +1110,19 @@ async def get_state():
         "jitter": {
             "last_time": state.last_jitter_time,
             "count": state.jitter_count,
-            "reacquire_pending": _low_confidence_since > 0 and
-                (time.monotonic() - _low_confidence_since) > config.jitter_interval_s,
+            "reacquire_pending": (
+                (_low_confidence_since > 0 and
+                 (time.monotonic() - _low_confidence_since) > config.jitter_interval_s) or
+                (sil_tracker and (
+                    sil_tracker.roi_size >= sil_tracker.ROI_MAX or
+                    sil_tracker.consecutive_misses >= 10))
+            ),
+            "trigger": "cnn" if (_low_confidence_since > 0 and
+                (time.monotonic() - _low_confidence_since) > config.jitter_interval_s)
+                else "silhouette" if (sil_tracker and (
+                    sil_tracker.roi_size >= sil_tracker.ROI_MAX or
+                    sil_tracker.consecutive_misses >= 10))
+                else "none",
             "low_confidence_s": round(time.monotonic() - _low_confidence_since, 1)
                 if _low_confidence_since > 0 else 0.0,
         },
@@ -1501,10 +1520,25 @@ async def claude_detect():
     else:
         state.vision_confidence = "not_found"
 
-    # If high confidence and not confusing, update tracker and save samples
+    # If high confidence and not confusing, update tracker and save samples.
+    # When Vision position differs from tracker by >50px and CNN had validated,
+    # the old position is a CNN false positive → save as negative training data.
     saved = 0
     if result.cursor_found and result.confidence in ("high", "medium"):
         if result.cursor_x is not None and result.cursor_y is not None:
+            # CNN false positive detection: if tracker was far from Vision
+            # and CNN had validated, the old position is a false positive
+            old_x, old_y = state.cursor_x, state.cursor_y
+            old_validated = state.cursor_validated
+            delta = ((old_x - result.cursor_x) ** 2 +
+                     (old_y - result.cursor_y) ** 2) ** 0.5
+            if delta > 50 and old_validated and collector:
+                # Save old position as NEGATIVE sample (CNN was wrong here)
+                # confidence=0.0 marks it as definite non-cursor
+                collector.collect_from_tracking(
+                    frame, old_x, old_y, confidence=0.0)
+                state.sample_count_neg = collector.negative_count
+
             # Also reset low-confidence clock — Claude Vision is ground truth
             global _low_confidence_since
             _low_confidence_since = 0.0
@@ -1529,6 +1563,71 @@ async def claude_detect():
         **claude_detector.to_dict(),
         "samples_saved": saved,
     }
+
+
+# ── Experience Logging ─────────────────────────────────────────────
+
+_EXPERIENCE_DIR = Path(__file__).parent.parent.parent / "data" / "experience"
+_EXPERIENCE_DIR.mkdir(parents=True, exist_ok=True)
+_EXPERIENCE_LOG = _EXPERIENCE_DIR / "log.jsonl"
+
+
+@app.post("/api/experience/log")
+async def log_experience_snapshot(request: Request):
+    """Log full sensor stack snapshot with optional user note.
+
+    POST body: {"note": "cursor is at approximately (500, 400)", "test_id": "V1"}
+
+    Every Claude Vision detection auto-logs. This endpoint also allows
+    manual snapshots from Claude Code or the dashboard.
+    """
+    body = await request.json() if request.headers.get("content-type") == "application/json" else {}
+    now_mono = time.monotonic()
+
+    snapshot = {
+        "utc": utc_now_ms(),
+        "note": body.get("note", ""),
+        "test_id": body.get("test_id", "manual"),
+        "tracker": {
+            "x": state.cursor_x, "y": state.cursor_y,
+            "method": state.cursor_method,
+            "age_s": round(state.cursor_age_s, 1),
+            "validated": state.cursor_validated,
+        },
+        "cnn": {
+            "confidence": round(state.cnn_confidence, 3),
+            "validated": state.cursor_validated,
+            "model": state.cnn_model_version,
+        },
+        "silhouette": {
+            "active": state.silhouette_active,
+            "method": state.silhouette_method,
+            "confidence": state.silhouette_confidence,
+            "roi_size": state.silhouette_roi_size,
+            "misses": state.silhouette_misses,
+            "hz": state.silhouette_hz,
+        },
+        "vision": {
+            "x": state.vision_x, "y": state.vision_y,
+            "confidence": state.vision_confidence,
+            "age_s": round(now_mono - state.vision_timestamp, 1)
+                if state.vision_timestamp > 0 else -1,
+        },
+        "jitter": {
+            "count": state.jitter_count,
+            "low_confidence_s": round(now_mono - _low_confidence_since, 1)
+                if _low_confidence_since > 0 else 0,
+        },
+        "motion_blobs": state.blob_count,
+        "fps": round(state.fps, 1),
+        "frame_count": state.frame_count,
+    }
+
+    # Append to JSONL log
+    with open(_EXPERIENCE_LOG, "a") as f:
+        f.write(json.dumps(snapshot) + "\n")
+
+    return snapshot
 
 
 # ── Validation GUI ─────────────────────────────────────────────────
