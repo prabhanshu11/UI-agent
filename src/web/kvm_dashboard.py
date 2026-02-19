@@ -61,10 +61,6 @@ class MotionState:
     cursor_y: int = 0
     cursor_method: str = "unknown"
     cursor_age_s: float = 999.0
-    # Secondary cursor (remote participant in meetings)
-    cursor2_x: int = 0
-    cursor2_y: int = 0
-    cursor2_active: bool = False
     tracker_tier: str = "none"
     mouse_connected: bool = False
     heartbeat_active: bool = False
@@ -239,6 +235,10 @@ def _daemon_motion_loop():
     last_daemon_seq = 0
     last_daemon_seq_time = time.monotonic()
 
+    # Velocity estimation for predictive cursor tracking
+    velocity_history: list[tuple[float, float, float]] = []  # (dx, dy, timestamp)
+    MAX_VELOCITY_SAMPLES = 5
+
     while True:
         try:
             ds = daemon_client.read_state()
@@ -276,48 +276,75 @@ def _daemon_motion_loop():
             primary_blob = None
             if cursor_blobs:
                 if pos and (now - pos.timestamp < 10):
-                    # Score by distance + size preference (cursor-sized: 10-60px)
+                    # Predict next position from velocity history
+                    pred_x, pred_y = pos.x, pos.y
+                    if len(velocity_history) >= 2:
+                        recent = velocity_history[-MAX_VELOCITY_SAMPLES:]
+                        avg_dx = sum(v[0] for v in recent) / len(recent)
+                        avg_dy = sum(v[1] for v in recent) / len(recent)
+                        dt = now - pos.timestamp
+                        pred_x = pos.x + int(avg_dx * min(dt * 20, 3))
+                        pred_y = pos.y + int(avg_dy * min(dt * 20, 3))
+
                     def _blob_score(b):
-                        dist = ((b.centroid[0] - pos.x) ** 2 +
-                                (b.centroid[1] - pos.y) ** 2) ** 0.5
-                        # Prefer cursor-sized blobs (10-60px sweet spot)
-                        size_penalty = 0
-                        if b.pixel_count > 60:
-                            size_penalty = (b.pixel_count - 60) * 0.5
+                        # Distance from predicted AND last-known, use smaller
+                        dist_pred = ((b.centroid[0] - pred_x) ** 2 +
+                                     (b.centroid[1] - pred_y) ** 2) ** 0.5
+                        dist_last = ((b.centroid[0] - pos.x) ** 2 +
+                                     (b.centroid[1] - pos.y) ** 2) ** 0.5
+                        dist = min(dist_pred, dist_last)
+                        # Size sweet spot: 15-40px, penalize above AND below
+                        size = b.pixel_count
+                        if size < 15:
+                            size_penalty = (15 - size) * 1.0
+                        elif size > 40:
+                            size_penalty = (size - 40) * 0.8
+                        else:
+                            size_penalty = 0
                         return dist + size_penalty
+
                     best = min(cursor_blobs, key=_blob_score)
                     dist = ((best.centroid[0] - pos.x) ** 2 +
                             (best.centroid[1] - pos.y) ** 2) ** 0.5
-                    if dist < 150:
-                        primary_blob = best
-                        bx, by = best.centroid
-                        if tracker:
-                            tracker.set_position(bx, by, method="motion_track")
-                        pos = tracker.position
-                        if sil_tracker:
-                            sil_tracker.reset()
+                    if dist < 300:
+                        # Silhouette confidence gate: if tracker is confident,
+                        # reject blobs too far from silhouette position
+                        accept = True
+                        if (sil_tracker and state.silhouette_confidence > 0.6
+                                and state.silhouette_latency_ms < 50):
+                            sil_dist = ((best.centroid[0] - state.cursor_x) ** 2 +
+                                        (best.centroid[1] - state.cursor_y) ** 2) ** 0.5
+                            if sil_dist > 100:
+                                accept = False
+
+                        if accept:
+                            primary_blob = best
+                            bx, by = best.centroid
+                            # Update velocity history
+                            dx = bx - pos.x
+                            dy = by - pos.y
+                            velocity_history.append((dx, dy, now))
+                            if len(velocity_history) > MAX_VELOCITY_SAMPLES * 2:
+                                velocity_history = velocity_history[-MAX_VELOCITY_SAMPLES:]
+                            if tracker:
+                                tracker.set_position(bx, by, method="motion_track")
+                            pos = tracker.position
+                            if sil_tracker:
+                                sil_tracker.reset()
                 else:
-                    # No known position — pick blob most likely to be cursor
-                    # (prefer 10-60px range over outliers)
+                    # No known position — pick blob closest to typical cursor size
                     def _cursor_likelihood(b):
-                        ideal = 30  # typical cursor pixel count
+                        ideal = 30
                         return abs(b.pixel_count - ideal)
                     best = min(cursor_blobs, key=_cursor_likelihood)
                     primary_blob = best
                     bx, by = best.centroid
+                    velocity_history.clear()
                     if tracker:
                         tracker.set_position(bx, by, method="motion_track")
                     pos = tracker.position
                     if sil_tracker:
                         sil_tracker.reset()
-
-            # ── Secondary cursor (meetings: remote participant) ───
-            secondary_pos = None
-            if primary_blob and len(cursor_blobs) > 1:
-                others = [b for b in cursor_blobs if b is not primary_blob]
-                if others:
-                    sec = max(others, key=lambda b: b.pixel_count)
-                    secondary_pos = (sec.centroid[0], sec.centroid[1])
 
             # ── Slow path: frame decode + template match + overlay (5Hz) ──
             frame_interval = 1.0 / max(0.1, config.frame_fps)
@@ -426,12 +453,6 @@ def _daemon_motion_loop():
                     cursor_pos = (pos.x, pos.y)
                 else:
                     state.cursor_age_s = 999.0
-                if secondary_pos:
-                    state.cursor2_x = secondary_pos[0]
-                    state.cursor2_y = secondary_pos[1]
-                    state.cursor2_active = True
-                else:
-                    state.cursor2_active = False
 
             time.sleep(0.05)  # 20Hz state polling
 
@@ -896,6 +917,16 @@ async def dashboard():
     return HTMLResponse(DASHBOARD_HTML)
 
 
+@app.get("/profiler")
+async def profiler_page():
+    return HTMLResponse(PROFILER_HTML)
+
+
+@app.get("/concepts")
+async def concepts_page():
+    return HTMLResponse(CONCEPTS_HTML)
+
+
 @app.get("/api/frame")
 async def get_frame():
     with state.lock:
@@ -922,10 +953,6 @@ async def get_state():
             "quality": "good" if state.cursor_age_s < 5
                        else "stale" if state.cursor_age_s < 30
                        else "lost",
-        },
-        "cursor2": {
-            "x": state.cursor2_x, "y": state.cursor2_y,
-            "active": state.cursor2_active,
         },
         "hardware": {
             "mouse_connected": state.mouse_connected,
@@ -1582,7 +1609,15 @@ async def get_profiler():
         "daemon": {
             "fps": state.fps,
             "frame_count": state.frame_count,
+            "blob_count": state.blob_count,
             "timestamp_ns": state.prof_daemon_timestamp_ns,
+        },
+        "cursor": {
+            "x": state.cursor_x,
+            "y": state.cursor_y,
+            "method": state.cursor_method,
+            "age_s": round(state.cursor_age_s, 1),
+            "validated": state.cursor_validated,
         },
     }
 
@@ -1805,8 +1840,16 @@ DASHBOARD_HTML = r"""
             grid-template-columns: 1fr 320px;
             height: calc(100vh - 50px);
         }
-        .feed { background: #000; position: relative; overflow: hidden; }
-        .feed img { width: 100%; height: 100%; object-fit: contain; }
+        .feed {
+            background: #000; overflow: hidden;
+            display: flex; justify-content: center; align-items: center;
+        }
+        .video-wrapper {
+            position: relative; display: flex; justify-content: center;
+            align-items: center; width: 100%; height: 100%;
+        }
+        #video-area { position: relative; max-width: 100%; max-height: 100%; }
+        #video-area img { display: block; max-width: 100%; max-height: calc(100vh - 50px); }
         .cursor-dot {
             position: absolute; width: 24px; height: 24px;
             border-radius: 50%; pointer-events: none;
@@ -1816,22 +1859,9 @@ DASHBOARD_HTML = r"""
             animation: cursor-pulse 1.5s ease-in-out infinite;
             z-index: 10; display: none;
         }
-        .cursor-dot-secondary {
-            position: absolute; width: 18px; height: 18px;
-            border-radius: 50%; pointer-events: none;
-            background: radial-gradient(circle, #fff 20%, #ff8800 50%, transparent 70%);
-            box-shadow: 0 0 10px #ff8800, 0 0 20px #ff880088;
-            transform: translate(-50%, -50%);
-            animation: cursor2-pulse 2s ease-in-out infinite;
-            z-index: 9; display: none;
-        }
         @keyframes cursor-pulse {
             0%, 100% { opacity: 1; box-shadow: 0 0 12px #00ff00, 0 0 24px #00ff0088; }
             50% { opacity: 0.7; box-shadow: 0 0 20px #00ff00, 0 0 40px #00ff0066; }
-        }
-        @keyframes cursor2-pulse {
-            0%, 100% { opacity: 1; box-shadow: 0 0 10px #ff8800, 0 0 20px #ff880088; }
-            50% { opacity: 0.6; box-shadow: 0 0 16px #ff8800, 0 0 32px #ff880066; }
         }
         .sidebar {
             background: #101018; border-left: 1px solid #222;
@@ -1893,62 +1923,14 @@ DASHBOARD_HTML = r"""
         .tier.t1.active { background: #2ecc71; color: #000; }
         .tier.t2.active { background: #f1c40f; color: #000; }
         .tier.t3.active { background: #e74c3c; }
-        /* Tabs */
-        .tabs { display: flex; gap: 0; margin-left: 1.5rem; }
-        .tab-btn {
-            padding: 4px 14px; font-family: inherit; font-size: 0.75rem;
-            background: transparent; border: 1px solid #333; color: #666;
-            cursor: pointer; transition: all 0.2s;
-        }
-        .tab-btn:first-child { border-radius: 4px 0 0 4px; }
-        .tab-btn:last-child { border-radius: 0 4px 4px 0; }
-        .tab-btn.active { background: #ff4444; color: #fff; border-color: #ff4444; }
-        .tab-btn:not(.active):hover { color: #ccc; border-color: #555; }
-        .tab-view { display: none; }
-        .tab-view.active { display: block; }
-        /* Profiler tab styles */
-        .profiler-content { padding: 1rem; height: 100%; overflow-y: auto; }
-        .prof-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
-        .prof-panel { background: #0a0a12; border: 1px solid #1a1a25; border-radius: 6px; padding: 0.8rem; }
-        .wf-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-        .wf-label { width: 110px; font-size: 0.7rem; color: #888; text-align: right; flex-shrink: 0; }
-        .wf-bar-wrap { flex: 1; height: 20px; background: #12121a; border-radius: 3px; overflow: hidden; }
-        .wf-bar { height: 100%; border-radius: 3px; transition: width 0.2s; min-width: 2px; }
-        .wf-bar.decode { background: #3498db; }
-        .wf-bar.track { background: #2ecc71; }
-        .wf-bar.overlay { background: #9b59b6; }
-        .wf-bar.encode { background: #e67e22; }
-        .wf-bar.total { background: #e74c3c; }
-        .wf-bar.http { background: #f1c40f; }
-        .wf-val { width: 65px; font-size: 0.75rem; color: #aaa; font-variant-numeric: tabular-nums; }
-        .wf-sep { border-top: 1px dashed #333; margin: 4px 0; }
-        .prof-btn {
-            padding: 5px 14px; border: 1px solid #333; border-radius: 4px;
-            background: #1a1a25; color: #ccc; font-family: inherit; font-size: 0.75rem;
-            cursor: pointer;
-        }
-        .prof-btn:hover { background: #252530; }
-        .prof-btn.start { border-color: #ff4444; color: #ff4444; }
-        .prof-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-        .prof-table { width: 100%; font-size: 0.7rem; border-collapse: collapse; margin-top: 0.5rem; }
-        .prof-table th { text-align: right; color: #555; font-weight: normal; padding: 3px 6px; border-bottom: 1px solid #1a1a25; }
-        .prof-table th:first-child { text-align: left; }
-        .prof-table td { text-align: right; padding: 3px 6px; font-variant-numeric: tabular-nums; }
-        .prof-table td:first-child { text-align: left; color: #888; }
-        .utc-row { display: flex; gap: 1.5rem; font-size: 0.75rem; margin-bottom: 0.6rem; }
-        .utc-lbl { color: #555; font-size: 0.6rem; text-transform: uppercase; }
-        .utc-val { color: #2ecc71; font-variant-numeric: tabular-nums; }
-        .utc-delta { color: #f1c40f; }
     </style>
 </head>
 <body>
     <div class="header">
-        <div style="display:flex; align-items:center; gap:0.5rem;">
+        <div style="display:flex; align-items:center; gap:1rem;">
             <h1>KVM</h1>
-            <div class="tabs">
-                <button class="tab-btn active" onclick="switchTab('live')">Live Feed</button>
-                <button class="tab-btn" onclick="switchTab('profiler')">Profiler</button>
-            </div>
+            <a href="/profiler" style="color:#888; text-decoration:none; font-size:0.75rem;">Profiler</a>
+            <a href="/concepts" style="color:#888; text-decoration:none; font-size:0.75rem;">Concepts</a>
         </div>
         <div class="status">
             <span><span id="dot-mouse" class="dot gray"></span> Mouse</span>
@@ -1959,64 +1941,11 @@ DASHBOARD_HTML = r"""
         </div>
     </div>
     <div class="main">
-        <!-- Tab: Live Feed -->
-        <div class="feed tab-view active" id="feed-container" data-tab="live">
-            <img id="live-frame" src="" alt="Loading...">
-            <div class="cursor-dot" id="cursor-dot"></div>
-            <div class="cursor-dot-secondary" id="cursor-dot-2"></div>
-        </div>
-        <!-- Tab: Profiler -->
-        <div class="tab-view" data-tab="profiler" style="background:#0a0a0f; overflow-y:auto;">
-            <div class="profiler-content">
-                <div class="utc-row">
-                    <div><div class="utc-lbl">Browser UTC</div><div class="utc-val" id="browser-utc">--:--:--.---</div></div>
-                    <div><div class="utc-lbl">Server UTC</div><div class="utc-val" id="server-utc">--:--:--.---</div></div>
-                    <div><div class="utc-lbl">Delta</div><div class="utc-delta" id="utc-delta">--ms</div></div>
-                </div>
-                <div class="prof-grid">
-                    <div class="prof-panel">
-                        <div class="panel-title">Pipeline Waterfall</div>
-                        <div class="wf-row"><span class="wf-label">JPEG Decode</span><div class="wf-bar-wrap"><div class="wf-bar decode" id="bar-decode"></div></div><span class="wf-val" id="val-decode">&mdash;</span></div>
-                        <div class="wf-row"><span class="wf-label">Sil. Track</span><div class="wf-bar-wrap"><div class="wf-bar track" id="bar-track"></div></div><span class="wf-val" id="val-track">&mdash;</span></div>
-                        <div class="wf-row"><span class="wf-label">Overlay Draw</span><div class="wf-bar-wrap"><div class="wf-bar overlay" id="bar-overlay"></div></div><span class="wf-val" id="val-overlay">&mdash;</span></div>
-                        <div class="wf-row"><span class="wf-label">JPEG Encode</span><div class="wf-bar-wrap"><div class="wf-bar encode" id="bar-encode"></div></div><span class="wf-val" id="val-encode">&mdash;</span></div>
-                        <div class="wf-sep"></div>
-                        <div class="wf-row"><span class="wf-label">Frame Total</span><div class="wf-bar-wrap"><div class="wf-bar total" id="bar-total"></div></div><span class="wf-val" id="val-total">&mdash;</span></div>
-                        <div class="wf-row"><span class="wf-label">HTTP RT</span><div class="wf-bar-wrap"><div class="wf-bar http" id="bar-http"></div></div><span class="wf-val" id="val-http">&mdash;</span></div>
-                        <div style="font-size:0.65rem; color:#555; margin-top:6px;">
-                            Method: <span id="ti-method" style="color:#888">&mdash;</span> |
-                            Hz: <span id="ti-hz" style="color:#888">&mdash;</span> |
-                            Conf: <span id="ti-conf" style="color:#888">&mdash;</span> |
-                            FPS: <span id="ti-fps" style="color:#888">&mdash;</span>
-                        </div>
-                    </div>
-                    <div class="prof-panel">
-                        <div class="panel-title">3-Minute Test</div>
-                        <div style="display:flex; gap:0.5rem; margin-bottom:0.5rem;">
-                            <button class="prof-btn start" id="btn-start" onclick="startProfilerTest()">Start 3m Test</button>
-                            <button class="prof-btn" id="btn-stop" onclick="stopProfilerTest()" disabled>Stop</button>
-                        </div>
-                        <div id="prof-test-status" style="font-size:0.75rem; color:#555; margin-bottom:0.3rem;">Idle</div>
-                        <div id="prof-test-progress" style="font-size:0.7rem; color:#444; margin-bottom:0.5rem;"></div>
-                        <table class="prof-table">
-                            <thead><tr><th>Stage</th><th>Min</th><th>Avg</th><th>Max</th><th>P95</th></tr></thead>
-                            <tbody id="prof-results-body">
-                                <tr><td colspan="5" style="color:#333; text-align:center;">No test data</td></tr>
-                            </tbody>
-                        </table>
-                    </div>
-                    <div class="prof-panel" style="grid-column: 1 / -1;">
-                        <div class="panel-title">UTC Latency Measurement</div>
-                        <div style="font-size:0.65rem; color:#555; margin-bottom:0.5rem;">
-                            Open a UTC ms clock website on the target machine, then click Measure.
-                            Claude Vision OCR reads the displayed time and compares with local UTC.
-                        </div>
-                        <div style="display:flex; gap:0.5rem; align-items:center; margin-bottom:0.5rem;">
-                            <button class="prof-btn start" id="btn-measure" onclick="measureLatency()">Measure Latency</button>
-                            <span id="measure-status" style="font-size:0.7rem; color:#555;"></span>
-                        </div>
-                        <div id="measure-result" style="font-size:0.75rem;"></div>
-                    </div>
+        <div class="feed" id="feed-container">
+            <div class="video-wrapper">
+                <div id="video-area">
+                    <img id="live-frame" src="" alt="Loading...">
+                    <div class="cursor-dot" id="cursor-dot"></div>
                 </div>
             </div>
         </div>
@@ -2029,10 +1958,6 @@ DASHBOARD_HTML = r"""
                         <span id="cursor-method">—</span> |
                         age: <span id="cursor-age">—</span>s
                     </div>
-                </div>
-                <div id="cursor2-row" class="hw-row" style="display:none; margin-top:6px;">
-                    <span class="hw-label" style="color:#ff8800;">Secondary</span>
-                    <span class="hw-value" id="cursor2-coords" style="color:#ff8800;">(?, ?)</span>
                 </div>
                 <div class="tier-indicator">
                     <div class="tier t1" id="tier-1">T1 Micro</div>
@@ -2171,18 +2096,6 @@ DASHBOARD_HTML = r"""
                     s.cursor.age_s + 's';
                 updateCursorDot(s.cursor.x, s.cursor.y);
 
-                // Secondary cursor (remote participant in meetings)
-                var c2row = document.getElementById('cursor2-row');
-                if (s.cursor2 && s.cursor2.active) {
-                    c2row.style.display = 'flex';
-                    document.getElementById('cursor2-coords').textContent =
-                        '(' + s.cursor2.x + ', ' + s.cursor2.y + ')';
-                    updateSecondaryCursorDot(s.cursor2.x, s.cursor2.y);
-                } else {
-                    c2row.style.display = 'none';
-                    document.getElementById('cursor-dot-2').style.display = 'none';
-                }
-
                 var m = s.cursor.method;
                 document.getElementById('tier-1').classList.toggle('active',
                     m === 'micro_shake' || m === 'motion_track' || m === 'shape_track');
@@ -2299,252 +2212,24 @@ DASHBOARD_HTML = r"""
             el.className = 'hw-value ' + (ok ? 'ok' : 'err');
         }
 
-        function mapCursorToScreen(cursorX, cursorY) {
-            var img = document.getElementById('live-frame');
-            if (!img.naturalWidth) return null;
-
-            var imgRect = img.getBoundingClientRect();
-            var naturalRatio = img.naturalWidth / img.naturalHeight;
-            var elementRatio = imgRect.width / imgRect.height;
-
-            // Calculate actual rendered image position within the element
-            // (object-fit: contain causes letterboxing)
-            var renderedW, renderedH, padX, padY;
-            if (naturalRatio > elementRatio) {
-                // Image wider than element — fit width, letterbox top/bottom
-                renderedW = imgRect.width;
-                renderedH = imgRect.width / naturalRatio;
-                padX = 0;
-                padY = (imgRect.height - renderedH) / 2;
-            } else {
-                // Image taller than element — fit height, letterbox left/right
-                renderedH = imgRect.height;
-                renderedW = imgRect.height * naturalRatio;
-                padX = (imgRect.width - renderedW) / 2;
-                padY = 0;
-            }
-
-            var scaleX = renderedW / img.naturalWidth;
-            var scaleY = renderedH / img.naturalHeight;
-
-            // Position relative to feed-container
-            var container = document.getElementById('feed-container');
-            var containerRect = container.getBoundingClientRect();
-            var offsetX = (imgRect.left + padX) - containerRect.left;
-            var offsetY = (imgRect.top + padY) - containerRect.top;
-
-            return {
-                left: (offsetX + cursorX * scaleX) + 'px',
-                top: (offsetY + cursorY * scaleY) + 'px'
-            };
-        }
-
         function updateCursorDot(cursorX, cursorY) {
+            var img = document.getElementById('live-frame');
             var dot = document.getElementById('cursor-dot');
-            if (cursorX <= 0 && cursorY <= 0) {
+            if (!img.naturalWidth || (cursorX <= 0 && cursorY <= 0)) {
                 dot.style.display = 'none';
                 return;
             }
-            var pos = mapCursorToScreen(cursorX, cursorY);
-            if (!pos) { dot.style.display = 'none'; return; }
-            dot.style.left = pos.left;
-            dot.style.top = pos.top;
+            dot.style.left = (cursorX / img.naturalWidth * 100) + '%';
+            dot.style.top = (cursorY / img.naturalHeight * 100) + '%';
             dot.style.display = 'block';
         }
 
-        function updateSecondaryCursorDot(cursorX, cursorY) {
-            var dot = document.getElementById('cursor-dot-2');
-            if (cursorX <= 0 && cursorY <= 0) {
-                dot.style.display = 'none';
-                return;
-            }
-            var pos = mapCursorToScreen(cursorX, cursorY);
-            if (!pos) { dot.style.display = 'none'; return; }
-            dot.style.left = pos.left;
-            dot.style.top = pos.top;
-            dot.style.display = 'block';
-        }
-
-        // ── Tab switching ──
-        var currentTab = 'live';
-        function switchTab(tab) {
-            currentTab = tab;
-            var views = document.querySelectorAll('.tab-view');
-            for (var i = 0; i < views.length; i++) {
-                views[i].classList.toggle('active', views[i].getAttribute('data-tab') === tab);
-            }
-            var btns = document.querySelectorAll('.tab-btn');
-            for (var i = 0; i < btns.length; i++) {
-                btns[i].classList.toggle('active', btns[i].textContent.toLowerCase().indexOf(tab) >= 0 ||
-                    (tab === 'live' && btns[i].textContent === 'Live Feed') ||
-                    (tab === 'profiler' && btns[i].textContent === 'Profiler'));
-            }
-        }
-
-        // ── Profiler polling ──
-        var profBarMax = 50;
-        var profHttpRt = 0;
-        var profServerUtc = '';
-        var profTestRunning = false;
-        var profResultsInterval = null;
-
-        function updateBrowserClock() {
-            var el = document.getElementById('browser-utc');
-            if (!el) return;
-            var t = new Date().toISOString().slice(11, 23);
-            el.textContent = t;
-            if (profServerUtc) {
-                var delta = Date.now() - new Date(profServerUtc).getTime();
-                document.getElementById('utc-delta').textContent = delta + 'ms';
-            }
-        }
-        setInterval(updateBrowserClock, 100);
-
-        function setWfBar(name, ms) {
-            var barEl = document.getElementById('bar-' + name);
-            var valEl = document.getElementById('val-' + name);
-            if (!barEl || !valEl) return;
-            barEl.style.width = Math.min(100, (ms / profBarMax) * 100) + '%';
-            valEl.textContent = ms.toFixed(1) + 'ms';
-        }
-
-        async function pollProfiler() {
-            if (currentTab !== 'profiler') return;
-            try {
-                var t0 = Date.now();
-                var res = await fetch('/api/profiler');
-                profHttpRt = Date.now() - t0;
-                var d = await res.json();
-                profServerUtc = d.utc;
-                var sEl = document.getElementById('server-utc');
-                if (sEl) sEl.textContent = d.utc.slice(11, 23);
-                setWfBar('decode', d.pipeline.jpeg_decode_ms);
-                setWfBar('track', d.pipeline.silhouette_ms);
-                setWfBar('overlay', d.pipeline.overlay_draw_ms);
-                setWfBar('encode', d.pipeline.jpeg_encode_ms);
-                setWfBar('total', d.pipeline.frame_total_ms);
-                setWfBar('http', profHttpRt);
-                var tiM = document.getElementById('ti-method');
-                if (tiM) tiM.textContent = d.tracking.method;
-                var tiH = document.getElementById('ti-hz');
-                if (tiH) tiH.textContent = d.tracking.hz;
-                var tiC = document.getElementById('ti-conf');
-                if (tiC) tiC.textContent = (d.tracking.confidence * 100).toFixed(1) + '%';
-                var tiF = document.getElementById('ti-fps');
-                if (tiF) tiF.textContent = d.daemon.fps.toFixed(1);
-            } catch (e) { /* ignore */ }
-        }
-        setInterval(pollProfiler, 200);
-
-        var PROF_STAGE_NAMES = {
-            jpeg_decode_ms: 'JPEG Decode', silhouette_ms: 'Sil. Track',
-            overlay_draw_ms: 'Overlay Draw', jpeg_encode_ms: 'JPEG Encode',
-            frame_total_ms: 'Frame Total'
-        };
-
-        function makeProfRow(label, s) {
-            var tr = document.createElement('tr');
-            var cells = [label, s.min.toFixed(1), s.avg.toFixed(1), s.max.toFixed(1), s.p95.toFixed(1)];
-            for (var i = 0; i < cells.length; i++) {
-                var td = document.createElement('td');
-                td.textContent = cells[i];
-                tr.appendChild(td);
-            }
-            return tr;
-        }
-
-        async function startProfilerTest() {
-            await fetch('/api/profiler/start', { method: 'POST' });
-            profTestRunning = true;
-            document.getElementById('btn-start').disabled = true;
-            document.getElementById('btn-stop').disabled = false;
-            document.getElementById('prof-test-status').textContent = 'Running...';
-            document.getElementById('prof-test-status').style.color = '#2ecc71';
-            profResultsInterval = setInterval(pollProfResults, 1000);
-        }
-
-        async function stopProfilerTest() {
-            await fetch('/api/profiler/stop', { method: 'POST' });
-            profTestRunning = false;
-            document.getElementById('btn-start').disabled = false;
-            document.getElementById('btn-stop').disabled = true;
-            document.getElementById('prof-test-status').textContent = 'Complete';
-            document.getElementById('prof-test-status').style.color = '#f1c40f';
-            if (profResultsInterval) { clearInterval(profResultsInterval); profResultsInterval = null; }
-            pollProfResults();
-        }
-
-        async function pollProfResults() {
-            try {
-                var res = await fetch('/api/profiler/results');
-                var d = await res.json();
-                if (d.status === 'no_data') return;
-                document.getElementById('prof-test-progress').textContent =
-                    'Samples: ' + d.samples + ' | ' + d.elapsed_s + 's / ' + d.duration_s + 's';
-                if (d.status === 'complete' && profTestRunning) {
-                    profTestRunning = false;
-                    document.getElementById('btn-start').disabled = false;
-                    document.getElementById('btn-stop').disabled = true;
-                    document.getElementById('prof-test-status').textContent = 'Complete';
-                    document.getElementById('prof-test-status').style.color = '#f1c40f';
-                    if (profResultsInterval) { clearInterval(profResultsInterval); profResultsInterval = null; }
-                }
-                if (d.stages) {
-                    var tbody = document.getElementById('prof-results-body');
-                    while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
-                    var keys = Object.keys(PROF_STAGE_NAMES);
-                    for (var i = 0; i < keys.length; i++) {
-                        if (d.stages[keys[i]]) tbody.appendChild(makeProfRow(PROF_STAGE_NAMES[keys[i]], d.stages[keys[i]]));
-                    }
-                }
-            } catch (e) { /* ignore */ }
-        }
-
-        // ── UTC Latency Measurement ──
-        async function measureLatency() {
-            var btn = document.getElementById('btn-measure');
-            var statusEl = document.getElementById('measure-status');
-            var resultEl = document.getElementById('measure-result');
-            btn.disabled = true;
-            statusEl.textContent = 'Capturing + OCR inference...';
-            statusEl.style.color = '#f1c40f';
-            resultEl.textContent = '';
-            try {
-                var res = await fetch('/api/profiler/measure_latency', { method: 'POST' });
-                var d = await res.json();
-                btn.disabled = false;
-                if (d.error) {
-                    statusEl.textContent = 'Error: ' + d.error;
-                    statusEl.style.color = '#e74c3c';
-                    return;
-                }
-                statusEl.textContent = 'Done';
-                statusEl.style.color = '#2ecc71';
-                var lines = [];
-                lines.push('Capture: ' + d.capture_ms.toFixed(1) + 'ms | Inference: ' + d.inference_ms.toFixed(0) + 'ms');
-                lines.push('Local UTC: ' + d.capture_utc);
-                lines.push('Screen UTC: ' + (d.displayed_utc || 'not detected'));
-                if (d.delta_ms !== null && d.delta_ms !== undefined) {
-                    lines.push('Pipeline delta: ' + d.delta_ms + 'ms (local - screen)');
-                }
-                if (d.ocr_result && d.ocr_result.notes) {
-                    lines.push('Notes: ' + d.ocr_result.notes);
-                }
-                resultEl.textContent = lines.join('\n');
-                resultEl.style.whiteSpace = 'pre-wrap';
-            } catch (e) {
-                btn.disabled = false;
-                statusEl.textContent = 'Failed';
-                statusEl.style.color = '#e74c3c';
-            }
-        }
-
-        // ── Frame updates at 5Hz (matches config.frame_fps=5) ──
+        // ── Frame updates at 5Hz ──
         function scheduleFrame() {
-            if (currentTab === 'live') updateFrame();
-            setTimeout(scheduleFrame, 200);  // 5fps
+            updateFrame();
+            setTimeout(scheduleFrame, 200);
         }
-        setInterval(updateState, 200);  // 5Hz — smooth cursor dot movement
+        setInterval(updateState, 200);
         scheduleFrame();
         updateState();
     </script>
@@ -2794,6 +2479,431 @@ function showToast(msg) {
 loadSamples();
 loadStats();
 </script>
+</body>
+</html>"""
+
+
+# ── Profiler HTML ──────────────────────────────────────────────────
+
+PROFILER_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>KVM Pipeline Profiler</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'JetBrains Mono', 'Fira Code', monospace; background: #0a0a0f; color: #c8c8d0; }
+.header { background: #101018; padding: 0.6rem 1.5rem; border-bottom: 2px solid #3498db;
+    display: flex; justify-content: space-between; align-items: center; }
+.header h1 { color: #3498db; font-size: 1.1rem; letter-spacing: 1px; }
+.header a { color: #888; text-decoration: none; font-size: 0.75rem; margin-left: 1rem; }
+.header a:hover { color: #3498db; }
+.main { padding: 1rem; max-width: 1400px; margin: 0 auto; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1rem; }
+.row.full { grid-template-columns: 1fr; }
+.row.triple { grid-template-columns: 1fr 1fr 1fr; }
+.card { background: #101018; border: 1px solid #1a1a25; border-radius: 8px; padding: 1rem; }
+.card-title { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 2px; color: #3498db; margin-bottom: 0.8rem; }
+.utc-bar { display: flex; gap: 2rem; align-items: center; margin-bottom: 1rem;
+    background: #101018; border: 1px solid #1a1a25; border-radius: 8px; padding: 0.8rem 1rem; }
+.utc-lbl { color: #555; font-size: 0.6rem; text-transform: uppercase; }
+.utc-val { color: #2ecc71; font-size: 1.1rem; font-variant-numeric: tabular-nums; }
+.utc-delta { color: #f1c40f; font-size: 1.1rem; }
+/* Waterfall */
+.wf-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.wf-label { width: 120px; font-size: 0.75rem; color: #888; text-align: right; flex-shrink: 0; }
+.wf-bar-wrap { flex: 1; height: 28px; background: #0a0a12; border-radius: 4px; overflow: hidden; }
+.wf-bar { height: 100%; border-radius: 4px; transition: width 0.2s; min-width: 2px; }
+.wf-bar.decode { background: #3498db; } .wf-bar.track { background: #2ecc71; }
+.wf-bar.overlay { background: #9b59b6; } .wf-bar.encode { background: #e67e22; }
+.wf-bar.total { background: #e74c3c; } .wf-bar.http { background: #f1c40f; }
+.wf-bar.render { background: #1abc9c; }
+.wf-val { width: 80px; font-size: 0.8rem; color: #aaa; font-variant-numeric: tabular-nums; }
+.wf-sep { border-top: 1px dashed #333; margin: 6px 0; }
+/* Test panel */
+.prof-btn { padding: 6px 16px; border: 1px solid #333; border-radius: 4px;
+    background: #1a1a25; color: #ccc; font-family: inherit; font-size: 0.8rem; cursor: pointer; }
+.prof-btn:hover { background: #252530; }
+.prof-btn.primary { border-color: #3498db; color: #3498db; }
+.prof-btn.danger { border-color: #e74c3c; color: #e74c3c; }
+.prof-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.results-table { width: 100%; font-size: 0.75rem; border-collapse: collapse; margin-top: 0.6rem; }
+.results-table th { text-align: right; color: #555; font-weight: normal; padding: 4px 8px; border-bottom: 1px solid #1a1a25; }
+.results-table th:first-child { text-align: left; }
+.results-table td { text-align: right; padding: 4px 8px; font-variant-numeric: tabular-nums; }
+.results-table td:first-child { text-align: left; color: #888; }
+/* Metrics */
+.metric-row { display: flex; justify-content: space-between; padding: 4px 0; font-size: 0.8rem; }
+.metric-label { color: #666; }
+.metric-val { font-weight: 600; color: #ccc; font-variant-numeric: tabular-nums; }
+.metric-val.good { color: #2ecc71; } .metric-val.warn { color: #f1c40f; } .metric-val.bad { color: #e74c3c; }
+/* Sparkline */
+.spark-canvas { width: 100%; height: 80px; background: #0a0a12; border-radius: 4px; }
+/* Frame preview */
+.preview-img { max-width: 100%; border-radius: 4px; background: #000; display: block; }
+.preview-overlay { font-size: 0.7rem; color: #888; margin-top: 4px; }
+</style>
+</head>
+<body>
+<div class="header">
+    <div style="display:flex; align-items:center;">
+        <h1>PIPELINE PROFILER</h1>
+        <a href="/">Dashboard</a>
+        <a href="/concepts">Concepts</a>
+    </div>
+    <div style="font-size:0.75rem; color:#555;" id="prof-status">Connecting...</div>
+</div>
+<div class="main">
+    <!-- UTC Clock Bar -->
+    <div class="utc-bar">
+        <div><div class="utc-lbl">Browser UTC</div><div class="utc-val" id="browser-utc">--:--:--.---</div></div>
+        <div><div class="utc-lbl">Server UTC</div><div class="utc-val" id="server-utc">--:--:--.---</div></div>
+        <div><div class="utc-lbl">Clock Delta</div><div class="utc-delta" id="utc-delta">--ms</div></div>
+        <div style="margin-left:auto;"><div class="utc-lbl">Daemon FPS</div><div class="metric-val" id="daemon-fps">--</div></div>
+        <div><div class="utc-lbl">Blobs</div><div class="metric-val" id="blob-count">--</div></div>
+        <div><div class="utc-lbl">Frame #</div><div class="metric-val" id="frame-count" style="color:#555">--</div></div>
+    </div>
+
+    <!-- Pipeline Waterfall (full width) -->
+    <div class="row full">
+        <div class="card">
+            <div class="card-title">Pipeline Waterfall (per frame)</div>
+            <div class="wf-row"><span class="wf-label">JPEG Decode</span><div class="wf-bar-wrap"><div class="wf-bar decode" id="bar-decode"></div></div><span class="wf-val" id="val-decode">&mdash;</span></div>
+            <div class="wf-row"><span class="wf-label">Sil. Track</span><div class="wf-bar-wrap"><div class="wf-bar track" id="bar-track"></div></div><span class="wf-val" id="val-track">&mdash;</span></div>
+            <div class="wf-row"><span class="wf-label">Overlay Draw</span><div class="wf-bar-wrap"><div class="wf-bar overlay" id="bar-overlay"></div></div><span class="wf-val" id="val-overlay">&mdash;</span></div>
+            <div class="wf-row"><span class="wf-label">JPEG Encode</span><div class="wf-bar-wrap"><div class="wf-bar encode" id="bar-encode"></div></div><span class="wf-val" id="val-encode">&mdash;</span></div>
+            <div class="wf-sep"></div>
+            <div class="wf-row"><span class="wf-label">Frame Total</span><div class="wf-bar-wrap"><div class="wf-bar total" id="bar-total"></div></div><span class="wf-val" id="val-total">&mdash;</span></div>
+            <div class="wf-row"><span class="wf-label">HTTP Round-Trip</span><div class="wf-bar-wrap"><div class="wf-bar http" id="bar-http"></div></div><span class="wf-val" id="val-http">&mdash;</span></div>
+        </div>
+    </div>
+
+    <!-- 3-Minute Test + Live Frame Preview -->
+    <div class="row">
+        <div class="card">
+            <div class="card-title">3-Minute Profiling Test</div>
+            <div style="display:flex; gap:0.5rem; margin-bottom:0.6rem;">
+                <button class="prof-btn primary" id="btn-start" onclick="startTest()">Start 3m Test</button>
+                <button class="prof-btn danger" id="btn-stop" onclick="stopTest()" disabled>Stop</button>
+            </div>
+            <div id="test-status" style="font-size:0.8rem; color:#555; margin-bottom:0.3rem;">Idle</div>
+            <div id="test-progress" style="font-size:0.75rem; color:#444; margin-bottom:0.5rem;"></div>
+            <table class="results-table">
+                <thead><tr><th>Stage</th><th>Min</th><th>Avg</th><th>Max</th><th>P95</th></tr></thead>
+                <tbody id="results-body"><tr><td colspan="5" style="color:#333; text-align:center;">No test data</td></tr></tbody>
+            </table>
+        </div>
+        <div class="card">
+            <div class="card-title">Live Frame Preview</div>
+            <img id="preview-frame" class="preview-img" alt="Preview">
+            <div class="preview-overlay">
+                Cursor: <span id="pv-cursor">(?, ?)</span> |
+                Method: <span id="pv-method">--</span> |
+                Age: <span id="pv-age">--</span>s
+            </div>
+        </div>
+    </div>
+
+    <!-- Historical Sparkline + Backend Metrics + OCR -->
+    <div class="row triple">
+        <div class="card">
+            <div class="card-title">Frame Total (last 100 frames)</div>
+            <canvas id="spark-canvas" class="spark-canvas"></canvas>
+            <div style="display:flex; justify-content:space-between; font-size:0.65rem; color:#444; margin-top:4px;">
+                <span id="spark-min">min: --</span>
+                <span id="spark-avg">avg: --</span>
+                <span id="spark-max">max: --</span>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-title">Backend Metrics</div>
+            <div class="metric-row"><span class="metric-label">Tracking Method</span><span class="metric-val" id="m-method">--</span></div>
+            <div class="metric-row"><span class="metric-label">Tracking Hz</span><span class="metric-val" id="m-hz">--</span></div>
+            <div class="metric-row"><span class="metric-label">Confidence</span><span class="metric-val" id="m-conf">--</span></div>
+            <div class="metric-row"><span class="metric-label">Misses</span><span class="metric-val" id="m-misses">--</span></div>
+            <div class="metric-row"><span class="metric-label">Cursor Age</span><span class="metric-val" id="m-age">--</span></div>
+            <div class="metric-row"><span class="metric-label">Validated</span><span class="metric-val" id="m-validated">--</span></div>
+            <div class="metric-row"><span class="metric-label">Daemon Timestamp</span><span class="metric-val" id="m-ts" style="font-size:0.65rem; color:#555">--</span></div>
+        </div>
+        <div class="card">
+            <div class="card-title">UTC Latency Measurement</div>
+            <div style="font-size:0.7rem; color:#555; margin-bottom:0.6rem;">
+                Open a UTC ms clock on the target machine, then measure.
+                Claude Vision OCR reads the displayed time.
+            </div>
+            <div style="display:flex; gap:0.5rem; align-items:center; margin-bottom:0.5rem;">
+                <button class="prof-btn primary" id="btn-measure" onclick="measureLatency()">Measure</button>
+                <span id="measure-status" style="font-size:0.75rem; color:#555;"></span>
+            </div>
+            <div id="measure-result" style="font-size:0.75rem; white-space:pre-wrap;"></div>
+        </div>
+    </div>
+</div>
+
+<script>
+var serverUtc = '';
+var httpRt = 0;
+var barMax = 50;
+var history = [];
+var MAX_HISTORY = 100;
+var testRunning = false;
+var testPollId = null;
+var previewSeq = 0;
+
+// UTC clock
+function tickClock() {
+    document.getElementById('browser-utc').textContent = new Date().toISOString().slice(11, 23);
+    if (serverUtc) {
+        var d = Date.now() - new Date(serverUtc).getTime();
+        document.getElementById('utc-delta').textContent = d + 'ms';
+    }
+}
+setInterval(tickClock, 100);
+
+function setBar(name, ms) {
+    var b = document.getElementById('bar-' + name);
+    var v = document.getElementById('val-' + name);
+    if (!b || !v) return;
+    b.style.width = Math.min(100, (ms / barMax) * 100) + '%';
+    v.textContent = ms.toFixed(1) + 'ms';
+}
+
+// Main poll
+async function poll() {
+    try {
+        var t0 = Date.now();
+        var r = await fetch('/api/profiler');
+        httpRt = Date.now() - t0;
+        var d = await r.json();
+        serverUtc = d.utc;
+        document.getElementById('server-utc').textContent = d.utc.slice(11, 23);
+        document.getElementById('prof-status').textContent = 'Live';
+        document.getElementById('prof-status').style.color = '#2ecc71';
+
+        setBar('decode', d.pipeline.jpeg_decode_ms);
+        setBar('track', d.pipeline.silhouette_ms);
+        setBar('overlay', d.pipeline.overlay_draw_ms);
+        setBar('encode', d.pipeline.jpeg_encode_ms);
+        setBar('total', d.pipeline.frame_total_ms);
+        setBar('http', httpRt);
+
+        // Daemon stats in header bar
+        document.getElementById('daemon-fps').textContent = d.daemon.fps.toFixed(1);
+        document.getElementById('blob-count').textContent = d.daemon.blob_count;
+        document.getElementById('frame-count').textContent = d.daemon.frame_count;
+
+        // Backend metrics
+        document.getElementById('m-method').textContent = d.tracking.method;
+        document.getElementById('m-hz').textContent = d.tracking.hz;
+        var conf = d.tracking.confidence;
+        var confEl = document.getElementById('m-conf');
+        confEl.textContent = (conf * 100).toFixed(1) + '%';
+        confEl.className = 'metric-val ' + (conf > 0.7 ? 'good' : conf > 0.3 ? 'warn' : 'bad');
+        document.getElementById('m-misses').textContent = d.tracking.misses;
+        document.getElementById('m-age').textContent = d.tracking.cursor_age_s + 's';
+        document.getElementById('m-validated').textContent = d.cursor.validated ? 'Yes' : 'No';
+        document.getElementById('m-ts').textContent = d.daemon.timestamp_ns;
+
+        // Cursor position for preview
+        document.getElementById('pv-cursor').textContent = '(' + d.cursor.x + ', ' + d.cursor.y + ')';
+        document.getElementById('pv-method').textContent = d.cursor.method;
+        document.getElementById('pv-age').textContent = d.cursor.age_s;
+
+        // Sparkline history
+        history.push(d.pipeline.frame_total_ms);
+        if (history.length > MAX_HISTORY) history.shift();
+        drawSparkline();
+    } catch (e) {
+        document.getElementById('prof-status').textContent = 'Disconnected';
+        document.getElementById('prof-status').style.color = '#e74c3c';
+    }
+}
+setInterval(poll, 200);
+
+// Preview frame at 2Hz
+function updatePreview() {
+    document.getElementById('preview-frame').src = '/api/frame?' + previewSeq++;
+}
+setInterval(updatePreview, 500);
+
+// Sparkline
+function drawSparkline() {
+    var canvas = document.getElementById('spark-canvas');
+    var ctx = canvas.getContext('2d');
+    var W = canvas.offsetWidth, H = canvas.offsetHeight;
+    canvas.width = W * (window.devicePixelRatio || 1);
+    canvas.height = H * (window.devicePixelRatio || 1);
+    ctx.scale(window.devicePixelRatio || 1, window.devicePixelRatio || 1);
+
+    ctx.clearRect(0, 0, W, H);
+    if (history.length < 2) return;
+
+    var min = Math.min.apply(null, history);
+    var max = Math.max.apply(null, history);
+    var avg = history.reduce(function(a,b){return a+b;}, 0) / history.length;
+    var range = Math.max(max - min, 1);
+
+    document.getElementById('spark-min').textContent = 'min: ' + min.toFixed(1) + 'ms';
+    document.getElementById('spark-avg').textContent = 'avg: ' + avg.toFixed(1) + 'ms';
+    document.getElementById('spark-max').textContent = 'max: ' + max.toFixed(1) + 'ms';
+
+    // Average line
+    var avgY = H - ((avg - min) / range) * (H - 10) - 5;
+    ctx.strokeStyle = '#333';
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(0, avgY); ctx.lineTo(W, avgY); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Data line
+    ctx.strokeStyle = '#e74c3c';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (var i = 0; i < history.length; i++) {
+        var x = (i / (MAX_HISTORY - 1)) * W;
+        var y = H - ((history[i] - min) / range) * (H - 10) - 5;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Fill under curve
+    ctx.lineTo((history.length - 1) / (MAX_HISTORY - 1) * W, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(231, 76, 60, 0.1)';
+    ctx.fill();
+}
+
+// 3-minute test
+var STAGE_NAMES = {
+    jpeg_decode_ms: 'JPEG Decode', silhouette_ms: 'Sil. Track',
+    overlay_draw_ms: 'Overlay Draw', jpeg_encode_ms: 'JPEG Encode',
+    frame_total_ms: 'Frame Total'
+};
+
+async function startTest() {
+    await fetch('/api/profiler/start', {method:'POST'});
+    testRunning = true;
+    document.getElementById('btn-start').disabled = true;
+    document.getElementById('btn-stop').disabled = false;
+    document.getElementById('test-status').textContent = 'Running...';
+    document.getElementById('test-status').style.color = '#2ecc71';
+    testPollId = setInterval(pollResults, 1000);
+}
+
+async function stopTest() {
+    await fetch('/api/profiler/stop', {method:'POST'});
+    testRunning = false;
+    document.getElementById('btn-start').disabled = false;
+    document.getElementById('btn-stop').disabled = true;
+    document.getElementById('test-status').textContent = 'Complete';
+    document.getElementById('test-status').style.color = '#f1c40f';
+    if (testPollId) { clearInterval(testPollId); testPollId = null; }
+    pollResults();
+}
+
+async function pollResults() {
+    try {
+        var r = await fetch('/api/profiler/results');
+        var d = await r.json();
+        if (d.status === 'no_data') return;
+        document.getElementById('test-progress').textContent =
+            'Samples: ' + d.samples + ' | ' + d.elapsed_s + 's / ' + d.duration_s + 's';
+        if (d.status === 'complete' && testRunning) {
+            testRunning = false;
+            document.getElementById('btn-start').disabled = false;
+            document.getElementById('btn-stop').disabled = true;
+            document.getElementById('test-status').textContent = 'Complete';
+            document.getElementById('test-status').style.color = '#f1c40f';
+            if (testPollId) { clearInterval(testPollId); testPollId = null; }
+        }
+        if (d.stages) {
+            var tbody = document.getElementById('results-body');
+            while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+            var keys = Object.keys(STAGE_NAMES);
+            for (var i = 0; i < keys.length; i++) {
+                if (d.stages[keys[i]]) {
+                    var s = d.stages[keys[i]];
+                    var tr = document.createElement('tr');
+                    [STAGE_NAMES[keys[i]], s.min.toFixed(1), s.avg.toFixed(1), s.max.toFixed(1), s.p95.toFixed(1)].forEach(function(v) {
+                        var td = document.createElement('td');
+                        td.textContent = v;
+                        tr.appendChild(td);
+                    });
+                    tbody.appendChild(tr);
+                }
+            }
+        }
+    } catch(e) {}
+}
+
+// OCR Latency measurement
+async function measureLatency() {
+    var btn = document.getElementById('btn-measure');
+    var st = document.getElementById('measure-status');
+    var res = document.getElementById('measure-result');
+    btn.disabled = true;
+    st.textContent = 'Capturing + OCR...';
+    st.style.color = '#f1c40f';
+    res.textContent = '';
+    try {
+        var r = await fetch('/api/profiler/measure_latency', {method:'POST'});
+        var d = await r.json();
+        btn.disabled = false;
+        if (d.error) { st.textContent = 'Error'; st.style.color = '#e74c3c'; res.textContent = d.error; return; }
+        st.textContent = 'Done'; st.style.color = '#2ecc71';
+        var lines = [];
+        lines.push('Capture: ' + d.capture_ms.toFixed(1) + 'ms');
+        lines.push('Inference: ' + d.inference_ms.toFixed(0) + 'ms');
+        lines.push('Local UTC: ' + d.capture_utc);
+        lines.push('Screen UTC: ' + (d.displayed_utc || 'not detected'));
+        if (d.delta_ms !== null && d.delta_ms !== undefined) lines.push('Delta: ' + d.delta_ms + 'ms');
+        if (d.ocr_result && d.ocr_result.notes) lines.push('Notes: ' + d.ocr_result.notes);
+        res.textContent = lines.join('\n');
+    } catch(e) { btn.disabled = false; st.textContent = 'Failed'; st.style.color = '#e74c3c'; }
+}
+
+poll();
+</script>
+</body>
+</html>"""
+
+
+# ── Concepts HTML ──────────────────────────────────────────────────
+
+_CONCEPTS_PATH = Path(__file__).parent.parent.parent / "docs" / "STAR_TREK_COMPUTER_CONCEPTS.md"
+_CONCEPTS_TEXT = ""
+if _CONCEPTS_PATH.exists():
+    _raw = _CONCEPTS_PATH.read_text()
+    _CONCEPTS_TEXT = _raw.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+else:
+    _CONCEPTS_TEXT = "Concepts file not found at " + str(_CONCEPTS_PATH)
+
+CONCEPTS_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Star Trek Computer Concepts</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'JetBrains Mono', 'Fira Code', monospace; background: #0a0a0f; color: #c8c8d0; line-height: 1.6; }
+.header { background: #101018; padding: 0.6rem 1.5rem; border-bottom: 2px solid #ff4444;
+    display: flex; justify-content: space-between; align-items: center; }
+.header h1 { color: #ff4444; font-size: 1.1rem; letter-spacing: 1px; }
+.header a { color: #888; text-decoration: none; font-size: 0.75rem; margin-left: 1rem; }
+.header a:hover { color: #ff4444; }
+.content { max-width: 960px; margin: 2rem auto; padding: 0 2rem; }
+pre { white-space: pre-wrap; word-wrap: break-word; font-size: 0.82rem; line-height: 1.7; }
+</style>
+</head>
+<body>
+<div class="header">
+    <div style="display:flex; align-items:center;">
+        <h1>STAR TREK COMPUTER &mdash; CONCEPTS</h1>
+        <a href="/">Dashboard</a>
+        <a href="/profiler">Profiler</a>
+    </div>
+</div>
+<div class="content"><pre>""" + _CONCEPTS_TEXT + r"""</pre></div>
 </body>
 </html>"""
 
