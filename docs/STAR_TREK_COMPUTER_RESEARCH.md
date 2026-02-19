@@ -10,6 +10,7 @@ The sections below are organized by implementation area, but the true conceptual
 
 ```
 Ship Computer (§9) — orchestrator
+├── UTC Time — foundational: all events carry ms-precision UTC timestamps
 ├── ASMP (§8) — generalized actuator-sensor protocol
 │   ├── Cursor Awareness (§3-6, §10) — one system, not four separate ones
 │   │   The Lissajous, shape filter, three-tier recovery, C daemon, dashboard,
@@ -17,6 +18,7 @@ Ship Computer (§9) — orchestrator
 │   └── Camera Awareness — Tapo C210 (separate repo, same ASMP pattern)
 ├── Navigation (§7) — uses Cursor Awareness for "IT Work" experience type
 ├── Hardware (§2) — physical actuators and sensors
+├── Pipeline Profiler (§10) — per-stage timing, latency measurement, 3m test
 └── Experience System (§7 OTel, §11 lessons) — logging and skill preservation
 ```
 
@@ -48,6 +50,7 @@ The system is a **Star Trek ship computer** — an AI that has full awareness an
 - *"Once a good thing is created, it should not be forgotten"* — Proven approaches must be preserved. Conversation history IS the experience log.
 - *"if the position is not known, only the locator utility needs to be used, and not random motions"* — Binding constraint for all agents.
 - *"The mouse pointer should not be affected by image recognition at any point"* — Motion detection is the base layer. CNN only validates.
+- **UTC time is fundamental** — All timestamps in the system use millisecond-precision UTC (`YYYY-MM-DDTHH:MM:SS.mmmZ`). This is not optional. UTC enables: (1) cross-machine latency measurement between HDMI source and dashboard, (2) pipeline profiling with absolute time references, (3) experience log entries that are comparable across devices and sessions. Every API response, every log entry, every sensor reading should carry UTC.
 
 ### Mesh Architecture (user-described, session `9545c157`)
 
@@ -103,6 +106,7 @@ Desktop (Arch Linux, PRIME A520M-K)
 | HDMI Capture | `/dev/video0` (desktop), `/dev/video4` (laptop) | USB autosuspend causes black frames. Fix: `echo "on" > /sys/bus/usb/devices/BUS-PORT/power/control` |
 | ESP32 Mouse | `/dev/ttyUSB0` | BLE goes stale within ~1s of no activity. Fix: heartbeat (zero-movement reports) or DTR toggle for hard reset |
 | Pi Zero KB | `10.55.0.2:8081` | USB gadget network needs manual IP: `ip addr add 10.55.0.1/24 dev enp8s0f3u3u4` |
+| Desktop Front USB | 2 front panel ports (PRIME A520M-K) | **One port is dead** (2026-02-20). Only one front port works (currently used by keyboard). Rear has USB 3.0 port available next to WiFi dongle. Plan USB peripheral placement accordingly. Session: `ff04450c-a27e-450a-b64c-fe849cd16f32` |
 
 ### Signal Detection Heuristic
 
@@ -446,11 +450,35 @@ Web dashboard at `http://localhost:8766` showing:
 | Endpoint | Purpose |
 |----------|---------|
 | `/video_feed` | MJPEG stream |
-| `/api/state` | JSON: cursor pos, blobs, fps, mouse status |
+| `/api/state` | JSON: cursor pos, blobs, fps, mouse status (UTC timestamp) |
+| `/api/frame` | Latest overlay JPEG frame (`X-Frame-UTC` response header) |
 | `/api/probe` | Move mouse, detect blob, return position |
 | `/api/locate` | Dual-direction probe (120px) |
 | `/api/mouse/move` | Send relative mouse movement |
 | `/api/mouse/reconnect` | DTR toggle for ESP32 reset |
+| `/api/profiler` | Live per-stage pipeline timing (JPEG decode, silhouette, overlay, encode) |
+| `/api/profiler/start` | Start 3-minute profiling test (POST) |
+| `/api/profiler/stop` | Stop profiling test early (POST) |
+| `/api/profiler/results` | Aggregate results: min/avg/max/p95 per stage |
+| `/profiler` | Dedicated profiler page with live waterfall + UTC clock comparison |
+
+### UTC Timestamps (added Feb 20)
+
+All API responses now carry UTC timestamps (`utc_now_ms()` → `2026-02-20T14:30:05.123Z`):
+- `/api/state` → `timestamp` field is UTC
+- `/api/frame` → `X-Frame-UTC` response header
+- `/api/profiler` → `utc` field in response
+- Profiler frontend shows browser UTC vs server UTC with delta in milliseconds
+
+### Pipeline Profiler (added Feb 20)
+
+The daemon loop instruments 4 stages per frame:
+1. **JPEG Decode** (`cv2.imdecode` + BGR→RGB conversion)
+2. **Silhouette Tracking** (already timed by `sil_tracker.track()`)
+3. **Overlay Draw** (blob rectangles + HUD text)
+4. **JPEG Encode** (`frame_to_jpeg` — RGB→BGR + imencode)
+
+Profiler page at `/profiler` shows live waterfall bars + HTTP round-trip. The 3-minute test collects per-frame samples and computes statistical summaries.
 
 ### Background Loops
 

@@ -75,6 +75,27 @@ def _make_ibeam_template(size: int = 32) -> np.ndarray:
     return img
 
 
+def _make_hand_template(size: int = 32) -> np.ndarray:
+    """Generate a synthetic hand/pointer cursor template."""
+    img = np.full((size, size), 128, dtype=np.uint8)
+    s = size / 32.0
+    # Simplified pointing hand: index finger + palm
+    hand_pts = np.array([
+        [int(10 * s), int(2 * s)],   # finger tip
+        [int(13 * s), int(2 * s)],
+        [int(13 * s), int(12 * s)],
+        [int(20 * s), int(12 * s)],  # knuckles
+        [int(22 * s), int(14 * s)],
+        [int(22 * s), int(24 * s)],  # palm bottom
+        [int(8 * s), int(24 * s)],
+        [int(8 * s), int(14 * s)],
+        [int(10 * s), int(12 * s)],
+    ], dtype=np.int32)
+    cv2.fillPoly(img, [hand_pts], color=255)
+    cv2.polylines(img, [hand_pts], isClosed=True, color=0, thickness=1)
+    return img
+
+
 class CursorRecognizer:
     """Validates cursor presence and provides shape templates.
 
@@ -92,6 +113,7 @@ class CursorRecognizer:
         # Synthetic templates for Stage 0
         self._arrow_template = _make_arrow_template(32)
         self._ibeam_template = _make_ibeam_template(32)
+        self._hand_template = _make_hand_template(32)
 
         # Learned cursor template (updated from confirmed positions)
         self._cursor_template: Optional[np.ndarray] = None
@@ -157,7 +179,7 @@ class CursorRecognizer:
         """Stage 0: Match against synthetic cursor templates."""
         best_score = 0.0
 
-        for template in (self._arrow_template, self._ibeam_template):
+        for template in (self._arrow_template, self._ibeam_template, self._hand_template):
             result = cv2.matchTemplate(patch, template, cv2.TM_CCOEFF_NORMED)
             _, max_val, _, _ = cv2.minMaxLoc(result)
             best_score = max(best_score, max_val)

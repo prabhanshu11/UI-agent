@@ -17,7 +17,7 @@ import json
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import cv2
@@ -37,6 +37,13 @@ from src.hardware.cursor_sample_collector import CursorSampleCollector, extract_
 from src.hardware.cursor_recognizer import CursorRecognizer
 from src.hardware.daemon_client import DaemonClient
 from src.hardware.cursor_vision_detector import ClaudeVisionCursorDetector
+from src.hardware.silhouette_tracker import SilhouetteTracker
+from src.hardware.commanded_movement import CommandedMovement
+
+def utc_now_ms() -> str:
+    """UTC timestamp with millisecond precision, e.g. '2026-02-20T14:30:05.123Z'."""
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+
 
 app = FastAPI(title="KVM Control Dashboard")
 
@@ -73,7 +80,21 @@ class MotionState:
     cursor_validated: bool = False
     sample_count_pos: int = 0
     sample_count_neg: int = 0
+    # Silhouette tracking (Phase 2)
+    silhouette_active: bool = False
+    silhouette_method: str = "none"
+    silhouette_hz: float = 0.0
+    silhouette_roi_size: int = 200
+    silhouette_confidence: float = 0.0
+    silhouette_latency_ms: float = 0.0
+    silhouette_misses: int = 0
     error: Optional[str] = None
+    # Pipeline profiling
+    prof_jpeg_decode_ms: float = 0.0
+    prof_overlay_draw_ms: float = 0.0
+    prof_jpeg_encode_ms: float = 0.0
+    prof_frame_total_ms: float = 0.0
+    prof_daemon_timestamp_ns: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 state = MotionState()
@@ -82,13 +103,19 @@ state = MotionState()
 @dataclass
 class DashboardConfig:
     """Runtime-tunable parameters exposed via /api/config."""
-    frame_fps: float = 1.0          # Overlayed video render rate (Hz)
+    frame_fps: float = 5.0          # Overlayed video render rate (Hz)
     cnn_interval_s: float = 30.0    # CNN validation cycle (seconds)
     jitter_interval_s: float = 30.0 # Anti-sleep jitter interval
     jitter_pixels: int = 3          # Jitter amplitude (px)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 config = DashboardConfig()
+
+# ── Pipeline profiler state ────────────────────────────────────────
+profiler_samples: list[dict] = []
+profiler_running: bool = False
+profiler_start_time: float = 0.0
+PROFILER_DURATION_S = 180  # 3 minutes
 
 
 mouse: Optional[ESP32Mouse] = None
@@ -98,13 +125,16 @@ recognizer: Optional[CursorRecognizer] = None
 collector: Optional[CursorSampleCollector] = None
 daemon_client: Optional[DaemonClient] = None
 claude_detector: Optional[ClaudeVisionCursorDetector] = None
+sil_tracker: Optional[SilhouetteTracker] = None
+cmd_movement: Optional[CommandedMovement] = None
 
 
 # ── Motion detection service (background thread) ───────────────────
 
 def draw_blob_overlay(frame: np.ndarray, blobs: list[MotionBlob],
                       cursor_pos: tuple[int, int],
-                      pointer_blob_idx: int = -1) -> np.ndarray:
+                      pointer_blob_idx: int = -1,
+                      roi_bounds: Optional[tuple[int, int, int, int]] = None) -> np.ndarray:
     """Draw motion blob rectangles and cursor crosshair on frame.
 
     Args:
@@ -113,8 +143,28 @@ def draw_blob_overlay(frame: np.ndarray, blobs: list[MotionBlob],
         cursor_pos: (x, y) of known cursor position.
         pointer_blob_idx: Index of the blob identified as cursor (-1 if none).
             This blob gets green coloring; all others get blue.
+        roi_bounds: Optional (x0, y0, x1, y1) silhouette tracking ROI to draw.
     """
     overlay = frame.copy()
+
+    # Draw silhouette tracking ROI (yellow dashed rectangle)
+    if roi_bounds:
+        rx0, ry0, rx1, ry1 = roi_bounds
+        # Draw dashed rectangle by drawing short segments
+        color_roi = (0, 255, 255)  # Yellow
+        dash_len = 10
+        # Top edge
+        for x in range(rx0, rx1, dash_len * 2):
+            cv2.line(overlay, (x, ry0), (min(x + dash_len, rx1), ry0), color_roi, 1)
+        # Bottom edge
+        for x in range(rx0, rx1, dash_len * 2):
+            cv2.line(overlay, (x, ry1), (min(x + dash_len, rx1), ry1), color_roi, 1)
+        # Left edge
+        for y in range(ry0, ry1, dash_len * 2):
+            cv2.line(overlay, (rx0, y), (rx0, min(y + dash_len, ry1)), color_roi, 1)
+        # Right edge
+        for y in range(ry0, ry1, dash_len * 2):
+            cv2.line(overlay, (rx1, y), (rx1, min(y + dash_len, ry1)), color_roi, 1)
 
     for i, blob in enumerate(blobs):
         x_min, y_min, x_max, y_max = blob.bbox
@@ -145,19 +195,49 @@ def frame_to_jpeg(frame: np.ndarray, quality: int = 80) -> bytes:
     return buf.tobytes()
 
 
+def _draw_tracking_hud(overlay: np.ndarray, cursor_age: float,
+                       cursor_pos: tuple[int, int]):
+    """Draw tracking quality indicator directly on the video frame.
+
+    Shows: green TRACKING / yellow STALE / red LOST with age and coords.
+    This gives immediate visual feedback without reading the sidebar.
+    """
+    h, w = overlay.shape[:2]
+    if cursor_age < 5:
+        color = (0, 200, 0)
+        label = f"TRACKING ({cursor_pos[0]},{cursor_pos[1]})"
+    elif cursor_age < 30:
+        color = (255, 200, 0)
+        label = f"STALE {cursor_age:.0f}s ({cursor_pos[0]},{cursor_pos[1]})"
+    else:
+        color = (255, 50, 50)
+        label = f"LOST {cursor_age:.0f}s"
+
+    # Bottom-left corner
+    cv2.putText(overlay, label, (10, h - 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)  # shadow
+    cv2.putText(overlay, label, (10, h - 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+    # Draw crosshair at cursor position if tracking
+    if cursor_age < 30 and cursor_pos[0] > 0:
+        cx, cy = cursor_pos
+        cv2.drawMarker(overlay, (cx, cy), color,
+                       cv2.MARKER_CROSS, 20, 1, cv2.LINE_AA)
+
+
 def _daemon_motion_loop():
     """Read blobs + frames from C daemon shm. Cursor ID stays in Python.
 
-    Two update rates:
-    - State (blobs, cursor dot): ~20Hz — smooth CSS cursor overlay
-    - Frame (JPEG decode + draw overlays + re-encode): config.frame_fps (default 1Hz)
-
-    Jitter correlation: when the anti-sleep jitter fires (every 30s),
-    the resulting motion blob is matched to the cursor's last known
-    position. This keeps tracker.position continuously maintained
-    without any extra probe movements.
+    Three tracking strategies run in the same loop:
+    1. Motion blobs from daemon (~20Hz) — tracks moving cursor via frame-diff
+    2. Template matching via silhouette tracker (at frame_fps) — tracks stationary cursor
+    3. Staleness auto-detection — marks position lost when age exceeds threshold
+    4. Daemon health check — detects frozen daemon via stale frame_count
     """
     last_frame_time = 0.0
+    last_daemon_seq = 0
+    last_daemon_seq_time = time.monotonic()
 
     while True:
         try:
@@ -168,43 +248,170 @@ def _daemon_motion_loop():
 
             now = time.monotonic()
 
-            # ── Continuous cursor tracking from daemon blobs ────────
+            # ── Daemon health check ──
+            if ds.frame_count != last_daemon_seq:
+                last_daemon_seq = ds.frame_count
+                last_daemon_seq_time = now
+            elif now - last_daemon_seq_time > 5.0:
+                state.error = f"Daemon frozen (seq={ds.frame_count} for {now - last_daemon_seq_time:.0f}s)"
+
+            # ── Fast path: cursor tracking from daemon blobs (~20Hz) ──
+            # Tighter blob filter: real cursor is 5-200px at 1080p.
+            # Also reject very elongated blobs (UI text redraws, scrollbars).
             pos = tracker.position if tracker else None
-            cursor_blobs = [b for b in ds.blobs if 5 <= b.pixel_count <= 500]
+            cursor_blobs = []
+            for b in ds.blobs:
+                if b.pixel_count < 5 or b.pixel_count > 200:
+                    continue
+                bx0, by0, bx1, by1 = b.bbox
+                bw = max(1, bx1 - bx0)
+                bh = max(1, by1 - by0)
+                # Reject very elongated blobs (aspect < 0.2 = text/scrollbar)
+                if min(bw, bh) / max(bw, bh) < 0.2:
+                    continue
+                # Reject very large bounding boxes (UI element redraws)
+                if bw > 80 or bh > 80:
+                    continue
+                cursor_blobs.append(b)
             primary_blob = None
             if cursor_blobs:
                 if pos and (now - pos.timestamp < 10):
-                    # Position fresh — pick blob closest to last known
-                    best = min(cursor_blobs, key=lambda b:
-                        ((b.centroid[0] - pos.x) ** 2 +
-                         (b.centroid[1] - pos.y) ** 2) ** 0.5)
+                    # Score by distance + size preference (cursor-sized: 10-60px)
+                    def _blob_score(b):
+                        dist = ((b.centroid[0] - pos.x) ** 2 +
+                                (b.centroid[1] - pos.y) ** 2) ** 0.5
+                        # Prefer cursor-sized blobs (10-60px sweet spot)
+                        size_penalty = 0
+                        if b.pixel_count > 60:
+                            size_penalty = (b.pixel_count - 60) * 0.5
+                        return dist + size_penalty
+                    best = min(cursor_blobs, key=_blob_score)
                     dist = ((best.centroid[0] - pos.x) ** 2 +
                             (best.centroid[1] - pos.y) ** 2) ** 0.5
-                    if dist < 200:
+                    if dist < 150:
                         primary_blob = best
                         bx, by = best.centroid
                         if tracker:
                             tracker.set_position(bx, by, method="motion_track")
                         pos = tracker.position
+                        if sil_tracker:
+                            sil_tracker.reset()
                 else:
-                    # Position stale (>10s) — pick largest as primary
-                    best = max(cursor_blobs, key=lambda b: b.pixel_count)
+                    # No known position — pick blob most likely to be cursor
+                    # (prefer 10-60px range over outliers)
+                    def _cursor_likelihood(b):
+                        ideal = 30  # typical cursor pixel count
+                        return abs(b.pixel_count - ideal)
+                    best = min(cursor_blobs, key=_cursor_likelihood)
                     primary_blob = best
                     bx, by = best.centroid
                     if tracker:
                         tracker.set_position(bx, by, method="motion_track")
                     pos = tracker.position
+                    if sil_tracker:
+                        sil_tracker.reset()
 
             # ── Secondary cursor (meetings: remote participant) ───
             secondary_pos = None
             if primary_blob and len(cursor_blobs) > 1:
                 others = [b for b in cursor_blobs if b is not primary_blob]
                 if others:
-                    # Pick the largest remaining cursor-sized blob
                     sec = max(others, key=lambda b: b.pixel_count)
                     secondary_pos = (sec.centroid[0], sec.centroid[1])
 
-            # ── Update shared state (fast, ~20Hz) ──────────────────
+            # ── Slow path: frame decode + template match + overlay (5Hz) ──
+            frame_interval = 1.0 / max(0.1, config.frame_fps)
+            roi_bounds = None
+
+            if now - last_frame_time >= frame_interval:
+                jpeg = daemon_client.read_jpeg()
+                if jpeg:
+                    t_decode = time.monotonic()
+                    frame = cv2.imdecode(
+                        np.frombuffer(jpeg, dtype=np.uint8),
+                        cv2.IMREAD_COLOR)
+                    if frame is not None:
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        state.prof_jpeg_decode_ms = (time.monotonic() - t_decode) * 1000
+
+                        # ── Silhouette tracking on decoded frame ──
+                        pos = tracker.position if tracker else None
+                        if sil_tracker and pos:
+                            track_result = sil_tracker.track(frame_rgb, pos.x, pos.y)
+                            roi_bounds = sil_tracker.roi_bounds(
+                                pos.x, pos.y, frame_rgb.shape)
+
+                            state.silhouette_active = True
+                            state.silhouette_hz = round(sil_tracker.tracking_hz, 1)
+                            state.silhouette_roi_size = sil_tracker.roi_size
+                            state.silhouette_misses = sil_tracker.consecutive_misses
+
+                            if track_result:
+                                if tracker:
+                                    tracker.set_position(
+                                        track_result.x, track_result.y,
+                                        method="sil_" + track_result.method)
+                                pos = tracker.position
+                                state.silhouette_method = track_result.method
+                                state.silhouette_confidence = round(
+                                    track_result.confidence, 3)
+                                state.silhouette_latency_ms = round(
+                                    track_result.latency_ms, 2)
+                            else:
+                                state.silhouette_method = "searching"
+                                if sil_tracker.roi_size >= SilhouetteTracker.ROI_MAX:
+                                    state.silhouette_method = "lost"
+                                    # Auto-recovery: probe to re-establish position
+                                    recovery = _jitter_reacquire(True)
+                                    if recovery:
+                                        rx, ry = recovery
+                                        sil_tracker.reset()
+                                        state.silhouette_method = "recovered"
+                        else:
+                            state.silhouette_active = False
+
+                        # ── Draw overlay with tracking info ──
+                        t_overlay = time.monotonic()
+                        cursor_pos = (pos.x, pos.y) if pos else (0, 0)
+                        overlay = draw_blob_overlay(
+                            frame_rgb, ds.blobs, cursor_pos,
+                            roi_bounds=roi_bounds)
+
+                        # ── HUD: tracking quality on the frame ──
+                        cursor_age = (now - pos.timestamp) if pos else 999.0
+                        _draw_tracking_hud(overlay, cursor_age, cursor_pos)
+                        state.prof_overlay_draw_ms = (time.monotonic() - t_overlay) * 1000
+
+                        t_encode = time.monotonic()
+                        overlay_jpeg = frame_to_jpeg(overlay)
+                        state.prof_jpeg_encode_ms = (time.monotonic() - t_encode) * 1000
+
+                        state.prof_frame_total_ms = (time.monotonic() - t_decode) * 1000
+                        state.prof_daemon_timestamp_ns = ds.timestamp_ns
+
+                        # Collect profiler sample if test is running
+                        if profiler_running:
+                            profiler_samples.append({
+                                "utc": utc_now_ms(),
+                                "jpeg_decode_ms": round(state.prof_jpeg_decode_ms, 2),
+                                "silhouette_ms": round(state.silhouette_latency_ms, 2),
+                                "overlay_draw_ms": round(state.prof_overlay_draw_ms, 2),
+                                "jpeg_encode_ms": round(state.prof_jpeg_encode_ms, 2),
+                                "frame_total_ms": round(state.prof_frame_total_ms, 2),
+                            })
+
+                        with state.lock:
+                            state.frame_overlay = overlay_jpeg
+                            state.frame_raw = frame_rgb
+                        last_frame_time = now
+
+            # ── Staleness check: auto-expire validated status ──
+            pos = tracker.position if tracker else None
+            cursor_age = (now - pos.timestamp) if pos else 999.0
+            if cursor_age > 15:
+                state.cursor_validated = False
+
+            # ── Update shared state (~20Hz) ──
             cursor_pos = (0, 0)
             with state.lock:
                 state.blobs = ds.blobs
@@ -214,35 +421,17 @@ def _daemon_motion_loop():
                 if pos:
                     state.cursor_x = pos.x
                     state.cursor_y = pos.y
-                    state.cursor_age_s = now - pos.timestamp
+                    state.cursor_age_s = round(cursor_age, 1)
                     state.cursor_method = pos.method
                     cursor_pos = (pos.x, pos.y)
+                else:
+                    state.cursor_age_s = 999.0
                 if secondary_pos:
                     state.cursor2_x = secondary_pos[0]
                     state.cursor2_y = secondary_pos[1]
                     state.cursor2_active = True
                 else:
                     state.cursor2_active = False
-
-            # ── Render overlayed frame (slow, config.frame_fps) ────
-            frame_interval = 1.0 / max(0.1, config.frame_fps)
-            if now - last_frame_time >= frame_interval:
-                jpeg = daemon_client.read_jpeg()
-                if jpeg:
-                    # Decode → draw overlays → re-encode
-                    frame = cv2.imdecode(
-                        np.frombuffer(jpeg, dtype=np.uint8),
-                        cv2.IMREAD_COLOR)
-                    if frame is not None:
-                        # cv2 decodes to BGR; draw_blob_overlay expects RGB
-                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        overlay = draw_blob_overlay(
-                            frame_rgb, ds.blobs, cursor_pos)
-                        overlay_jpeg = frame_to_jpeg(overlay)
-                        with state.lock:
-                            state.frame_overlay = overlay_jpeg
-                            state.frame_raw = frame_rgb
-                    last_frame_time = now
 
             time.sleep(0.05)  # 20Hz state polling
 
@@ -262,7 +451,17 @@ def motion_detection_loop():
 
 
 def _python_motion_loop():
-    """Original Python motion detection loop (fallback when daemon not running)."""
+    """Python motion detection loop with Phase 2 silhouette tracking fast path.
+
+    When cursor position is known and fresh:
+      → Silhouette tracker runs first (ROI-based, <1ms)
+      → If it finds cursor, skip expensive full-frame blob detection
+      → Yellow dashed ROI rectangle shown on overlay
+
+    When position is stale or silhouette tracker fails:
+      → Full-frame blob detection (existing code, ~5-10ms)
+      → Shape-informed or proximity-based blob selection
+    """
     prev_frame = None
     frame_times = []
 
@@ -272,15 +471,10 @@ def _python_motion_loop():
             frame = sensor.capture(settle_frames=1)
             state.frame_count += 1
 
-            blobs = []
-            if prev_frame is not None:
-                blobs = extract_motion_blobs(
-                    prev_frame, frame,
-                    threshold=15, min_pixels=5, max_pixels=3000,
-                )
-
             pos = tracker.position if tracker else None
             cursor_pos = (0, 0)
+            roi_bounds = None
+
             if pos:
                 cursor_pos = (pos.x, pos.y)
                 state.cursor_x = pos.x
@@ -288,39 +482,108 @@ def _python_motion_loop():
                 state.cursor_method = pos.method
                 state.cursor_age_s = time.monotonic() - pos.timestamp
 
-            # Auto-track: update cursor position from cursor-sized blobs
+            # ── FAST PATH: Silhouette tracking in ROI ──────────────
+            silhouette_handled = False
+            position_fresh = pos and (time.monotonic() - pos.timestamp < 10)
+
+            if sil_tracker and position_fresh:
+                track_result = sil_tracker.track(frame, pos.x, pos.y)
+
+                state.silhouette_active = True
+                state.silhouette_hz = round(sil_tracker.tracking_hz, 1)
+                state.silhouette_roi_size = sil_tracker.roi_size
+                state.silhouette_misses = sil_tracker.consecutive_misses
+                roi_bounds = sil_tracker.roi_bounds(pos.x, pos.y, frame.shape)
+
+                if track_result:
+                    bx, by = track_result.x, track_result.y
+                    method = f"sil_{track_result.method}"
+                    if tracker:
+                        tracker.set_position(bx, by, method=method)
+                    cursor_pos = (bx, by)
+                    state.cursor_x = bx
+                    state.cursor_y = by
+                    state.cursor_method = method
+                    state.cursor_age_s = 0.0
+                    state.silhouette_method = track_result.method
+                    state.silhouette_confidence = round(track_result.confidence, 3)
+                    state.silhouette_latency_ms = round(track_result.latency_ms, 2)
+                    silhouette_handled = True
+
+                    # Update cursor template on high-confidence template matches
+                    if (recognizer and track_result.method == "template"
+                            and track_result.confidence > 0.6):
+                        patch = extract_gray_patch(frame, bx, by)
+                        if patch is not None:
+                            recognizer.update_cursor_template(patch)
+                else:
+                    state.silhouette_method = "searching"
+                    # If ROI maxed out, let full-frame take over
+                    if sil_tracker.roi_size >= SilhouetteTracker.ROI_MAX:
+                        state.silhouette_active = False
+                        state.silhouette_method = "lost"
+            else:
+                state.silhouette_active = False
+
+            # ── SLOW PATH: Full-frame blob detection ───────────────
+            blobs = []
             pointer_blob_idx = -1
-            if blobs:
-                cursor_blobs = [b for b in blobs if 5 <= b.pixel_count <= 500]
-                position_stale = not pos or (time.monotonic() - pos.timestamp > 10)
-                if cursor_blobs:
-                    best = None
-                    bx, by = 0, 0
 
-                    # Shape-informed scoring: if we have a cursor template,
-                    # score blobs by shape match instead of just size
-                    if recognizer and recognizer.cursor_template is not None:
-                        scored = []
-                        for b in cursor_blobs:
-                            bx_, by_ = b.centroid
-                            blob_patch = extract_gray_patch(frame, bx_, by_)
-                            if blob_patch is not None:
-                                score = recognizer.score_blob_shape(blob_patch)
-                                scored.append((b, score))
-                        scored.sort(key=lambda x: x[1], reverse=True)
+            if not silhouette_handled:
+                if prev_frame is not None:
+                    blobs = extract_motion_blobs(
+                        prev_frame, frame,
+                        threshold=15, min_pixels=5, max_pixels=3000,
+                    )
 
-                        if position_stale:
-                            # Pick highest shape score
-                            if scored and scored[0][1] > 0.5:
-                                best = scored[0][0]
+                if blobs:
+                    cursor_blobs = [b for b in blobs if 5 <= b.pixel_count <= 500]
+                    position_stale = not pos or (time.monotonic() - pos.timestamp > 10)
+                    if cursor_blobs:
+                        best = None
+                        bx, by = 0, 0
+
+                        # Shape-informed scoring
+                        if recognizer and recognizer.cursor_template is not None:
+                            scored = []
+                            for b in cursor_blobs:
+                                bx_, by_ = b.centroid
+                                blob_patch = extract_gray_patch(frame, bx_, by_)
+                                if blob_patch is not None:
+                                    score = recognizer.score_blob_shape(blob_patch)
+                                    scored.append((b, score))
+                            scored.sort(key=lambda x: x[1], reverse=True)
+
+                            if position_stale:
+                                if scored and scored[0][1] > 0.5:
+                                    best = scored[0][0]
+                                    bx, by = best.centroid
+                                    state.cursor_method = "shape_track"
+                            else:
+                                good = [(b, s) for b, s in scored if s > 0.4]
+                                if good:
+                                    best_dist = 9999
+                                    for b, s in good:
+                                        bx_, by_ = b.centroid
+                                        dist = ((bx_ - pos.x) ** 2 + (by_ - pos.y) ** 2) ** 0.5
+                                        if dist < best_dist:
+                                            best_dist = dist
+                                            best = b
+                                    if best and best_dist > 600:
+                                        best = None
+                                    if best:
+                                        bx, by = best.centroid
+                                        state.cursor_method = "shape_track"
+
+                        # Fallback: size-based heuristic
+                        if best is None:
+                            if position_stale:
+                                cursor_blobs.sort(key=lambda b: b.pixel_count)
+                                best = cursor_blobs[0]
                                 bx, by = best.centroid
-                                state.cursor_method = "shape_track"
-                        else:
-                            # Among high-scoring blobs, pick closest to known position
-                            good = [(b, s) for b, s in scored if s > 0.4]
-                            if good:
+                            else:
                                 best_dist = 9999
-                                for b, s in good:
+                                for b in cursor_blobs:
                                     bx_, by_ = b.centroid
                                     dist = ((bx_ - pos.x) ** 2 + (by_ - pos.y) ** 2) ** 0.5
                                     if dist < best_dist:
@@ -330,43 +593,26 @@ def _python_motion_loop():
                                     best = None
                                 if best:
                                     bx, by = best.centroid
-                                    state.cursor_method = "shape_track"
 
-                    # Fallback: original size-based heuristic
-                    if best is None:
-                        if position_stale:
-                            cursor_blobs.sort(key=lambda b: b.pixel_count)
-                            best = cursor_blobs[0]
-                            bx, by = best.centroid
-                        else:
-                            best_dist = 9999
-                            for b in cursor_blobs:
-                                bx_, by_ = b.centroid
-                                dist = ((bx_ - pos.x) ** 2 + (by_ - pos.y) ** 2) ** 0.5
-                                if dist < best_dist:
-                                    best_dist = dist
-                                    best = b
-                            if best and best_dist > 600:
-                                best = None
-                            if best:
-                                bx, by = best.centroid
+                        if best:
+                            try:
+                                pointer_blob_idx = blobs.index(best)
+                            except ValueError:
+                                pointer_blob_idx = -1
+                            if tracker:
+                                tracker.set_position(bx, by, method=state.cursor_method if state.cursor_method in ("shape_track",) else "motion_track")
+                            cursor_pos = (bx, by)
+                            state.cursor_x = bx
+                            state.cursor_y = by
+                            if state.cursor_method != "shape_track":
+                                state.cursor_method = "motion_track"
+                            state.cursor_age_s = 0.0
 
-                    if best:
-                        # Track which blob is the pointer for color coding
-                        try:
-                            pointer_blob_idx = blobs.index(best)
-                        except ValueError:
-                            pointer_blob_idx = -1
-                        if tracker:
-                            tracker.set_position(bx, by, method=state.cursor_method if state.cursor_method in ("shape_track",) else "motion_track")
-                        cursor_pos = (bx, by)
-                        state.cursor_x = bx
-                        state.cursor_y = by
-                        if state.cursor_method != "shape_track":
-                            state.cursor_method = "motion_track"
-                        state.cursor_age_s = 0.0
+                            # Reset silhouette tracker on fresh position from full-frame
+                            if sil_tracker:
+                                sil_tracker.reset()
 
-            overlay = draw_blob_overlay(frame, blobs, cursor_pos, pointer_blob_idx)
+            overlay = draw_blob_overlay(frame, blobs, cursor_pos, pointer_blob_idx, roi_bounds)
             jpeg = frame_to_jpeg(overlay)
 
             with state.lock:
@@ -448,14 +694,14 @@ def _jitter_reacquire(use_daemon):
     if frame_a is None:
         return None
 
-    # Move RIGHT
+    # Move RIGHT — wait 250ms for daemon JPEG buffer to refresh
     mouse._send_raw(amp, 0)
-    time.sleep(0.15)
+    time.sleep(0.25)
     frame_b = _capture()
 
     # Move DOWN
     mouse._send_raw(0, amp)
-    time.sleep(0.15)
+    time.sleep(0.25)
     frame_c = _capture()
 
     # Undo both movements
@@ -562,13 +808,27 @@ def cursor_validation_loop():
             position_stale = (not pos) or (now - pos.timestamp > 60)
 
             if position_stale:
-                # Position unknown or very stale — skip CNN, go straight
-                # to jitter re-acquire. This is the startup path and the
-                # recovery path when cursor is lost.
-                result = _jitter_reacquire(use_daemon)
-                if result:
-                    state.cursor_validated = False  # Need CNN to confirm
+                # Position unknown or very stale — try commanded movement
+                # escalation first (silhouette-verified), fall back to legacy
+                reacquired = False
+                if cmd_movement and pos:
+                    mr = cmd_movement.escalate(pos.x, pos.y)
+                    if mr:
+                        tracker.set_position(mr.x, mr.y, method=mr.method)
+                        state.cursor_x = mr.x
+                        state.cursor_y = mr.y
+                        state.cursor_method = mr.method
+                        state.cursor_age_s = 0.0
+                        reacquired = True
+                if not reacquired:
+                    result = _jitter_reacquire(use_daemon)
+                    if result:
+                        reacquired = True
+                if reacquired:
+                    state.cursor_validated = False
                     state.cnn_confidence = 0.0
+                    if sil_tracker:
+                        sil_tracker.reset()
                 continue
 
             # Position is fresh — validate with CNN
@@ -598,18 +858,32 @@ def cursor_validation_loop():
             state.cnn_model_version = recognizer.model_version
 
             if confidence > 0.7:
-                # Cursor confirmed at known position
+                # Cursor confirmed — update template + reset silhouette to tight ROI
                 recognizer.update_cursor_template(patch)
                 state.cursor_validated = True
+                if sil_tracker:
+                    sil_tracker.reset()
                 if collector:
                     collector.collect_from_tracking(
                         frame, cx, cy, confidence=confidence)
                     state.sample_count_pos = collector.positive_count
                     state.sample_count_neg = collector.negative_count
             else:
-                # CNN says cursor NOT here — jitter re-acquire
+                # CNN says cursor NOT here — try commanded movement, then legacy
                 state.cursor_validated = False
-                _jitter_reacquire(use_daemon)
+                if sil_tracker:
+                    sil_tracker.reset()
+                reacquired = False
+                if cmd_movement:
+                    mr = cmd_movement.escalate(cx, cy)
+                    if mr:
+                        tracker.set_position(mr.x, mr.y, method=mr.method)
+                        state.cursor_x = mr.x
+                        state.cursor_y = mr.y
+                        state.cursor_method = mr.method
+                        reacquired = True
+                if not reacquired:
+                    _jitter_reacquire(use_daemon)
 
         except Exception:
             pass  # Non-critical — will retry next cycle
@@ -627,7 +901,8 @@ async def get_frame():
     with state.lock:
         jpeg = state.frame_overlay
     if jpeg:
-        return Response(content=jpeg, media_type="image/jpeg")
+        return Response(content=jpeg, media_type="image/jpeg",
+                        headers={"X-Frame-UTC": utc_now_ms()})
     return {"error": "No frame yet"}
 
 
@@ -644,6 +919,9 @@ async def get_state():
             "x": state.cursor_x, "y": state.cursor_y,
             "method": state.cursor_method,
             "age_s": round(state.cursor_age_s, 1),
+            "quality": "good" if state.cursor_age_s < 5
+                       else "stale" if state.cursor_age_s < 30
+                       else "lost",
         },
         "cursor2": {
             "x": state.cursor2_x, "y": state.cursor2_y,
@@ -665,11 +943,20 @@ async def get_state():
                 "neg": state.sample_count_neg,
             },
         },
+        "silhouette": {
+            "active": state.silhouette_active,
+            "method": state.silhouette_method,
+            "hz": state.silhouette_hz,
+            "roi_size": state.silhouette_roi_size,
+            "confidence": state.silhouette_confidence,
+            "latency_ms": state.silhouette_latency_ms,
+            "misses": state.silhouette_misses,
+        },
         "fps": round(state.fps, 1),
         "frame_count": state.frame_count,
         "claude_detector": claude_detector.to_dict() if claude_detector else None,
         "error": state.error,
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": utc_now_ms(),
     }
 
 
@@ -706,6 +993,7 @@ async def probe_cursor(amplitude: int = 30):
 
     import cv2 as _cv2
     import numpy as _np
+    import hashlib as _hl
     try:
         # Capture frame before probe
         if use_daemon:
@@ -716,8 +1004,12 @@ async def probe_cursor(amplitude: int = 30):
                 _np.frombuffer(jpeg, dtype=_np.uint8), _cv2.IMREAD_COLOR)
         else:
             frame_before = sensor.capture(settle_frames=1)
+
+        h_before = _hl.md5(jpeg).hexdigest()[:8] if use_daemon else "sensor"
+
         mouse._send_raw(amplitude, 0)
-        time.sleep(0.15)
+        time.sleep(0.30)  # Wait for daemon JPEG buffer to refresh
+
         if use_daemon:
             jpeg2 = daemon_client.read_jpeg()
             frame_after = _cv2.imdecode(
@@ -726,28 +1018,39 @@ async def probe_cursor(amplitude: int = 30):
             frame_after = sensor.capture(settle_frames=1)
         mouse._send_raw(-amplitude, 0)
 
+        h_after = _hl.md5(jpeg2).hexdigest()[:8] if (use_daemon and jpeg2) else "sensor"
+        frames_same = (h_before == h_after)
+
         # Use cursor shape filter to distinguish cursor from UI changes
         blobs = extract_motion_blobs(
             frame_before, frame_after,
-            threshold=25, min_pixels=5, max_pixels=500,
+            threshold=15, min_pixels=5, max_pixels=500,
             cursor_shape_filter=True,
         )
 
         # Also get unfiltered for comparison
         all_blobs = extract_motion_blobs(
             frame_before, frame_after,
-            threshold=25, min_pixels=5, max_pixels=3000,
+            threshold=15, min_pixels=5, max_pixels=3000,
         )
 
         if not blobs:
-            # Fallback: use smallest blob near expected area (cursor is small)
             small_blobs = [b for b in all_blobs if b.pixel_count < 200]
             small_blobs.sort(key=lambda b: b.pixel_count)
             if small_blobs:
                 blobs = small_blobs
 
         if not blobs:
-            return {"error": "No cursor detected", "total_blobs": len(all_blobs)}
+            return {
+                "error": "No cursor detected",
+                "total_blobs": len(all_blobs),
+                "debug": {
+                    "frames_same": frames_same,
+                    "hash_before": h_before,
+                    "hash_after": h_after,
+                    "all_blob_sizes": [b.pixel_count for b in all_blobs[:10]],
+                },
+            }
 
         bx, by = blobs[0].centroid
         if tracker:
@@ -847,6 +1150,48 @@ async def locate_cursor():
             }
     except Exception as e:
         return {"error": str(e)}
+
+
+@app.get("/api/escalate")
+async def escalate_cursor():
+    """Escalating commanded movement recovery chain.
+
+    Tries increasingly aggressive movements to re-find the cursor:
+    1. ±3px jitter (invisible)
+    2. ±15px dual-direction probe
+    3. ±50px dual-direction probe
+    Falls back to legacy _jitter_reacquire() if CommandedMovement not available.
+    """
+    if not mouse:
+        return {"error": "Mouse not initialized"}
+    if not tracker:
+        return {"error": "Tracker not initialized"}
+
+    pos = tracker.position
+    last_x = pos.x if pos else 960
+    last_y = pos.y if pos else 540
+
+    if cmd_movement:
+        mr = cmd_movement.escalate(last_x, last_y)
+        if mr:
+            tracker.set_position(mr.x, mr.y, method=mr.method)
+            if sil_tracker:
+                sil_tracker.reset()
+            return {
+                "cursor": {"x": mr.x, "y": mr.y},
+                "method": mr.method,
+                "amplitude": mr.amplitude,
+                "confidence": round(mr.confidence, 3),
+                "latency_ms": round(mr.latency_ms, 1),
+            }
+
+    # Fallback to legacy
+    use_daemon = daemon_client and daemon_client.is_running()
+    result = _jitter_reacquire(use_daemon)
+    if result:
+        return {"cursor": {"x": result[0], "y": result[1]}, "method": "legacy_dual_probe"}
+
+    return {"error": "All recovery methods failed"}
 
 
 @app.get("/api/screenshot")
@@ -978,6 +1323,8 @@ async def claude_detect():
                 state.cursor_y = result.cursor_y
                 state.cursor_method = "claude_vision"
                 state.cursor_age_s = 0.0
+            if sil_tracker:
+                sil_tracker.reset()  # Re-lock silhouette to Claude-found position
             if collector:
                 saved = claude_detector.save_training_samples(
                     frame, result, collector)
@@ -1210,6 +1557,216 @@ async def get_validation_stats():
     }
 
 
+# ── Pipeline Profiler API ────────────────────────────────────────────
+
+
+@app.get("/api/profiler")
+async def get_profiler():
+    """Live pipeline timing data (latest frame)."""
+    return {
+        "utc": utc_now_ms(),
+        "pipeline": {
+            "jpeg_decode_ms": round(state.prof_jpeg_decode_ms, 2),
+            "silhouette_ms": round(state.silhouette_latency_ms, 2),
+            "overlay_draw_ms": round(state.prof_overlay_draw_ms, 2),
+            "jpeg_encode_ms": round(state.prof_jpeg_encode_ms, 2),
+            "frame_total_ms": round(state.prof_frame_total_ms, 2),
+        },
+        "tracking": {
+            "method": state.silhouette_method,
+            "hz": state.silhouette_hz,
+            "confidence": state.silhouette_confidence,
+            "misses": state.silhouette_misses,
+            "cursor_age_s": state.cursor_age_s,
+        },
+        "daemon": {
+            "fps": state.fps,
+            "frame_count": state.frame_count,
+            "timestamp_ns": state.prof_daemon_timestamp_ns,
+        },
+    }
+
+
+@app.post("/api/profiler/start")
+async def start_profiler():
+    """Start a 3-minute profiling test. Collects per-frame timing samples."""
+    global profiler_samples, profiler_running, profiler_start_time
+    profiler_samples = []
+    profiler_running = True
+    profiler_start_time = time.monotonic()
+    return {"status": "started", "duration_s": PROFILER_DURATION_S, "utc": utc_now_ms()}
+
+
+@app.post("/api/profiler/stop")
+async def stop_profiler():
+    """Stop the profiling test early."""
+    global profiler_running
+    profiler_running = False
+    return {"status": "stopped", "samples": len(profiler_samples), "utc": utc_now_ms()}
+
+
+@app.get("/api/profiler/results")
+async def get_profiler_results():
+    """Get profiler results: per-stage min/avg/max/p95 over the test period."""
+    global profiler_running
+    # Auto-stop after duration
+    if profiler_running and (time.monotonic() - profiler_start_time) >= PROFILER_DURATION_S:
+        profiler_running = False
+
+    if not profiler_samples:
+        return {"status": "no_data", "running": profiler_running}
+
+    def stats(values):
+        if not values:
+            return {"min": 0, "avg": 0, "max": 0, "p95": 0}
+        s = sorted(values)
+        return {
+            "min": round(s[0], 2),
+            "avg": round(sum(s) / len(s), 2),
+            "max": round(s[-1], 2),
+            "p95": round(s[int(len(s) * 0.95)], 2) if len(s) >= 2 else round(s[-1], 2),
+        }
+
+    keys = ["jpeg_decode_ms", "silhouette_ms", "overlay_draw_ms",
+            "jpeg_encode_ms", "frame_total_ms"]
+    result = {}
+    for key in keys:
+        result[key] = stats([s[key] for s in profiler_samples])
+
+    elapsed = time.monotonic() - profiler_start_time if profiler_running else (
+        PROFILER_DURATION_S if profiler_samples else 0)
+
+    return {
+        "status": "running" if profiler_running else "complete",
+        "samples": len(profiler_samples),
+        "elapsed_s": round(elapsed, 1),
+        "duration_s": PROFILER_DURATION_S,
+        "stages": result,
+        "utc": utc_now_ms(),
+    }
+
+
+@app.post("/api/profiler/measure_latency")
+async def measure_latency():
+    """Capture frame, OCR the displayed UTC time, compare with local UTC.
+
+    Requires a UTC millisecond clock website to be open on the target machine.
+    Uses Claude Agent SDK to read the time from the captured HDMI frame.
+    Returns timing breakdown: capture, inference, and the UTC delta.
+    """
+    import tempfile
+
+    # Step 1: Capture frame + record local UTC
+    t_capture_start = time.monotonic()
+    capture_utc = utc_now_ms()
+    with state.lock:
+        jpeg = state.frame_overlay
+        raw_frame = state.frame_raw
+    t_capture_ms = (time.monotonic() - t_capture_start) * 1000
+
+    if raw_frame is None:
+        return {"error": "No frame available"}
+
+    # Step 2: Save frame as temp JPEG for the agent
+    t_infer_start = time.monotonic()
+    try:
+        import os
+        os.environ.pop("CLAUDECODE", None)
+
+        from claude_agent_sdk import (
+            ClaudeAgentOptions,
+            ResultMessage,
+            TextBlock,
+            query,
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False, prefix="utc_ocr_") as f:
+            tmppath = f.name
+            bgr = cv2.cvtColor(raw_frame, cv2.COLOR_RGB2BGR)
+            _, buf = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            f.write(buf.tobytes())
+
+        options = ClaudeAgentOptions(
+            system_prompt=(
+                "You read UTC timestamps from screenshots of clock websites. "
+                "You will be given a screenshot path. Read it using the Read tool, "
+                "find the displayed UTC time (look for HH:MM:SS.mmm or similar formats), "
+                "and output ONLY a JSON object: "
+                '{\"utc_time\": \"HH:MM:SS.mmm\", \"confidence\": \"high/low\", '
+                '\"notes\": \"brief description of what you see\"}'
+            ),
+            allowed_tools=["Read"],
+            permission_mode="bypassPermissions",
+            model="haiku",
+            max_turns=3,
+        )
+
+        prompt = f"Read this screenshot and find the UTC time displayed: {tmppath}"
+
+        ocr_text = ""
+        for msg in query(prompt=prompt, options=options):
+            if isinstance(msg, ResultMessage):
+                for block in msg.content:
+                    if isinstance(block, TextBlock):
+                        ocr_text += block.text
+
+        # Clean up temp file
+        try:
+            os.unlink(tmppath)
+        except OSError:
+            pass
+
+        t_infer_ms = (time.monotonic() - t_infer_start) * 1000
+
+        # Step 3: Parse the OCR result
+        import re
+        json_match = re.search(r'\{[^}]+\}', ocr_text)
+        ocr_result = {}
+        displayed_utc = None
+        if json_match:
+            try:
+                ocr_result = json.loads(json_match.group())
+                displayed_utc = ocr_result.get("utc_time")
+            except json.JSONDecodeError:
+                pass
+
+        # Step 4: Calculate delta if we got a time
+        delta_ms = None
+        if displayed_utc:
+            try:
+                # Parse capture_utc (YYYY-MM-DDTHH:MM:SS.mmmZ)
+                cap_time_str = capture_utc[11:23]  # HH:MM:SS.mmm
+                cap_parts = cap_time_str.split(':')
+                cap_ms = (int(cap_parts[0]) * 3600 + int(cap_parts[1]) * 60 +
+                          float(cap_parts[2])) * 1000
+
+                # Parse displayed time (HH:MM:SS.mmm or HH:MM:SS)
+                disp_parts = displayed_utc.split(':')
+                disp_sec = disp_parts[2] if len(disp_parts) > 2 else "0"
+                disp_ms = (int(disp_parts[0]) * 3600 + int(disp_parts[1]) * 60 +
+                           float(disp_sec)) * 1000
+
+                delta_ms = round(cap_ms - disp_ms)
+            except (ValueError, IndexError):
+                pass
+
+        return {
+            "capture_utc": capture_utc,
+            "capture_ms": round(t_capture_ms, 2),
+            "inference_ms": round(t_infer_ms, 2),
+            "displayed_utc": displayed_utc,
+            "delta_ms": delta_ms,
+            "ocr_result": ocr_result,
+            "ocr_raw": ocr_text[:500],
+        }
+
+    except ImportError:
+        return {"error": "Claude Agent SDK not installed"}
+    except Exception as e:
+        t_infer_ms = (time.monotonic() - t_infer_start) * 1000
+        return {"error": str(e), "inference_ms": round(t_infer_ms, 2)}
+
+
 # ── Dashboard HTML ──────────────────────────────────────────────────
 
 DASHBOARD_HTML = r"""
@@ -1336,11 +1893,63 @@ DASHBOARD_HTML = r"""
         .tier.t1.active { background: #2ecc71; color: #000; }
         .tier.t2.active { background: #f1c40f; color: #000; }
         .tier.t3.active { background: #e74c3c; }
+        /* Tabs */
+        .tabs { display: flex; gap: 0; margin-left: 1.5rem; }
+        .tab-btn {
+            padding: 4px 14px; font-family: inherit; font-size: 0.75rem;
+            background: transparent; border: 1px solid #333; color: #666;
+            cursor: pointer; transition: all 0.2s;
+        }
+        .tab-btn:first-child { border-radius: 4px 0 0 4px; }
+        .tab-btn:last-child { border-radius: 0 4px 4px 0; }
+        .tab-btn.active { background: #ff4444; color: #fff; border-color: #ff4444; }
+        .tab-btn:not(.active):hover { color: #ccc; border-color: #555; }
+        .tab-view { display: none; }
+        .tab-view.active { display: block; }
+        /* Profiler tab styles */
+        .profiler-content { padding: 1rem; height: 100%; overflow-y: auto; }
+        .prof-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+        .prof-panel { background: #0a0a12; border: 1px solid #1a1a25; border-radius: 6px; padding: 0.8rem; }
+        .wf-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+        .wf-label { width: 110px; font-size: 0.7rem; color: #888; text-align: right; flex-shrink: 0; }
+        .wf-bar-wrap { flex: 1; height: 20px; background: #12121a; border-radius: 3px; overflow: hidden; }
+        .wf-bar { height: 100%; border-radius: 3px; transition: width 0.2s; min-width: 2px; }
+        .wf-bar.decode { background: #3498db; }
+        .wf-bar.track { background: #2ecc71; }
+        .wf-bar.overlay { background: #9b59b6; }
+        .wf-bar.encode { background: #e67e22; }
+        .wf-bar.total { background: #e74c3c; }
+        .wf-bar.http { background: #f1c40f; }
+        .wf-val { width: 65px; font-size: 0.75rem; color: #aaa; font-variant-numeric: tabular-nums; }
+        .wf-sep { border-top: 1px dashed #333; margin: 4px 0; }
+        .prof-btn {
+            padding: 5px 14px; border: 1px solid #333; border-radius: 4px;
+            background: #1a1a25; color: #ccc; font-family: inherit; font-size: 0.75rem;
+            cursor: pointer;
+        }
+        .prof-btn:hover { background: #252530; }
+        .prof-btn.start { border-color: #ff4444; color: #ff4444; }
+        .prof-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .prof-table { width: 100%; font-size: 0.7rem; border-collapse: collapse; margin-top: 0.5rem; }
+        .prof-table th { text-align: right; color: #555; font-weight: normal; padding: 3px 6px; border-bottom: 1px solid #1a1a25; }
+        .prof-table th:first-child { text-align: left; }
+        .prof-table td { text-align: right; padding: 3px 6px; font-variant-numeric: tabular-nums; }
+        .prof-table td:first-child { text-align: left; color: #888; }
+        .utc-row { display: flex; gap: 1.5rem; font-size: 0.75rem; margin-bottom: 0.6rem; }
+        .utc-lbl { color: #555; font-size: 0.6rem; text-transform: uppercase; }
+        .utc-val { color: #2ecc71; font-variant-numeric: tabular-nums; }
+        .utc-delta { color: #f1c40f; }
     </style>
 </head>
 <body>
     <div class="header">
-        <h1>KVM MOTION DETECTOR</h1>
+        <div style="display:flex; align-items:center; gap:0.5rem;">
+            <h1>KVM</h1>
+            <div class="tabs">
+                <button class="tab-btn active" onclick="switchTab('live')">Live Feed</button>
+                <button class="tab-btn" onclick="switchTab('profiler')">Profiler</button>
+            </div>
+        </div>
         <div class="status">
             <span><span id="dot-mouse" class="dot gray"></span> Mouse</span>
             <span><span id="dot-heartbeat" class="dot gray"></span> Heartbeat</span>
@@ -1350,10 +1959,66 @@ DASHBOARD_HTML = r"""
         </div>
     </div>
     <div class="main">
-        <div class="feed" id="feed-container">
+        <!-- Tab: Live Feed -->
+        <div class="feed tab-view active" id="feed-container" data-tab="live">
             <img id="live-frame" src="" alt="Loading...">
             <div class="cursor-dot" id="cursor-dot"></div>
             <div class="cursor-dot-secondary" id="cursor-dot-2"></div>
+        </div>
+        <!-- Tab: Profiler -->
+        <div class="tab-view" data-tab="profiler" style="background:#0a0a0f; overflow-y:auto;">
+            <div class="profiler-content">
+                <div class="utc-row">
+                    <div><div class="utc-lbl">Browser UTC</div><div class="utc-val" id="browser-utc">--:--:--.---</div></div>
+                    <div><div class="utc-lbl">Server UTC</div><div class="utc-val" id="server-utc">--:--:--.---</div></div>
+                    <div><div class="utc-lbl">Delta</div><div class="utc-delta" id="utc-delta">--ms</div></div>
+                </div>
+                <div class="prof-grid">
+                    <div class="prof-panel">
+                        <div class="panel-title">Pipeline Waterfall</div>
+                        <div class="wf-row"><span class="wf-label">JPEG Decode</span><div class="wf-bar-wrap"><div class="wf-bar decode" id="bar-decode"></div></div><span class="wf-val" id="val-decode">&mdash;</span></div>
+                        <div class="wf-row"><span class="wf-label">Sil. Track</span><div class="wf-bar-wrap"><div class="wf-bar track" id="bar-track"></div></div><span class="wf-val" id="val-track">&mdash;</span></div>
+                        <div class="wf-row"><span class="wf-label">Overlay Draw</span><div class="wf-bar-wrap"><div class="wf-bar overlay" id="bar-overlay"></div></div><span class="wf-val" id="val-overlay">&mdash;</span></div>
+                        <div class="wf-row"><span class="wf-label">JPEG Encode</span><div class="wf-bar-wrap"><div class="wf-bar encode" id="bar-encode"></div></div><span class="wf-val" id="val-encode">&mdash;</span></div>
+                        <div class="wf-sep"></div>
+                        <div class="wf-row"><span class="wf-label">Frame Total</span><div class="wf-bar-wrap"><div class="wf-bar total" id="bar-total"></div></div><span class="wf-val" id="val-total">&mdash;</span></div>
+                        <div class="wf-row"><span class="wf-label">HTTP RT</span><div class="wf-bar-wrap"><div class="wf-bar http" id="bar-http"></div></div><span class="wf-val" id="val-http">&mdash;</span></div>
+                        <div style="font-size:0.65rem; color:#555; margin-top:6px;">
+                            Method: <span id="ti-method" style="color:#888">&mdash;</span> |
+                            Hz: <span id="ti-hz" style="color:#888">&mdash;</span> |
+                            Conf: <span id="ti-conf" style="color:#888">&mdash;</span> |
+                            FPS: <span id="ti-fps" style="color:#888">&mdash;</span>
+                        </div>
+                    </div>
+                    <div class="prof-panel">
+                        <div class="panel-title">3-Minute Test</div>
+                        <div style="display:flex; gap:0.5rem; margin-bottom:0.5rem;">
+                            <button class="prof-btn start" id="btn-start" onclick="startProfilerTest()">Start 3m Test</button>
+                            <button class="prof-btn" id="btn-stop" onclick="stopProfilerTest()" disabled>Stop</button>
+                        </div>
+                        <div id="prof-test-status" style="font-size:0.75rem; color:#555; margin-bottom:0.3rem;">Idle</div>
+                        <div id="prof-test-progress" style="font-size:0.7rem; color:#444; margin-bottom:0.5rem;"></div>
+                        <table class="prof-table">
+                            <thead><tr><th>Stage</th><th>Min</th><th>Avg</th><th>Max</th><th>P95</th></tr></thead>
+                            <tbody id="prof-results-body">
+                                <tr><td colspan="5" style="color:#333; text-align:center;">No test data</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="prof-panel" style="grid-column: 1 / -1;">
+                        <div class="panel-title">UTC Latency Measurement</div>
+                        <div style="font-size:0.65rem; color:#555; margin-bottom:0.5rem;">
+                            Open a UTC ms clock website on the target machine, then click Measure.
+                            Claude Vision OCR reads the displayed time and compares with local UTC.
+                        </div>
+                        <div style="display:flex; gap:0.5rem; align-items:center; margin-bottom:0.5rem;">
+                            <button class="prof-btn start" id="btn-measure" onclick="measureLatency()">Measure Latency</button>
+                            <span id="measure-status" style="font-size:0.7rem; color:#555;"></span>
+                        </div>
+                        <div id="measure-result" style="font-size:0.75rem;"></div>
+                    </div>
+                </div>
+            </div>
         </div>
         <div class="sidebar">
             <div class="panel">
@@ -1381,6 +2046,33 @@ DASHBOARD_HTML = r"""
                     <thead><tr><th>Centroid</th><th>Size</th><th>Angle</th></tr></thead>
                     <tbody id="blob-list"></tbody>
                 </table>
+            </div>
+            <div class="panel">
+                <div class="panel-title">Silhouette Tracking</div>
+                <div class="hw-row">
+                    <span class="hw-label">Status</span>
+                    <span class="hw-value" id="sil-status">—</span>
+                </div>
+                <div class="hw-row">
+                    <span class="hw-label">Method</span>
+                    <span class="hw-value" id="sil-method" style="color:#888">—</span>
+                </div>
+                <div class="hw-row">
+                    <span class="hw-label">Hz</span>
+                    <span class="hw-value" id="sil-hz" style="color:#888">—</span>
+                </div>
+                <div class="hw-row">
+                    <span class="hw-label">ROI</span>
+                    <span class="hw-value" id="sil-roi" style="color:#888">—</span>
+                </div>
+                <div class="hw-row">
+                    <span class="hw-label">Confidence</span>
+                    <span class="hw-value" id="sil-confidence">—</span>
+                </div>
+                <div class="hw-row">
+                    <span class="hw-label">Latency</span>
+                    <span class="hw-value" id="sil-latency" style="color:#888">—</span>
+                </div>
             </div>
             <div class="panel">
                 <div class="panel-title">CNN Cursor Recognition</div>
@@ -1468,10 +2160,15 @@ DASHBOARD_HTML = r"""
                     s.pi_keyboard === true ? 'green' :
                     s.pi_keyboard === false ? 'yellow' : 'gray');
 
-                document.getElementById('cursor-coords').textContent =
+                var coordsEl = document.getElementById('cursor-coords');
+                coordsEl.textContent =
                     '(' + s.cursor.x + ', ' + s.cursor.y + ')';
-                document.getElementById('cursor-method').textContent = s.cursor.method;
-                document.getElementById('cursor-age').textContent = s.cursor.age_s;
+                coordsEl.style.color = s.cursor.quality === 'good' ? '#2ecc71' :
+                    s.cursor.quality === 'stale' ? '#f1c40f' : '#e74c3c';
+                document.getElementById('cursor-method').textContent =
+                    s.cursor.method + ' [' + s.cursor.quality + ']';
+                document.getElementById('cursor-age').textContent =
+                    s.cursor.age_s + 's';
                 updateCursorDot(s.cursor.x, s.cursor.y);
 
                 // Secondary cursor (remote participant in meetings)
@@ -1540,6 +2237,29 @@ DASHBOARD_HTML = r"""
                     s.pi_keyboard === false ? 'Discoverable' : 'Unreachable');
                 document.getElementById('hw-frames').textContent = s.frame_count;
 
+                // Silhouette tracking panel
+                if (s.silhouette) {
+                    var silStatus = document.getElementById('sil-status');
+                    silStatus.textContent = s.silhouette.active ? 'Active' : 'Inactive';
+                    silStatus.className = 'hw-value ' + (s.silhouette.active ? 'ok' : 'warn');
+                    var silMethod = document.getElementById('sil-method');
+                    silMethod.textContent = s.silhouette.method;
+                    silMethod.style.color = s.silhouette.method === 'template' ? '#2ecc71' :
+                        s.silhouette.method === 'motion_roi' ? '#3498db' :
+                        s.silhouette.method === 'lost' ? '#e74c3c' : '#888';
+                    document.getElementById('sil-hz').textContent = s.silhouette.hz + ' Hz';
+                    var roiEl = document.getElementById('sil-roi');
+                    roiEl.textContent = s.silhouette.roi_size + 'px';
+                    roiEl.style.color = s.silhouette.roi_size <= 200 ? '#2ecc71' :
+                        s.silhouette.roi_size <= 400 ? '#f1c40f' : '#e74c3c';
+                    var silConf = document.getElementById('sil-confidence');
+                    silConf.textContent = (s.silhouette.confidence * 100).toFixed(1) + '%';
+                    silConf.className = 'hw-value ' + (s.silhouette.confidence > 0.5 ? 'ok' :
+                        s.silhouette.confidence > 0.3 ? 'warn' : 'err');
+                    document.getElementById('sil-latency').textContent =
+                        s.silhouette.latency_ms.toFixed(2) + 'ms';
+                }
+
                 // CNN panel
                 if (s.cnn) {
                     var conf = s.cnn.confidence;
@@ -1581,14 +2301,38 @@ DASHBOARD_HTML = r"""
 
         function mapCursorToScreen(cursorX, cursorY) {
             var img = document.getElementById('live-frame');
-            var container = document.getElementById('feed-container');
             if (!img.naturalWidth) return null;
-            var containerRect = container.getBoundingClientRect();
+
             var imgRect = img.getBoundingClientRect();
-            var scaleX = imgRect.width / 1920;
-            var scaleY = imgRect.height / 1080;
-            var offsetX = imgRect.left - containerRect.left;
-            var offsetY = imgRect.top - containerRect.top;
+            var naturalRatio = img.naturalWidth / img.naturalHeight;
+            var elementRatio = imgRect.width / imgRect.height;
+
+            // Calculate actual rendered image position within the element
+            // (object-fit: contain causes letterboxing)
+            var renderedW, renderedH, padX, padY;
+            if (naturalRatio > elementRatio) {
+                // Image wider than element — fit width, letterbox top/bottom
+                renderedW = imgRect.width;
+                renderedH = imgRect.width / naturalRatio;
+                padX = 0;
+                padY = (imgRect.height - renderedH) / 2;
+            } else {
+                // Image taller than element — fit height, letterbox left/right
+                renderedH = imgRect.height;
+                renderedW = imgRect.height * naturalRatio;
+                padX = (imgRect.width - renderedW) / 2;
+                padY = 0;
+            }
+
+            var scaleX = renderedW / img.naturalWidth;
+            var scaleY = renderedH / img.naturalHeight;
+
+            // Position relative to feed-container
+            var container = document.getElementById('feed-container');
+            var containerRect = container.getBoundingClientRect();
+            var offsetX = (imgRect.left + padX) - containerRect.left;
+            var offsetY = (imgRect.top + padY) - containerRect.top;
+
             return {
                 left: (offsetX + cursorX * scaleX) + 'px',
                 top: (offsetY + cursorY * scaleY) + 'px'
@@ -1621,12 +2365,184 @@ DASHBOARD_HTML = r"""
             dot.style.display = 'block';
         }
 
-        // State updates fast (smooth cursor dot), frame updates slow (1fps)
-        // Frame is rendered at config.frame_fps (default 1Hz) so polling
-        // faster just wastes bandwidth returning the same cached JPEG.
+        // ── Tab switching ──
+        var currentTab = 'live';
+        function switchTab(tab) {
+            currentTab = tab;
+            var views = document.querySelectorAll('.tab-view');
+            for (var i = 0; i < views.length; i++) {
+                views[i].classList.toggle('active', views[i].getAttribute('data-tab') === tab);
+            }
+            var btns = document.querySelectorAll('.tab-btn');
+            for (var i = 0; i < btns.length; i++) {
+                btns[i].classList.toggle('active', btns[i].textContent.toLowerCase().indexOf(tab) >= 0 ||
+                    (tab === 'live' && btns[i].textContent === 'Live Feed') ||
+                    (tab === 'profiler' && btns[i].textContent === 'Profiler'));
+            }
+        }
+
+        // ── Profiler polling ──
+        var profBarMax = 50;
+        var profHttpRt = 0;
+        var profServerUtc = '';
+        var profTestRunning = false;
+        var profResultsInterval = null;
+
+        function updateBrowserClock() {
+            var el = document.getElementById('browser-utc');
+            if (!el) return;
+            var t = new Date().toISOString().slice(11, 23);
+            el.textContent = t;
+            if (profServerUtc) {
+                var delta = Date.now() - new Date(profServerUtc).getTime();
+                document.getElementById('utc-delta').textContent = delta + 'ms';
+            }
+        }
+        setInterval(updateBrowserClock, 100);
+
+        function setWfBar(name, ms) {
+            var barEl = document.getElementById('bar-' + name);
+            var valEl = document.getElementById('val-' + name);
+            if (!barEl || !valEl) return;
+            barEl.style.width = Math.min(100, (ms / profBarMax) * 100) + '%';
+            valEl.textContent = ms.toFixed(1) + 'ms';
+        }
+
+        async function pollProfiler() {
+            if (currentTab !== 'profiler') return;
+            try {
+                var t0 = Date.now();
+                var res = await fetch('/api/profiler');
+                profHttpRt = Date.now() - t0;
+                var d = await res.json();
+                profServerUtc = d.utc;
+                var sEl = document.getElementById('server-utc');
+                if (sEl) sEl.textContent = d.utc.slice(11, 23);
+                setWfBar('decode', d.pipeline.jpeg_decode_ms);
+                setWfBar('track', d.pipeline.silhouette_ms);
+                setWfBar('overlay', d.pipeline.overlay_draw_ms);
+                setWfBar('encode', d.pipeline.jpeg_encode_ms);
+                setWfBar('total', d.pipeline.frame_total_ms);
+                setWfBar('http', profHttpRt);
+                var tiM = document.getElementById('ti-method');
+                if (tiM) tiM.textContent = d.tracking.method;
+                var tiH = document.getElementById('ti-hz');
+                if (tiH) tiH.textContent = d.tracking.hz;
+                var tiC = document.getElementById('ti-conf');
+                if (tiC) tiC.textContent = (d.tracking.confidence * 100).toFixed(1) + '%';
+                var tiF = document.getElementById('ti-fps');
+                if (tiF) tiF.textContent = d.daemon.fps.toFixed(1);
+            } catch (e) { /* ignore */ }
+        }
+        setInterval(pollProfiler, 200);
+
+        var PROF_STAGE_NAMES = {
+            jpeg_decode_ms: 'JPEG Decode', silhouette_ms: 'Sil. Track',
+            overlay_draw_ms: 'Overlay Draw', jpeg_encode_ms: 'JPEG Encode',
+            frame_total_ms: 'Frame Total'
+        };
+
+        function makeProfRow(label, s) {
+            var tr = document.createElement('tr');
+            var cells = [label, s.min.toFixed(1), s.avg.toFixed(1), s.max.toFixed(1), s.p95.toFixed(1)];
+            for (var i = 0; i < cells.length; i++) {
+                var td = document.createElement('td');
+                td.textContent = cells[i];
+                tr.appendChild(td);
+            }
+            return tr;
+        }
+
+        async function startProfilerTest() {
+            await fetch('/api/profiler/start', { method: 'POST' });
+            profTestRunning = true;
+            document.getElementById('btn-start').disabled = true;
+            document.getElementById('btn-stop').disabled = false;
+            document.getElementById('prof-test-status').textContent = 'Running...';
+            document.getElementById('prof-test-status').style.color = '#2ecc71';
+            profResultsInterval = setInterval(pollProfResults, 1000);
+        }
+
+        async function stopProfilerTest() {
+            await fetch('/api/profiler/stop', { method: 'POST' });
+            profTestRunning = false;
+            document.getElementById('btn-start').disabled = false;
+            document.getElementById('btn-stop').disabled = true;
+            document.getElementById('prof-test-status').textContent = 'Complete';
+            document.getElementById('prof-test-status').style.color = '#f1c40f';
+            if (profResultsInterval) { clearInterval(profResultsInterval); profResultsInterval = null; }
+            pollProfResults();
+        }
+
+        async function pollProfResults() {
+            try {
+                var res = await fetch('/api/profiler/results');
+                var d = await res.json();
+                if (d.status === 'no_data') return;
+                document.getElementById('prof-test-progress').textContent =
+                    'Samples: ' + d.samples + ' | ' + d.elapsed_s + 's / ' + d.duration_s + 's';
+                if (d.status === 'complete' && profTestRunning) {
+                    profTestRunning = false;
+                    document.getElementById('btn-start').disabled = false;
+                    document.getElementById('btn-stop').disabled = true;
+                    document.getElementById('prof-test-status').textContent = 'Complete';
+                    document.getElementById('prof-test-status').style.color = '#f1c40f';
+                    if (profResultsInterval) { clearInterval(profResultsInterval); profResultsInterval = null; }
+                }
+                if (d.stages) {
+                    var tbody = document.getElementById('prof-results-body');
+                    while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+                    var keys = Object.keys(PROF_STAGE_NAMES);
+                    for (var i = 0; i < keys.length; i++) {
+                        if (d.stages[keys[i]]) tbody.appendChild(makeProfRow(PROF_STAGE_NAMES[keys[i]], d.stages[keys[i]]));
+                    }
+                }
+            } catch (e) { /* ignore */ }
+        }
+
+        // ── UTC Latency Measurement ──
+        async function measureLatency() {
+            var btn = document.getElementById('btn-measure');
+            var statusEl = document.getElementById('measure-status');
+            var resultEl = document.getElementById('measure-result');
+            btn.disabled = true;
+            statusEl.textContent = 'Capturing + OCR inference...';
+            statusEl.style.color = '#f1c40f';
+            resultEl.textContent = '';
+            try {
+                var res = await fetch('/api/profiler/measure_latency', { method: 'POST' });
+                var d = await res.json();
+                btn.disabled = false;
+                if (d.error) {
+                    statusEl.textContent = 'Error: ' + d.error;
+                    statusEl.style.color = '#e74c3c';
+                    return;
+                }
+                statusEl.textContent = 'Done';
+                statusEl.style.color = '#2ecc71';
+                var lines = [];
+                lines.push('Capture: ' + d.capture_ms.toFixed(1) + 'ms | Inference: ' + d.inference_ms.toFixed(0) + 'ms');
+                lines.push('Local UTC: ' + d.capture_utc);
+                lines.push('Screen UTC: ' + (d.displayed_utc || 'not detected'));
+                if (d.delta_ms !== null && d.delta_ms !== undefined) {
+                    lines.push('Pipeline delta: ' + d.delta_ms + 'ms (local - screen)');
+                }
+                if (d.ocr_result && d.ocr_result.notes) {
+                    lines.push('Notes: ' + d.ocr_result.notes);
+                }
+                resultEl.textContent = lines.join('\n');
+                resultEl.style.whiteSpace = 'pre-wrap';
+            } catch (e) {
+                btn.disabled = false;
+                statusEl.textContent = 'Failed';
+                statusEl.style.color = '#e74c3c';
+            }
+        }
+
+        // ── Frame updates at 5Hz (matches config.frame_fps=5) ──
         function scheduleFrame() {
-            updateFrame();
-            setTimeout(scheduleFrame, 1000);  // 1fps — matches default frame_fps
+            if (currentTab === 'live') updateFrame();
+            setTimeout(scheduleFrame, 200);  // 5fps
         }
         setInterval(updateState, 200);  // 5Hz — smooth cursor dot movement
         scheduleFrame();
@@ -1885,7 +2801,7 @@ loadStats();
 # ── Startup ─────────────────────────────────────────────────────────
 
 def init_hardware():
-    global mouse, sensor, tracker, recognizer, collector, daemon_client, claude_detector
+    global mouse, sensor, tracker, recognizer, collector, daemon_client, claude_detector, sil_tracker, cmd_movement
 
     print("Initializing hardware...")
     mouse = ESP32Mouse('/dev/ttyUSB0', screen_width=1920, screen_height=1080)
@@ -1922,6 +2838,15 @@ def init_hardware():
     state.sample_count_neg = collector.negative_count
     print("  Cursor recognizer: " + recognizer.model_version
           + " (" + str(collector.total_samples) + " samples)")
+
+    # Phase 2: Silhouette tracker (fast ROI-based cursor following)
+    sil_tracker = SilhouetteTracker(recognizer)
+    print("  Silhouette tracker initialized (ROI: " + str(sil_tracker.roi_size) + "px)")
+
+    # Phase 3: Commanded movement (unified jitter + probe + Lissajous)
+    cmd_movement = CommandedMovement(
+        mouse, sil_tracker, sensor=sensor, daemon_client=daemon_client)
+    print("  Commanded movement initialized (jitter→probe→lissajous)")
 
     # Claude Vision cursor detector (uses subscription, no API key)
     claude_detector = ClaudeVisionCursorDetector(model="haiku")
