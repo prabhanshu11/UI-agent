@@ -146,6 +146,73 @@ _NOISE_THRESHOLD = 8
 _noise_grid: list[list[int]] = [[_NOISE_THRESHOLD] * _NOISE_GRID_W for _ in range(_NOISE_GRID_H)]
 
 
+def noise_grid_features() -> dict:
+    """Extract compact features from the noise grid for logging/CNN input.
+
+    Converts the 48x27 = 1296-cell grid into ~20 meaningful features:
+    - Per-quadrant activity counts (4 features)
+    - Total noisy cells, active cells, clear cells (3 features)
+    - Cluster count and sizes (2 features)
+    - Spatial centroid of activity (2 features)
+    - Activity density per 8x8 macro-block (reduces to ~6x3=18 → top-3 hottest blocks)
+    - Motion complexity score (entropy-like)
+    """
+    grid = _noise_grid
+    w, h = _NOISE_GRID_W, _NOISE_GRID_H
+    thresh = _NOISE_THRESHOLD
+    mid_x, mid_y = w // 2, h // 2
+
+    # Per-quadrant counts of noisy cells (cells at or above threshold)
+    q_counts = [0, 0, 0, 0]  # Q1=TL, Q2=TR, Q3=BL, Q4=BR
+    total_noisy = 0
+    total_active = 0  # cells with any activity (>0)
+    sum_x, sum_y, sum_w = 0.0, 0.0, 0.0
+
+    for gy in range(h):
+        for gx in range(w):
+            v = grid[gy][gx]
+            if v > 0:
+                total_active += 1
+            if v >= thresh:
+                total_noisy += 1
+                qi = (0 if gx < mid_x else 1) + (0 if gy < mid_y else 2)
+                q_counts[qi] += 1
+                # Weighted centroid
+                sum_x += gx * v
+                sum_y += gy * v
+                sum_w += v
+
+    centroid_x = round(sum_x / sum_w, 1) if sum_w > 0 else -1
+    centroid_y = round(sum_y / sum_w, 1) if sum_w > 0 else -1
+
+    # Macro-blocks: 8x8 cells → 6x3 = 18 blocks, report top 3 hottest
+    macro_w, macro_h = 8, 9  # 48/8=6, 27/9=3
+    macros = []
+    for my in range(0, h, macro_h):
+        for mx in range(0, w, macro_w):
+            count = 0
+            for gy in range(my, min(my + macro_h, h)):
+                for gx in range(mx, min(mx + macro_w, w)):
+                    if grid[gy][gx] >= thresh:
+                        count += 1
+            if count > 0:
+                macros.append({"x": mx, "y": my, "count": count})
+    macros.sort(key=lambda m: -m["count"])
+
+    # Complexity: ratio of noisy cells to total cells (0 = still, 1 = everything moving)
+    complexity = round(total_noisy / (w * h), 4) if w * h > 0 else 0
+
+    return {
+        "total_noisy": total_noisy,
+        "total_active": total_active,
+        "total_clear": w * h - total_active,
+        "quadrant_noisy": q_counts,
+        "centroid": [centroid_x, centroid_y],
+        "complexity": complexity,
+        "hotspots": macros[:3],
+    }
+
+
 # ── Motion detection service (background thread) ───────────────────
 
 def draw_blob_overlay(frame: np.ndarray, blobs: list[MotionBlob],
@@ -1622,17 +1689,12 @@ async def claude_detect():
     if not claude_detector:
         return {"error": "Claude detector not initialized"}
 
-    # Get frame from daemon or sensor
-    frame = None
-    if daemon_client and daemon_client.is_running():
-        jpeg = daemon_client.read_jpeg()
-        if jpeg:
-            frame = cv2.imdecode(
-                np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if frame is not None:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    elif sensor:
-        frame = sensor.capture(settle_frames=2)
+    # Use the EXACT same frame the rest of the system sees (state.frame_raw).
+    # This ensures Vision's ground truth matches the frame used for blob detection,
+    # silhouette tracking, and CNN validation — no timing skew from separate capture.
+    frame_capture_time = time.monotonic()
+    with state.lock:
+        frame = state.frame_raw.copy() if state.frame_raw is not None else None
 
     if frame is None:
         return {"error": "No frame available"}
@@ -2098,28 +2160,20 @@ async def get_validation_stats():
 
 @app.get("/api/profiler")
 async def get_profiler():
-    """Live pipeline timing data (latest frame)."""
+    """Live pipeline timing + all algorithm states with confidence scores.
+
+    Provides a complete snapshot of every subsystem for timing analysis.
+    """
+    now_mono = time.monotonic()
     return {
         "utc": utc_now_ms(),
+        "monotonic": now_mono,
         "pipeline": {
             "jpeg_decode_ms": round(state.prof_jpeg_decode_ms, 2),
             "silhouette_ms": round(state.silhouette_latency_ms, 2),
             "overlay_draw_ms": round(state.prof_overlay_draw_ms, 2),
             "jpeg_encode_ms": round(state.prof_jpeg_encode_ms, 2),
             "frame_total_ms": round(state.prof_frame_total_ms, 2),
-        },
-        "tracking": {
-            "method": state.silhouette_method,
-            "hz": state.silhouette_hz,
-            "confidence": state.silhouette_confidence,
-            "misses": state.silhouette_misses,
-            "cursor_age_s": state.cursor_age_s,
-        },
-        "daemon": {
-            "fps": state.fps,
-            "frame_count": state.frame_count,
-            "blob_count": state.blob_count,
-            "timestamp_ns": state.prof_daemon_timestamp_ns,
         },
         "cursor": {
             "x": state.cursor_x,
@@ -2128,6 +2182,54 @@ async def get_profiler():
             "age_s": round(state.cursor_age_s, 1),
             "validated": state.cursor_validated,
         },
+        "cnn": {
+            "confidence": round(state.cnn_confidence, 4),
+            "model": state.cnn_model_version,
+            "inference_ms": state.cnn_inference_ms,
+            "validated": state.cursor_validated,
+            "uncertainty": round(1.0 - abs(state.cnn_confidence - 0.5) * 2, 3),
+        },
+        "silhouette": {
+            "method": state.silhouette_method,
+            "hz": state.silhouette_hz,
+            "confidence": round(state.silhouette_confidence, 4),
+            "misses": state.silhouette_misses,
+            "roi_size": state.silhouette_roi_size,
+            "latency_ms": round(state.silhouette_latency_ms, 2),
+        },
+        "vision": {
+            "x": state.vision_x,
+            "y": state.vision_y,
+            "confidence": state.vision_confidence,
+            "cursor_type": state.vision_cursor_type,
+            "latency_ms": state.vision_latency_ms,
+            "age_s": round(now_mono - state.vision_timestamp, 1) if state.vision_timestamp > 0 else -1,
+            "count": state.vision_count,
+        },
+        "jitter": {
+            "count": state.jitter_count,
+            "trigger": "cnn" if (_low_confidence_since > 0 and
+                (now_mono - _low_confidence_since) > config.jitter_interval_s)
+                else "silhouette" if (sil_tracker and (
+                    sil_tracker.roi_size >= sil_tracker.ROI_MAX or
+                    sil_tracker.consecutive_misses >= 10))
+                else "none",
+            "low_confidence_s": round(now_mono - _low_confidence_since, 1)
+                if _low_confidence_since > 0 else 0.0,
+            "verify_in": config.verify_every_n - (state.jitter_count % config.verify_every_n),
+            "lockout_remaining_s": round(max(0, _vision_lockout_until - now_mono), 1),
+        },
+        "daemon": {
+            "fps": state.fps,
+            "frame_count": state.frame_count,
+            "blob_count": state.blob_count,
+            "timestamp_ns": state.prof_daemon_timestamp_ns,
+        },
+        "hardware": {
+            "mouse_connected": state.mouse_connected,
+            "heartbeat_active": state.heartbeat_active,
+        },
+        "noise_grid": noise_grid_features(),
     }
 
 
@@ -2248,7 +2350,7 @@ async def measure_latency():
         prompt = f"Read this screenshot and find the UTC time displayed: {tmppath}"
 
         ocr_text = ""
-        for msg in query(prompt=prompt, options=options):
+        async for msg in query(prompt=prompt, options=options):
             if isinstance(msg, ResultMessage):
                 for block in msg.content:
                     if isinstance(block, TextBlock):
@@ -2309,6 +2411,116 @@ async def measure_latency():
     except Exception as e:
         t_infer_ms = (time.monotonic() - t_infer_start) * 1000
         return {"error": str(e), "inference_ms": round(t_infer_ms, 2)}
+
+
+# ── Ground truth snapshot log ──────────────────────────────────────
+
+_GROUND_TRUTH_DIR = Path(__file__).parent.parent.parent / "data" / "ground_truth"
+_GROUND_TRUTH_DIR.mkdir(parents=True, exist_ok=True)
+_GROUND_TRUTH_LOG = _GROUND_TRUTH_DIR / "log.jsonl"
+
+
+@app.post("/api/profiler/snapshot")
+async def profiler_snapshot():
+    """Capture comprehensive ground truth: all algorithms + Vision + frame.
+
+    Runs Claude Vision on the SAME frame the system sees, records every
+    subsystem's output with timestamps and confidence/uncertainty scores.
+    Saves frame JPEG + JSONL record for training data.
+
+    This is the foundation for reliable Phase 2+ training loops.
+    """
+    now_mono = time.monotonic()
+    now_utc = utc_now_ms()
+
+    # 1. Grab the exact frame the system is using
+    with state.lock:
+        frame = state.frame_raw.copy() if state.frame_raw is not None else None
+    if frame is None:
+        return {"error": "No frame available"}
+
+    # 2. Record all algorithm states AT THIS MOMENT
+    snapshot = {
+        "utc": now_utc,
+        "monotonic": now_mono,
+        "cursor": {
+            "x": state.cursor_x, "y": state.cursor_y,
+            "method": state.cursor_method,
+            "age_s": round(state.cursor_age_s, 2),
+            "validated": state.cursor_validated,
+        },
+        "cnn": {
+            "confidence": round(state.cnn_confidence, 4),
+            "model": state.cnn_model_version,
+            "inference_ms": state.cnn_inference_ms,
+            "uncertainty": round(1.0 - abs(state.cnn_confidence - 0.5) * 2, 3),
+        },
+        "silhouette": {
+            "method": state.silhouette_method,
+            "hz": state.silhouette_hz,
+            "confidence": round(state.silhouette_confidence, 4),
+            "misses": state.silhouette_misses,
+            "roi_size": state.silhouette_roi_size,
+        },
+        "noise_grid": noise_grid_features(),
+        "daemon": {
+            "fps": state.fps,
+            "blob_count": state.blob_count,
+        },
+        "pipeline": {
+            "frame_total_ms": round(state.prof_frame_total_ms, 2),
+            "silhouette_ms": round(state.silhouette_latency_ms, 2),
+        },
+    }
+
+    # 3. Run Vision on the SAME frame (this takes 5-15s)
+    vision_result = None
+    if claude_detector:
+        pos = tracker.position if tracker else None
+        est_x = pos.x if pos else None
+        est_y = pos.y if pos else None
+        t0 = time.monotonic()
+        try:
+            frame_rgb = frame  # frame_raw is already RGB
+            result = await claude_detector.detect(frame_rgb, est_x, est_y)
+            detect_ms = (time.monotonic() - t0) * 1000
+            vision_result = {
+                "cursor_found": result.cursor_found,
+                "x": result.cursor_x,
+                "y": result.cursor_y,
+                "cursor_type": result.cursor_type,
+                "confidence": result.confidence,
+                "latency_ms": round(detect_ms, 1),
+                "reasoning": result.reasoning,
+            }
+            # Sanity check: does coord match claimed quadrant?
+            if result.cursor_found and result.cursor_x is not None:
+                cx, cy = result.cursor_x, result.cursor_y
+                coord_q = (1 if cx < 960 else 2) if cy < 540 else (3 if cx < 960 else 4)
+                claimed_q = None
+                for q in result.quadrants:
+                    if q.is_cursor_present:
+                        claimed_q = q.quadrant
+                        break
+                vision_result["coord_quadrant"] = coord_q
+                vision_result["claimed_quadrant"] = claimed_q
+                vision_result["quadrant_match"] = coord_q == claimed_q if claimed_q else None
+        except Exception as e:
+            vision_result = {"error": str(e)}
+
+    snapshot["vision"] = vision_result
+
+    # 4. Save frame and log record
+    ts_id = int(now_mono * 1000)
+    frame_path = _GROUND_TRUTH_DIR / f"frame_{ts_id}.jpg"
+    bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(str(frame_path), bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    snapshot["frame"] = frame_path.name
+
+    with open(_GROUND_TRUTH_LOG, "a") as f:
+        f.write(json.dumps(snapshot) + "\n")
+
+    return snapshot
 
 
 # ── Dashboard HTML ──────────────────────────────────────────────────
