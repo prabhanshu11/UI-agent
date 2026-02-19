@@ -1570,12 +1570,10 @@ async def claude_detect():
     # When Vision position differs from tracker by >50px and CNN had validated,
     # the old position is a CNN false positive → save as negative training data.
     saved = 0
+    old_x, old_y = state.cursor_x, state.cursor_y
+    old_validated = state.cursor_validated
     if result.cursor_found and result.confidence in ("high", "medium"):
         if result.cursor_x is not None and result.cursor_y is not None:
-            # CNN false positive detection: if tracker was far from Vision
-            # and CNN had validated, the old position is a false positive
-            old_x, old_y = state.cursor_x, state.cursor_y
-            old_validated = state.cursor_validated
             delta = ((old_x - result.cursor_x) ** 2 +
                      (old_y - result.cursor_y) ** 2) ** 0.5
             if delta > 50 and old_validated and collector:
@@ -1612,10 +1610,109 @@ async def claude_detect():
                 state.sample_count_pos = collector.positive_count
                 state.sample_count_neg = collector.negative_count
 
+    # ── Vision Dataset Logging ──
+    # Every Vision call is logged with full context for analysis
+    _log_vision_dataset(result, detect_ms, est_x, est_y, old_x, old_y,
+                        old_validated, frame)
+
     return {
         **claude_detector.to_dict(),
         "samples_saved": saved,
     }
+
+
+# ── Vision Dataset ─────────────────────────────────────────────────
+
+_VISION_DATASET_DIR = Path(__file__).parent.parent.parent / "data" / "vision_dataset"
+_VISION_DATASET_DIR.mkdir(parents=True, exist_ok=True)
+_VISION_DATASET_LOG = _VISION_DATASET_DIR / "log.jsonl"
+
+
+def _log_vision_dataset(result, detect_ms, est_x, est_y,
+                        tracker_x, tracker_y, tracker_validated, frame):
+    """Log every Claude Vision inference for accuracy tracking.
+
+    Dataset captures:
+    - Vision output: coordinates, confidence, reasoning, per-quadrant analysis
+    - Input context: tracker position, CNN state, estimated position
+    - Coordinate sanity: whether reported position matches claimed quadrant
+    - Frame snapshot for replay
+    """
+    try:
+        entry_id = int(time.time() * 1000)
+
+        # Sanity check: does cursor_x,cursor_y match the claimed quadrant?
+        quadrant_valid = None
+        cursor_quadrant = None
+        if result.cursor_found and result.cursor_x is not None:
+            cx, cy = result.cursor_x, result.cursor_y
+            # Which quadrant do the coordinates fall in?
+            if cx < 960:
+                cursor_quadrant = 1 if cy < 540 else 3
+            else:
+                cursor_quadrant = 2 if cy < 540 else 4
+            # Which quadrant did Vision say has the cursor?
+            claimed_q = None
+            for q in result.quadrants:
+                if q.is_cursor_present:
+                    claimed_q = q.quadrant
+                    break
+            quadrant_valid = (cursor_quadrant == claimed_q) if claimed_q else None
+
+        # Save frame snapshot
+        frame_path = None
+        if frame is not None:
+            fname = f"frame_{entry_id}.jpg"
+            fpath = _VISION_DATASET_DIR / fname
+            cv2.imwrite(str(fpath),
+                        cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
+                        [cv2.IMWRITE_JPEG_QUALITY, 80])
+            frame_path = fname
+
+        entry = {
+            "id": entry_id,
+            "utc": utc_now_ms(),
+            "latency_ms": round(detect_ms, 1),
+            "input": {
+                "est_x": est_x, "est_y": est_y,
+                "tracker_x": tracker_x, "tracker_y": tracker_y,
+                "tracker_validated": tracker_validated,
+                "cnn_confidence": round(state.cnn_confidence, 3),
+            },
+            "output": {
+                "cursor_found": result.cursor_found,
+                "cursor_x": result.cursor_x,
+                "cursor_y": result.cursor_y,
+                "cursor_type": result.cursor_type,
+                "confidence": result.confidence,
+                "reasoning": result.reasoning,
+                "has_confusing": result.has_confusing_quadrants,
+            },
+            "quadrants": [
+                {
+                    "q": q.quadrant,
+                    "cursor": q.is_cursor_present,
+                    "dist": q.distance_from_estimated_point,
+                    "confusing": q.is_the_image_confusing,
+                }
+                for q in result.quadrants
+            ],
+            "sanity": {
+                "coord_quadrant": cursor_quadrant,
+                "quadrant_valid": quadrant_valid,
+            },
+            "delta_from_tracker": round(
+                ((tracker_x - result.cursor_x) ** 2 +
+                 (tracker_y - result.cursor_y) ** 2) ** 0.5, 1
+            ) if result.cursor_x is not None else None,
+            "frame": frame_path,
+        }
+
+        with open(_VISION_DATASET_LOG, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+    except Exception as e:
+        print(f"Vision dataset log error: {e}")
 
 
 # ── Experience Logging ─────────────────────────────────────────────
