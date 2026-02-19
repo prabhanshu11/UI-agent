@@ -81,18 +81,75 @@ class CursorPatchDataset(Dataset):
         return patch
 
 
+def load_reviews(samples_dir: Path) -> dict[str, dict]:
+    """Load human reviews from reviews.jsonl, keyed by filename."""
+    reviews_path = samples_dir / "reviews.jsonl"
+    if not reviews_path.exists():
+        return {}
+
+    reviews = {}
+    with open(reviews_path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    review = json.loads(line)
+                    # Last review for each filename wins
+                    reviews[review["filename"]] = review
+                except (json.JSONDecodeError, KeyError):
+                    continue
+    return reviews
+
+
 def load_index(samples_dir: Path) -> list[dict]:
-    """Load all entries from index.jsonl."""
+    """Load all entries from index.jsonl, applying review overrides.
+
+    Reviews can flip labels (wrong) or remove samples (delete).
+    """
     index_path = samples_dir / "index.jsonl"
     if not index_path.exists():
         return []
+
+    reviews = load_reviews(samples_dir)
+    deleted = 0
+    flipped = 0
 
     entries = []
     with open(index_path) as f:
         for line in f:
             line = line.strip()
-            if line:
-                entries.append(json.loads(line))
+            if not line:
+                continue
+            entry = json.loads(line)
+            filename = entry.get("filename", "")
+
+            # Apply review overrides
+            if filename in reviews:
+                review = reviews[filename]
+                action = review.get("action")
+                if action == "delete":
+                    deleted += 1
+                    continue  # Skip deleted samples
+                elif action == "wrong":
+                    # Flip the label
+                    entry["label"] = review.get("corrected_label",
+                                                "neg" if entry["label"] == "pos" else "pos")
+                    flipped += 1
+
+            entries.append(entry)
+
+    if deleted or flipped:
+        print(f"Reviews applied: {flipped} label flips, {deleted} deletions")
+
+    # Log source distribution
+    sources = {}
+    for e in entries:
+        src = e.get("source", "unknown")
+        sources[src] = sources.get(src, 0) + 1
+    if sources:
+        dist = ", ".join(f"{k}: {v}" for k, v in sorted(sources.items()))
+        print(f"Source distribution: {dist}")
+
     return entries
 
 

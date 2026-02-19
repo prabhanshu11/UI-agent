@@ -103,7 +103,7 @@ class ESP32Mouse:
 
         status = ""
         while self.ser.in_waiting:
-            line = self.ser.readline().decode().strip()
+            line = self.ser.readline().decode(errors='replace').strip()
             if "Mouse:" in line:
                 status = line.split("Mouse:")[-1].strip()
         return status

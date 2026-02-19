@@ -36,6 +36,7 @@ from src.hardware.cursor_tracker import CursorTracker
 from src.hardware.cursor_sample_collector import CursorSampleCollector, extract_gray_patch
 from src.hardware.cursor_recognizer import CursorRecognizer
 from src.hardware.daemon_client import DaemonClient
+from src.hardware.cursor_vision_detector import ClaudeVisionCursorDetector
 
 app = FastAPI(title="KVM Control Dashboard")
 
@@ -96,6 +97,7 @@ tracker: Optional[CursorTracker] = None
 recognizer: Optional[CursorRecognizer] = None
 collector: Optional[CursorSampleCollector] = None
 daemon_client: Optional[DaemonClient] = None
+claude_detector: Optional[ClaudeVisionCursorDetector] = None
 
 
 # ── Motion detection service (background thread) ───────────────────
@@ -665,6 +667,7 @@ async def get_state():
         },
         "fps": round(state.fps, 1),
         "frame_count": state.frame_count,
+        "claude_detector": claude_detector.to_dict() if claude_detector else None,
         "error": state.error,
         "timestamp": datetime.now().isoformat(),
     }
@@ -925,6 +928,286 @@ async def set_config(request: Request):
                 pixels=config.jitter_pixels)
 
     return await get_config()
+
+
+# ── Claude Vision Detection ────────────────────────────────────────
+
+@app.get("/api/claude_detect")
+async def claude_detect():
+    """Trigger Claude Vision cursor detection (~5-15s).
+
+    Captures current frame, chops into 4 quadrants, sends to Claude Agent SDK.
+    Returns structured per-quadrant analysis with cursor position.
+
+    If high confidence, updates tracker position and saves CNN training samples.
+    """
+    if not claude_detector:
+        return {"error": "Claude detector not initialized"}
+
+    # Get frame from daemon or sensor
+    frame = None
+    if daemon_client and daemon_client.is_running():
+        jpeg = daemon_client.read_jpeg()
+        if jpeg:
+            frame = cv2.imdecode(
+                np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if frame is not None:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    elif sensor:
+        frame = sensor.capture(settle_frames=2)
+
+    if frame is None:
+        return {"error": "No frame available"}
+
+    # Get current estimated position
+    pos = tracker.position if tracker else None
+    est_x = pos.x if pos else None
+    est_y = pos.y if pos else None
+
+    # Run detection
+    result = await claude_detector.detect(frame, est_x, est_y)
+
+    # If high confidence and not confusing, update tracker and save samples
+    saved = 0
+    if result.cursor_found and result.confidence in ("high", "medium"):
+        if result.cursor_x is not None and result.cursor_y is not None:
+            if tracker:
+                tracker.set_position(
+                    result.cursor_x, result.cursor_y, method="claude_vision")
+                state.cursor_x = result.cursor_x
+                state.cursor_y = result.cursor_y
+                state.cursor_method = "claude_vision"
+                state.cursor_age_s = 0.0
+            if collector:
+                saved = claude_detector.save_training_samples(
+                    frame, result, collector)
+                state.sample_count_pos = collector.positive_count
+                state.sample_count_neg = collector.negative_count
+
+    return {
+        **claude_detector.to_dict(),
+        "samples_saved": saved,
+    }
+
+
+# ── Validation GUI ─────────────────────────────────────────────────
+
+_VALIDATION_SAMPLES_DIR = Path(__file__).parent.parent.parent / "data" / "cursor_samples"
+_VALIDATION_REVIEWS_PATH = _VALIDATION_SAMPLES_DIR / "reviews.jsonl"
+
+
+@app.get("/validation")
+async def validation_page():
+    """Validation GUI for reviewing CNN training samples."""
+    return HTMLResponse(VALIDATION_HTML)
+
+
+@app.get("/api/validation/samples")
+async def get_validation_samples(page: int = 0, page_size: int = 20,
+                                  sort: str = "priority"):
+    """Get paginated sample list for validation.
+
+    Sort options: priority (default), recent, confidence_asc, confidence_desc.
+    """
+    # Load index
+    index_path = _VALIDATION_SAMPLES_DIR / "index.jsonl"
+    if not index_path.exists():
+        return {"samples": [], "total": 0, "page": page}
+
+    entries = []
+    with open(index_path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+
+    # Load reviews
+    reviewed = {}
+    if _VALIDATION_REVIEWS_PATH.exists():
+        with open(_VALIDATION_REVIEWS_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        review = json.loads(line)
+                        reviewed[review["filename"]] = review
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+
+    # Run CNN inference on each sample for priority scoring
+    model = recognizer._cnn_model if recognizer else None
+    import torch
+
+    scored_entries = []
+    for entry in entries:
+        filename = entry.get("filename", "")
+        review = reviewed.get(filename)
+        is_reviewed = review is not None
+
+        # Get CNN confidence for this sample
+        cnn_conf = None
+        if model is not None:
+            patch_path = _VALIDATION_SAMPLES_DIR / filename
+            if patch_path.exists():
+                patch = cv2.imread(str(patch_path), cv2.IMREAD_GRAYSCALE)
+                if patch is not None and patch.shape == (64, 64):
+                    tensor = torch.from_numpy(
+                        patch.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0)
+                    with torch.no_grad():
+                        cnn_conf = model(tensor).item()
+
+        # Compute priority score (lower = review first)
+        priority = 5.0
+        label = entry.get("label", "")
+        source = entry.get("source", "")
+        is_confusing = entry.get("is_confusing", 0)
+
+        if is_reviewed:
+            priority = 99.0  # Already reviewed
+        elif is_confusing:
+            priority = 1.0  # Confusing images need human judgment
+        elif cnn_conf is not None:
+            predicted_pos = cnn_conf > 0.5
+            labeled_pos = label == "pos"
+            if predicted_pos != labeled_pos:
+                priority = 0.0 + abs(cnn_conf - 0.5)  # CNN disagrees = highest priority
+            elif abs(cnn_conf - 0.5) < 0.2:
+                priority = 2.0  # Low confidence
+            elif source == "claude_vision":
+                priority = 3.0  # Claude-labeled, CNN agrees
+            else:
+                priority = 4.0
+
+        scored_entries.append({
+            **entry,
+            "cnn_confidence": round(cnn_conf, 3) if cnn_conf is not None else None,
+            "priority": round(priority, 3),
+            "review": review,
+        })
+
+    # Sort
+    if sort == "priority":
+        scored_entries.sort(key=lambda e: e["priority"])
+    elif sort == "recent":
+        scored_entries.sort(key=lambda e: e.get("timestamp", 0), reverse=True)
+    elif sort == "confidence_asc":
+        scored_entries.sort(key=lambda e: e.get("cnn_confidence") or 0)
+    elif sort == "confidence_desc":
+        scored_entries.sort(key=lambda e: e.get("cnn_confidence") or 0, reverse=True)
+
+    # Paginate
+    total = len(scored_entries)
+    start = page * page_size
+    end = start + page_size
+    page_entries = scored_entries[start:end]
+
+    return {"samples": page_entries, "total": total, "page": page, "page_size": page_size}
+
+
+@app.get("/api/validation/patch/{filename}")
+async def get_validation_patch(filename: str):
+    """Serve a 64x64 PNG patch image for the validation UI."""
+    # Sanitize filename to prevent path traversal
+    if "/" in filename or ".." in filename:
+        return {"error": "Invalid filename"}
+    patch_path = _VALIDATION_SAMPLES_DIR / filename
+    if not patch_path.exists():
+        return {"error": "File not found"}
+    return Response(
+        content=patch_path.read_bytes(),
+        media_type="image/png",
+    )
+
+
+@app.post("/api/validation/review")
+async def submit_review(request: Request):
+    """Submit a review for a sample.
+
+    Body: {"filename": "pos_000123.png", "action": "correct"|"wrong"|"delete",
+           "cursor_type": "arrow"|null}
+    """
+    data = await request.json()
+    filename = data.get("filename")
+    action = data.get("action")
+
+    if not filename or action not in ("correct", "wrong", "delete"):
+        return {"error": "Invalid review: need filename and action (correct/wrong/delete)"}
+
+    review = {
+        "filename": filename,
+        "action": action,
+        "timestamp": time.time(),
+    }
+    if data.get("cursor_type"):
+        review["cursor_type"] = data["cursor_type"]
+    if action == "wrong":
+        # Determine corrected label
+        current_label = "pos" if filename.startswith("pos_") else "neg"
+        review["corrected_label"] = "neg" if current_label == "pos" else "pos"
+
+    with open(_VALIDATION_REVIEWS_PATH, "a") as f:
+        f.write(json.dumps(review) + "\n")
+
+    return {"ok": True, "review": review}
+
+
+@app.post("/api/validation/retrain")
+async def trigger_retrain():
+    """Trigger model retraining as a background subprocess."""
+    import subprocess
+    project_root = Path(__file__).parent.parent.parent
+    script = project_root / "scripts" / "train_cursor_model.py"
+    venv_python = project_root / ".venv" / "bin" / "python"
+
+    proc = subprocess.Popen(
+        [str(venv_python), str(script), "--epochs", "30", "--patience", "5"],
+        cwd=str(project_root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+    return {
+        "status": "training_started",
+        "pid": proc.pid,
+        "command": f"python scripts/train_cursor_model.py --epochs 30 --patience 5",
+    }
+
+
+@app.get("/api/validation/stats")
+async def get_validation_stats():
+    """Get validation stats: sample counts, model version, review progress."""
+    # Count reviews
+    review_count = 0
+    if _VALIDATION_REVIEWS_PATH.exists():
+        with open(_VALIDATION_REVIEWS_PATH) as f:
+            review_count = sum(1 for line in f if line.strip())
+
+    # Count samples by source
+    source_counts = {}
+    index_path = _VALIDATION_SAMPLES_DIR / "index.jsonl"
+    if index_path.exists():
+        with open(index_path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        entry = json.loads(line)
+                        src = entry.get("source", "unknown")
+                        source_counts[src] = source_counts.get(src, 0) + 1
+                    except json.JSONDecodeError:
+                        continue
+
+    return {
+        "pos_count": collector.positive_count if collector else 0,
+        "neg_count": collector.negative_count if collector else 0,
+        "total_samples": collector.total_samples if collector else 0,
+        "review_count": review_count,
+        "model_version": recognizer.model_version if recognizer else "none",
+        "source_distribution": source_counts,
+    }
 
 
 # ── Dashboard HTML ──────────────────────────────────────────────────
@@ -1354,10 +1637,255 @@ DASHBOARD_HTML = r"""
 """
 
 
+# ── Validation HTML ────────────────────────────────────────────────
+
+VALIDATION_HTML = r"""<!DOCTYPE html>
+<html>
+<head>
+<title>Cursor Sample Validation</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0a0a0f; color: #e0e0e0; font-family: 'JetBrains Mono', monospace; }
+.header { background: #12121a; padding: 12px 20px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #222; }
+.header h1 { font-size: 16px; color: #ff4444; }
+.header .actions { display: flex; gap: 8px; }
+.btn { padding: 6px 14px; border: 1px solid #333; background: #1a1a24; color: #e0e0e0; cursor: pointer; font-size: 12px; font-family: inherit; border-radius: 4px; }
+.btn:hover { background: #252530; }
+.btn-retrain { border-color: #ff4444; color: #ff4444; }
+.btn-retrain:hover { background: #ff444420; }
+.filters { padding: 10px 20px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid #1a1a24; }
+.filter-btn { padding: 4px 10px; border: 1px solid #333; background: transparent; color: #888; cursor: pointer; font-size: 11px; font-family: inherit; border-radius: 3px; }
+.filter-btn.active { border-color: #ff4444; color: #ff4444; background: #ff444410; }
+.pagination { display: flex; gap: 8px; align-items: center; margin-left: auto; font-size: 11px; color: #666; }
+.pagination .btn { padding: 3px 8px; font-size: 11px; }
+.stats-bar { padding: 8px 20px; background: #0d0d14; font-size: 11px; color: #666; display: flex; gap: 16px; border-bottom: 1px solid #1a1a24; }
+.stats-bar span { color: #888; }
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; padding: 8px 12px; font-size: 11px; color: #666; background: #0d0d14; border-bottom: 1px solid #222; }
+td { padding: 8px 12px; border-bottom: 1px solid #1a1a24; vertical-align: middle; font-size: 12px; }
+tr:hover { background: #12121a; }
+.patch-img { width: 96px; height: 96px; image-rendering: pixelated; border: 1px solid #333; border-radius: 2px; }
+.label-pos { color: #4CAF50; font-weight: bold; }
+.label-neg { color: #ff5252; font-weight: bold; }
+.source { color: #888; font-size: 11px; }
+.source.claude { color: #7c4dff; }
+.confusing-badge { color: #FF9800; font-size: 10px; margin-left: 4px; }
+.conf-bar { width: 60px; height: 6px; background: #1a1a24; border-radius: 3px; display: inline-block; vertical-align: middle; margin-right: 6px; }
+.conf-fill { height: 100%; border-radius: 3px; }
+.conf-high { background: #4CAF50; }
+.conf-mid { background: #FF9800; }
+.conf-low { background: #ff5252; }
+.actions-cell { display: flex; gap: 4px; }
+.btn-ok { border-color: #4CAF50; color: #4CAF50; }
+.btn-ok:hover { background: #4CAF5020; }
+.btn-wrong { border-color: #FF9800; color: #FF9800; }
+.btn-wrong:hover { background: #FF980020; }
+.btn-del { border-color: #ff5252; color: #ff5252; }
+.btn-del:hover { background: #ff525220; }
+.reviewed { opacity: 0.4; }
+.toast { position: fixed; bottom: 20px; right: 20px; padding: 10px 16px; background: #1a1a24; border: 1px solid #4CAF50; color: #4CAF50; border-radius: 4px; font-size: 12px; display: none; z-index: 100; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>CURSOR SAMPLE VALIDATION</h1>
+  <div class="actions">
+    <button class="btn" onclick="loadStats()">Stats</button>
+    <button class="btn btn-retrain" onclick="retrain()">Retrain CNN</button>
+    <a href="/" class="btn" style="text-decoration:none">Dashboard</a>
+  </div>
+</div>
+<div class="filters">
+  <button class="filter-btn active" data-filter="all" onclick="setFilter('all')">All</button>
+  <button class="filter-btn" data-filter="unreviewed" onclick="setFilter('unreviewed')">Unreviewed</button>
+  <button class="filter-btn" data-filter="confusing" onclick="setFilter('confusing')">Confusing</button>
+  <button class="filter-btn" data-filter="claude" onclick="setFilter('claude')">Claude Vision</button>
+  <div class="pagination">
+    <button class="btn" onclick="prevPage()">&laquo;</button>
+    <span id="page-info">Page 1</span>
+    <button class="btn" onclick="nextPage()">&raquo;</button>
+  </div>
+</div>
+<div class="stats-bar" id="stats-bar">
+  <span>Loading stats...</span>
+</div>
+<table>
+  <thead>
+    <tr><th>Patch</th><th>Label</th><th>Source</th><th>CNN Conf</th><th>Priority</th><th>Actions</th></tr>
+  </thead>
+  <tbody id="samples-body"></tbody>
+</table>
+<div class="toast" id="toast"></div>
+
+<script>
+let currentPage = 0;
+let currentFilter = 'all';
+let totalPages = 1;
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.textContent;
+}
+
+async function loadSamples() {
+  const res = await fetch('/api/validation/samples?page=' + currentPage + '&sort=priority');
+  const data = await res.json();
+  totalPages = Math.ceil(data.total / data.page_size) || 1;
+  document.getElementById('page-info').textContent = 'Page ' + (currentPage + 1) + ' of ' + totalPages;
+
+  let samples = data.samples;
+  if (currentFilter === 'unreviewed') samples = samples.filter(function(s) { return !s.review; });
+  else if (currentFilter === 'confusing') samples = samples.filter(function(s) { return s.is_confusing; });
+  else if (currentFilter === 'claude') samples = samples.filter(function(s) { return s.source && s.source.indexOf('claude') >= 0; });
+
+  const tbody = document.getElementById('samples-body');
+  tbody.replaceChildren();
+
+  samples.forEach(function(s) {
+    const tr = document.createElement('tr');
+    if (s.review) tr.classList.add('reviewed');
+    tr.id = 'row-' + s.filename;
+
+    // Patch image
+    const tdImg = document.createElement('td');
+    const img = document.createElement('img');
+    img.className = 'patch-img';
+    img.src = '/api/validation/patch/' + encodeURIComponent(s.filename);
+    tdImg.appendChild(img);
+    tr.appendChild(tdImg);
+
+    // Label
+    const tdLabel = document.createElement('td');
+    const labelSpan = document.createElement('span');
+    labelSpan.className = s.label === 'pos' ? 'label-pos' : 'label-neg';
+    labelSpan.textContent = s.label;
+    tdLabel.appendChild(labelSpan);
+    if (s.review) {
+      const reviewSpan = document.createElement('span');
+      reviewSpan.style.cssText = 'color:#4CAF50;font-size:10px;margin-left:4px';
+      reviewSpan.textContent = s.review.action;
+      tdLabel.appendChild(reviewSpan);
+    }
+    tr.appendChild(tdLabel);
+
+    // Source
+    const tdSource = document.createElement('td');
+    const srcSpan = document.createElement('span');
+    srcSpan.className = (s.source && s.source.indexOf('claude') >= 0) ? 'source claude' : 'source';
+    srcSpan.textContent = s.source || '?';
+    tdSource.appendChild(srcSpan);
+    if (s.is_confusing) {
+      const badge = document.createElement('span');
+      badge.className = 'confusing-badge';
+      badge.textContent = '\u26A0';
+      tdSource.appendChild(badge);
+    }
+    tr.appendChild(tdSource);
+
+    // CNN Confidence
+    const tdConf = document.createElement('td');
+    const bar = document.createElement('div');
+    bar.className = 'conf-bar';
+    const fill = document.createElement('div');
+    const confVal = s.cnn_confidence != null ? s.cnn_confidence : 0;
+    fill.className = 'conf-fill ' + (confVal > 0.7 ? 'conf-high' : confVal > 0.4 ? 'conf-mid' : 'conf-low');
+    fill.style.width = Math.round(confVal * 100) + '%';
+    bar.appendChild(fill);
+    tdConf.appendChild(bar);
+    tdConf.appendChild(document.createTextNode(s.cnn_confidence != null ? s.cnn_confidence.toFixed(3) : '?'));
+    tr.appendChild(tdConf);
+
+    // Priority
+    const tdPri = document.createElement('td');
+    tdPri.style.color = '#666';
+    tdPri.textContent = s.priority.toFixed(1);
+    tr.appendChild(tdPri);
+
+    // Actions
+    const tdAct = document.createElement('td');
+    tdAct.className = 'actions-cell';
+    ['OK:correct:btn-ok', 'Wrong:wrong:btn-wrong', 'Del:delete:btn-del'].forEach(function(spec) {
+      var parts = spec.split(':');
+      var btn = document.createElement('button');
+      btn.className = 'btn ' + parts[2];
+      btn.textContent = parts[0];
+      btn.addEventListener('click', function() { review(s.filename, parts[1]); });
+      tdAct.appendChild(btn);
+    });
+    tr.appendChild(tdAct);
+
+    tbody.appendChild(tr);
+  });
+}
+
+async function loadStats() {
+  const res = await fetch('/api/validation/stats');
+  const data = await res.json();
+  const bar = document.getElementById('stats-bar');
+  bar.replaceChildren();
+  var items = [
+    data.pos_count + ' pos', data.neg_count + ' neg',
+    data.review_count + ' reviewed', 'Model: ' + data.model_version
+  ];
+  var sources = data.source_distribution || {};
+  Object.keys(sources).forEach(function(k) { items.push(k + ': ' + sources[k]); });
+  items.forEach(function(txt) {
+    var span = document.createElement('span');
+    span.textContent = txt;
+    bar.appendChild(span);
+  });
+}
+
+async function review(filename, action) {
+  const res = await fetch('/api/validation/review', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({filename: filename, action: action})
+  });
+  if (res.ok) {
+    var row = document.getElementById('row-' + filename);
+    if (row) row.classList.add('reviewed');
+    showToast(action + ': ' + filename);
+  }
+}
+
+async function retrain() {
+  if (!confirm('Start retraining TinyCursorNet?')) return;
+  const res = await fetch('/api/validation/retrain', {method: 'POST'});
+  const data = await res.json();
+  showToast('Training started (PID: ' + data.pid + ')');
+}
+
+function setFilter(f) {
+  currentFilter = f;
+  document.querySelectorAll('.filter-btn').forEach(function(b) {
+    b.classList.toggle('active', b.dataset.filter === f);
+  });
+  currentPage = 0;
+  loadSamples();
+}
+
+function nextPage() { if (currentPage < totalPages - 1) { currentPage++; loadSamples(); } }
+function prevPage() { if (currentPage > 0) { currentPage--; loadSamples(); } }
+
+function showToast(msg) {
+  var t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  setTimeout(function() { t.style.display = 'none'; }, 2000);
+}
+
+loadSamples();
+loadStats();
+</script>
+</body>
+</html>"""
+
+
 # ── Startup ─────────────────────────────────────────────────────────
 
 def init_hardware():
-    global mouse, sensor, tracker, recognizer, collector, daemon_client
+    global mouse, sensor, tracker, recognizer, collector, daemon_client, claude_detector
 
     print("Initializing hardware...")
     mouse = ESP32Mouse('/dev/ttyUSB0', screen_width=1920, screen_height=1080)
@@ -1394,6 +1922,10 @@ def init_hardware():
     state.sample_count_neg = collector.negative_count
     print("  Cursor recognizer: " + recognizer.model_version
           + " (" + str(collector.total_samples) + " samples)")
+
+    # Claude Vision cursor detector (uses subscription, no API key)
+    claude_detector = ClaudeVisionCursorDetector(model="haiku")
+    print("  Claude Vision detector initialized (haiku)")
 
     threading.Thread(target=motion_detection_loop, daemon=True).start()
     print("  Motion detection loop started")

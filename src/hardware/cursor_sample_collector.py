@@ -94,7 +94,10 @@ class CursorSampleCollector:
         return filename
 
     def _append_index(self, filename: str, label: str, x: int, y: int,
-                      source: str, confidence: float):
+                      source: str, confidence: float,
+                      cursor_type: Optional[str] = None,
+                      is_confusing: Optional[int] = None,
+                      distance_from_estimated: Optional[str] = None):
         """Append a metadata entry to index.jsonl."""
         entry = {
             "filename": filename,
@@ -105,6 +108,12 @@ class CursorSampleCollector:
             "confidence": confidence,
             "timestamp": time.time(),
         }
+        if cursor_type is not None:
+            entry["cursor_type"] = cursor_type
+        if is_confusing is not None:
+            entry["is_confusing"] = is_confusing
+        if distance_from_estimated is not None:
+            entry["distance_from_estimated"] = distance_from_estimated
         with open(self.index_path, "a") as f:
             f.write(json.dumps(entry) + "\n")
 
@@ -115,15 +124,23 @@ class CursorSampleCollector:
         y: int,
         correlation: float = 1.0,
         num_negatives: int = 3,
+        source: str = "lissajous",
+        cursor_type: Optional[str] = None,
+        is_confusing: Optional[int] = None,
+        distance_from_estimated: Optional[str] = None,
     ) -> int:
-        """Collect samples from a Lissajous locate result.
+        """Collect samples from a locate result (Lissajous, Claude vision, etc.).
 
         Args:
             frame: Full RGB frame from HDMI capture.
             x: Detected cursor X position.
             y: Detected cursor Y position.
-            correlation: Match correlation from Lissajous detection.
+            correlation: Match correlation / confidence score.
             num_negatives: Number of random negative patches to extract.
+            source: Label source ("lissajous", "claude_vision", etc.).
+            cursor_type: Optional cursor type tag (arrow, ibeam, hand, etc.).
+            is_confusing: Optional confusion flag from Claude (0/1).
+            distance_from_estimated: Optional distance category (close/medium/far).
 
         Returns:
             Number of samples saved.
@@ -136,10 +153,16 @@ class CursorSampleCollector:
         if patch is not None:
             filename = self._save_patch(patch, "pos")
             if filename:
-                self._append_index(filename, "pos", x, y, "lissajous", correlation)
+                self._append_index(
+                    filename, "pos", x, y, source, correlation,
+                    cursor_type=cursor_type,
+                    is_confusing=is_confusing,
+                    distance_from_estimated=distance_from_estimated,
+                )
                 saved += 1
 
         # Negatives: random positions far from cursor
+        neg_source = f"{source}_neg"
         for _ in range(num_negatives):
             for _attempt in range(10):
                 rx = random.randint(HALF, w - HALF - 1)
@@ -154,7 +177,7 @@ class CursorSampleCollector:
             if neg_patch is not None:
                 filename = self._save_patch(neg_patch, "neg")
                 if filename:
-                    self._append_index(filename, "neg", rx, ry, "lissajous_neg", 0.0)
+                    self._append_index(filename, "neg", rx, ry, neg_source, 0.0)
                     saved += 1
 
         return saved
