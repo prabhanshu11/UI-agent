@@ -111,6 +111,8 @@ class DashboardConfig:
     cnn_interval_s: float = 30.0    # CNN validation cycle (seconds)
     jitter_interval_s: float = 30.0 # Anti-sleep jitter interval
     jitter_pixels: int = 3          # Jitter amplitude (px)
+    verify_every_n: int = 3         # Run verification probe every Nth jitter
+    verify_drift_px: int = 100      # Drift threshold: probe vs tracked position
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 config = DashboardConfig()
@@ -136,6 +138,12 @@ cmd_movement: Optional[CommandedMovement] = None
 _low_confidence_since: float = 0.0  # monotonic time when CNN confidence first went <0.7
 _vision_lockout_until: float = 0.0  # monotonic time until which motion blobs can't override position
 _VISION_LOCKOUT_S: float = 30.0     # how long Vision position is protected from motion override
+
+# Noise grid: shared between daemon loop (writer) and probe (reader)
+_NOISE_GRID_W, _NOISE_GRID_H = 48, 27
+_NOISE_CELL_PX = 40
+_NOISE_THRESHOLD = 8
+_noise_grid: list[list[int]] = [[_NOISE_THRESHOLD] * _NOISE_GRID_W for _ in range(_NOISE_GRID_H)]
 
 
 # ── Motion detection service (background thread) ───────────────────
@@ -260,10 +268,8 @@ def _daemon_motion_loop():
     # UI animation regions stay above threshold because they get blobs
     # every frame. Cursor regions clear quickly because cursor motion
     # is transient (only during movement).
-    NOISE_GRID_W, NOISE_GRID_H = 48, 27
-    NOISE_CELL_PX = 40
-    NOISE_THRESHOLD = 8
-    noise_grid = [[NOISE_THRESHOLD] * NOISE_GRID_W for _ in range(NOISE_GRID_H)]
+    global _noise_grid
+    _noise_grid = [[_NOISE_THRESHOLD] * _NOISE_GRID_W for _ in range(_NOISE_GRID_H)]
 
     while True:
         try:
@@ -304,23 +310,23 @@ def _daemon_motion_loop():
             # Update noise grid: mark cells that have blobs this frame
             active_cells = set()
             for b in cursor_blobs:
-                gx = min(NOISE_GRID_W - 1, b.centroid[0] // NOISE_CELL_PX)
-                gy = min(NOISE_GRID_H - 1, b.centroid[1] // NOISE_CELL_PX)
+                gx = min(_NOISE_GRID_W - 1, b.centroid[0] // _NOISE_CELL_PX)
+                gy = min(_NOISE_GRID_H - 1, b.centroid[1] // _NOISE_CELL_PX)
                 active_cells.add((gx, gy))
 
-            for gy in range(NOISE_GRID_H):
-                for gx in range(NOISE_GRID_W):
+            for gy in range(_NOISE_GRID_H):
+                for gx in range(_NOISE_GRID_W):
                     if (gx, gy) in active_cells:
-                        noise_grid[gy][gx] = min(noise_grid[gy][gx] + 1, NOISE_THRESHOLD + 5)
+                        _noise_grid[gy][gx] = min(_noise_grid[gy][gx] + 1, _NOISE_THRESHOLD + 5)
                     else:
-                        noise_grid[gy][gx] = max(0, noise_grid[gy][gx] - 1)
+                        _noise_grid[gy][gx] = max(0, _noise_grid[gy][gx] - 1)
 
             # Remove blobs in persistent-motion cells (UI animations)
             filtered_blobs = []
             for b in cursor_blobs:
-                gx = min(NOISE_GRID_W - 1, b.centroid[0] // NOISE_CELL_PX)
-                gy = min(NOISE_GRID_H - 1, b.centroid[1] // NOISE_CELL_PX)
-                if noise_grid[gy][gx] >= NOISE_THRESHOLD:
+                gx = min(_NOISE_GRID_W - 1, b.centroid[0] // _NOISE_CELL_PX)
+                gy = min(_NOISE_GRID_H - 1, b.centroid[1] // _NOISE_CELL_PX)
+                if _noise_grid[gy][gx] >= _NOISE_THRESHOLD:
                     continue  # Skip: persistent motion = UI animation
                 filtered_blobs.append(b)
             cursor_blobs = filtered_blobs
@@ -777,28 +783,31 @@ def jitter_loop():
     large enough for reliable blob correlation but still serves as
     anti-sleep (any mouse movement resets Windows idle timer).
     """
-    global _low_confidence_since
+    global _low_confidence_since, _vision_lockout_until
 
     while True:
         time.sleep(config.jitter_interval_s)
 
         # Update hardware monitoring state
-        # Don't call mouse.status() here — it sends serial commands that
-        # collide with the heartbeat thread (100ms writes). Instead check
-        # if the serial port is open and heartbeat is running.
+        # Check _ser (private) to avoid triggering the lazy-init property.
+        # If heartbeat thread is alive, the serial IS working.
         try:
-            state.mouse_connected = (
+            hb_alive = (
                 mouse is not None and
-                hasattr(mouse, 'ser') and
-                mouse.ser.is_open
-            )
-            state.heartbeat_active = (
                 hasattr(mouse, '_heartbeat_stop') and
                 not mouse._heartbeat_stop.is_set()
-            ) if mouse else False
+            )
+            ser_open = (
+                mouse is not None and
+                mouse._ser is not None and
+                mouse._ser.is_open
+            )
+            state.mouse_connected = hb_alive or ser_open
+            state.heartbeat_active = hb_alive
             state.anti_sleep_active = True  # We ARE the anti-sleep now
-        except Exception:
-            pass
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
 
         if not mouse:
             continue
@@ -845,6 +854,48 @@ def jitter_loop():
                     mouse._send_raw(-px, 0)
                 except Exception:
                     pass
+        elif (state.jitter_count % config.verify_every_n == 0
+              and (use_daemon or sensor)):
+            # Verification probe: dual-direction check to catch CNN false positives.
+            # The tracker might be confidently tracking the WRONG thing.
+            result = _jitter_reacquire(use_daemon)
+            if result:
+                rx, ry = result
+                drift = ((rx - state.cursor_x) ** 2 +
+                         (ry - state.cursor_y) ** 2) ** 0.5
+                if drift > config.verify_drift_px:
+                    # Probe found cursor far from tracked position — tracker is wrong
+                    print(f"[verify] drift={drift:.0f}px: probe=({rx},{ry}) "
+                          f"vs tracked=({state.cursor_x},{state.cursor_y}) → re-lock")
+                    state.cursor_x = rx
+                    state.cursor_y = ry
+                    state.cursor_method = "verify_probe"
+                    state.cursor_age_s = 0.0
+                    state.cursor_validated = False
+                    state.cnn_confidence = 0.0
+                    _low_confidence_since = 0.0
+                    # Protect position from motion override (reuse Vision lockout)
+                    _vision_lockout_until = time.monotonic() + _VISION_LOCKOUT_S
+                    state.vision_x = rx
+                    state.vision_y = ry
+                    state.vision_timestamp = time.monotonic()
+                    if sil_tracker:
+                        sil_tracker.reset()
+                    if recognizer and (use_daemon or sensor):
+                        # Capture fresh template at probe-confirmed position
+                        try:
+                            if use_daemon:
+                                jpeg = daemon_client.read_jpeg()
+                                if jpeg:
+                                    frame = cv2.imdecode(
+                                        np.frombuffer(jpeg, dtype=np.uint8),
+                                        cv2.IMREAD_COLOR)
+                                    patch = extract_gray_patch(frame, rx, ry)
+                                    if patch is not None:
+                                        recognizer.update_cursor_template(patch)
+                        except Exception:
+                            pass
+                # else: drift is small — tracker is on the right thing, no action
         else:
             # Normal anti-sleep jitter: ±Npx, net zero displacement
             try:
@@ -941,10 +992,36 @@ def _jitter_reacquire(use_daemon):
     # After moving right by amp, cursor blob in A→B is near (original_x + amp/2, original_y).
     # After moving down by amp, cursor blob in B→C is offset from A→B blob by ~(0, amp/2).
     half = amp / 2.0
+
+    # Pre-filter: reject blobs in known-noisy cells (clock, toolbar animations)
+    # AND reject large blobs (>500px, UI redraws not cursor movement).
+    def _probe_filter(blobs):
+        out = []
+        for b in blobs:
+            if b.pixel_count > 500:
+                continue
+            gx = min(_NOISE_GRID_W - 1, b.centroid[0] // _NOISE_CELL_PX)
+            gy = min(_NOISE_GRID_H - 1, b.centroid[1] // _NOISE_CELL_PX)
+            if _noise_grid[gy][gx] >= _NOISE_THRESHOLD:
+                continue  # Known-noisy region (toolbar, clock)
+            out.append(b)
+        return out
+
+    blobs_ab_filt = _probe_filter(blobs_ab)
+    blobs_bc_filt = _probe_filter(blobs_bc)
+
+    # Log blob counts for diagnostics
+    print(f"[probe] blobs A→B: {len(blobs_ab)} total, {len(blobs_ab_filt)} clean | "
+          f"B→C: {len(blobs_bc)} total, {len(blobs_bc_filt)} clean")
+
+    # Fall back to unfiltered if filtering removed everything
+    ab_search = blobs_ab_filt or blobs_ab
+    bc_search = blobs_bc_filt or blobs_bc
+
     best_match = None
     best_dist = 9999
-    for ba in blobs_ab:
-        for bc in blobs_bc:
+    for ba in ab_search:
+        for bc in bc_search:
             # B→C blob should be shifted ~(0, +half) from A→B blob
             dx = bc.centroid[0] - ba.centroid[0]
             dy = bc.centroid[1] - ba.centroid[1]
@@ -958,6 +1035,9 @@ def _jitter_reacquire(use_daemon):
         # Cursor was at: A→B blob centroid minus half the rightward movement
         cursor_x = ba.centroid[0] - int(half)
         cursor_y = ba.centroid[1]
+        print(f"[probe] match dist={best_dist:.1f} → cursor=({cursor_x},{cursor_y}) "
+              f"ba_px={ba.pixel_count} bc_px={bc.pixel_count} "
+              f"ba_pos={ba.centroid} bc_pos={bc.centroid}")
 
         if tracker:
             tracker.set_position(cursor_x, cursor_y, method="dual_probe")
@@ -1178,6 +1258,7 @@ async def get_state():
                 else "none",
             "low_confidence_s": round(time.monotonic() - _low_confidence_since, 1)
                 if _low_confidence_since > 0 else 0.0,
+            "verify_in": config.verify_every_n - (state.jitter_count % config.verify_every_n),
         },
         "pi_keyboard": state.pi_keyboard_connected,
         "cnn": {
@@ -1493,6 +1574,8 @@ async def get_config():
         "cnn_interval_s": config.cnn_interval_s,
         "jitter_interval_s": config.jitter_interval_s,
         "jitter_pixels": config.jitter_pixels,
+        "verify_every_n": config.verify_every_n,
+        "verify_drift_px": config.verify_drift_px,
     }
 
 
@@ -1517,7 +1600,10 @@ async def set_config(request: Request):
         # jitter_loop() reads config each cycle — no restart needed
     if "jitter_pixels" in data:
         config.jitter_pixels = max(1, min(30, int(data["jitter_pixels"])))
-        # jitter_loop() reads config each cycle — no restart needed
+    if "verify_every_n" in data:
+        config.verify_every_n = max(1, min(20, int(data["verify_every_n"])))
+    if "verify_drift_px" in data:
+        config.verify_drift_px = max(20, min(500, int(data["verify_drift_px"])))
 
     return await get_config()
 
