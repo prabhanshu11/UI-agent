@@ -134,6 +134,8 @@ cmd_movement: Optional[CommandedMovement] = None
 
 # Sustained low-confidence tracker for jitter-based re-acquisition
 _low_confidence_since: float = 0.0  # monotonic time when CNN confidence first went <0.7
+_vision_lockout_until: float = 0.0  # monotonic time until which motion blobs can't override position
+_VISION_LOCKOUT_S: float = 30.0     # how long Vision position is protected from motion override
 
 
 # ── Motion detection service (background thread) ───────────────────
@@ -367,6 +369,15 @@ def _daemon_motion_loop():
                             if sil_dist > 100:
                                 accept = False
 
+                        # Vision lockout: don't let motion blobs override
+                        # a Vision-confirmed position for _VISION_LOCKOUT_S
+                        if accept and now < _vision_lockout_until:
+                            blob_dist_from_vision = (
+                                (best.centroid[0] - state.vision_x) ** 2 +
+                                (best.centroid[1] - state.vision_y) ** 2) ** 0.5
+                            if blob_dist_from_vision > 80:
+                                accept = False  # Blob too far from Vision truth
+
                         if accept:
                             primary_blob = best
                             bx, by = best.centroid
@@ -382,19 +393,41 @@ def _daemon_motion_loop():
                             if sil_tracker:
                                 sil_tracker.reset()
                 else:
-                    # No known position — pick blob closest to typical cursor size
-                    def _cursor_likelihood(b):
-                        ideal = 30
-                        return abs(b.pixel_count - ideal)
-                    best = min(cursor_blobs, key=_cursor_likelihood)
-                    primary_blob = best
-                    bx, by = best.centroid
-                    velocity_history.clear()
-                    if tracker:
-                        tracker.set_position(bx, by, method="motion_track")
-                    pos = tracker.position
-                    if sil_tracker:
-                        sil_tracker.reset()
+                    # No known position — use Vision as anchor if recent,
+                    # otherwise pick blob closest to typical cursor size
+                    if now < _vision_lockout_until:
+                        pass  # Don't pick random blobs during Vision lockout
+                    elif (state.vision_x > 0 and state.vision_timestamp > 0
+                          and now - state.vision_timestamp < 120):
+                        # Vision position is <2min old — use as anchor
+                        # Only accept blobs within 150px of Vision position
+                        def _vision_dist(b):
+                            return ((b.centroid[0] - state.vision_x) ** 2 +
+                                    (b.centroid[1] - state.vision_y) ** 2) ** 0.5
+                        near_blobs = [b for b in cursor_blobs if _vision_dist(b) < 150]
+                        if near_blobs:
+                            best = min(near_blobs, key=lambda b: _vision_dist(b))
+                            primary_blob = best
+                            bx, by = best.centroid
+                            velocity_history.clear()
+                            if tracker:
+                                tracker.set_position(bx, by, method="motion_track")
+                            pos = tracker.position
+                            if sil_tracker:
+                                sil_tracker.reset()
+                    else:
+                        def _cursor_likelihood(b):
+                            ideal = 30
+                            return abs(b.pixel_count - ideal)
+                        best = min(cursor_blobs, key=_cursor_likelihood)
+                        primary_blob = best
+                        bx, by = best.centroid
+                        velocity_history.clear()
+                        if tracker:
+                            tracker.set_position(bx, by, method="motion_track")
+                        pos = tracker.position
+                        if sil_tracker:
+                            sil_tracker.reset()
 
             # ── Slow path: frame decode + template match + overlay (5Hz) ──
             frame_interval = 1.0 / max(0.1, config.frame_fps)
@@ -430,16 +463,29 @@ def _daemon_motion_loop():
                                 # silhouette results when:
                                 #  a) CNN has validated the current position, OR
                                 #  b) Method is motion_roi (actual frame-diff movement)
+                                #  c) Result is close to Vision position during lockout
                                 # Template-only results are NEVER trusted without
                                 # CNN backing, no matter how high the confidence.
+                                vision_close = False
+                                if now < _vision_lockout_until and state.vision_x > 0:
+                                    vd = ((track_result.x - state.vision_x) ** 2 +
+                                          (track_result.y - state.vision_y) ** 2) ** 0.5
+                                    vision_close = vd < 60
                                 sil_trusted = (
                                     state.cursor_validated or
-                                    track_result.method == "motion_roi"
+                                    track_result.method == "motion_roi" or
+                                    vision_close
                                 )
                                 if sil_trusted and tracker:
                                     tracker.set_position(
                                         track_result.x, track_result.y,
                                         method="sil_" + track_result.method)
+                                    pos = tracker.position
+                                elif tracker:
+                                    # Gated but found — refresh timestamp to prevent
+                                    # staleness (don't change x,y, just keep alive)
+                                    tracker.set_position(
+                                        pos.x, pos.y, method=pos.method)
                                     pos = tracker.position
                                 state.silhouette_method = track_result.method
                                 state.silhouette_confidence = round(
@@ -1540,8 +1586,9 @@ async def claude_detect():
                 state.sample_count_neg = collector.negative_count
 
             # Also reset low-confidence clock — Claude Vision is ground truth
-            global _low_confidence_since
+            global _low_confidence_since, _vision_lockout_until
             _low_confidence_since = 0.0
+            _vision_lockout_until = time.monotonic() + _VISION_LOCKOUT_S
             if tracker:
                 tracker.set_position(
                     result.cursor_x, result.cursor_y, method="claude_vision")
@@ -1553,6 +1600,12 @@ async def claude_detect():
                 state.cnn_confidence = 1.0  # Claude Vision overrides CNN
             if sil_tracker:
                 sil_tracker.reset()  # Re-lock silhouette to Claude-found position
+            # Capture fresh template from Vision-confirmed position so
+            # silhouette tracks the ACTUAL cursor, not old UI element match
+            if recognizer and frame is not None:
+                patch = extract_gray_patch(frame, result.cursor_x, result.cursor_y)
+                if patch is not None:
+                    recognizer.update_cursor_template(patch)
             if collector:
                 saved = claude_detector.save_training_samples(
                     frame, result, collector)
