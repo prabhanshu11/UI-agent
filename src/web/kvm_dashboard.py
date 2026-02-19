@@ -85,6 +85,14 @@ class MotionState:
     silhouette_latency_ms: float = 0.0
     silhouette_misses: int = 0
     error: Optional[str] = None
+    # Claude Vision (ground truth)
+    vision_x: int = 0
+    vision_y: int = 0
+    vision_confidence: str = "none"  # "high", "medium", "low", "none"
+    vision_cursor_type: str = "unknown"
+    vision_latency_ms: float = 0.0
+    vision_timestamp: float = 0.0  # monotonic time of last detection
+    vision_count: int = 0
     # Pipeline profiling
     prof_jpeg_decode_ms: float = 0.0
     prof_overlay_draw_ms: float = 0.0
@@ -123,6 +131,9 @@ daemon_client: Optional[DaemonClient] = None
 claude_detector: Optional[ClaudeVisionCursorDetector] = None
 sil_tracker: Optional[SilhouetteTracker] = None
 cmd_movement: Optional[CommandedMovement] = None
+
+# Sustained low-confidence tracker for jitter-based re-acquisition
+_low_confidence_since: float = 0.0  # monotonic time when CNN confidence first went <0.7
 
 
 # ── Motion detection service (background thread) ───────────────────
@@ -239,6 +250,19 @@ def _daemon_motion_loop():
     velocity_history: list[tuple[float, float, float]] = []  # (dx, dy, timestamp)
     MAX_VELOCITY_SAMPLES = 5
 
+    # Persistent blob filter: detects UI animations (clocks, tickers, etc.)
+    # Grid of 48x27 cells (40px each at 1920x1080). Each cell tracks
+    # consecutive frames where blobs appear in that region.
+    # Starts FULL (all regions presumed noisy). Regions that DON'T have
+    # blobs decay to 0 and become "clear" after ~8 frames (~0.4s).
+    # UI animation regions stay above threshold because they get blobs
+    # every frame. Cursor regions clear quickly because cursor motion
+    # is transient (only during movement).
+    NOISE_GRID_W, NOISE_GRID_H = 48, 27
+    NOISE_CELL_PX = 40
+    NOISE_THRESHOLD = 8
+    noise_grid = [[NOISE_THRESHOLD] * NOISE_GRID_W for _ in range(NOISE_GRID_H)]
+
     while True:
         try:
             ds = daemon_client.read_state()
@@ -273,6 +297,32 @@ def _daemon_motion_loop():
                 if bw > 80 or bh > 80:
                     continue
                 cursor_blobs.append(b)
+
+            # ── Persistent blob filter ──
+            # Update noise grid: mark cells that have blobs this frame
+            active_cells = set()
+            for b in cursor_blobs:
+                gx = min(NOISE_GRID_W - 1, b.centroid[0] // NOISE_CELL_PX)
+                gy = min(NOISE_GRID_H - 1, b.centroid[1] // NOISE_CELL_PX)
+                active_cells.add((gx, gy))
+
+            for gy in range(NOISE_GRID_H):
+                for gx in range(NOISE_GRID_W):
+                    if (gx, gy) in active_cells:
+                        noise_grid[gy][gx] = min(noise_grid[gy][gx] + 1, NOISE_THRESHOLD + 5)
+                    else:
+                        noise_grid[gy][gx] = max(0, noise_grid[gy][gx] - 1)
+
+            # Remove blobs in persistent-motion cells (UI animations)
+            filtered_blobs = []
+            for b in cursor_blobs:
+                gx = min(NOISE_GRID_W - 1, b.centroid[0] // NOISE_CELL_PX)
+                gy = min(NOISE_GRID_H - 1, b.centroid[1] // NOISE_CELL_PX)
+                if noise_grid[gy][gx] >= NOISE_THRESHOLD:
+                    continue  # Skip: persistent motion = UI animation
+                filtered_blobs.append(b)
+            cursor_blobs = filtered_blobs
+
             primary_blob = None
             if cursor_blobs:
                 if pos and (now - pos.timestamp < 10):
@@ -374,11 +424,23 @@ def _daemon_motion_loop():
                             state.silhouette_misses = sil_tracker.consecutive_misses
 
                             if track_result:
-                                if tracker:
+                                # CNN confidence gate: template matching alone
+                                # can't be trusted — cursors look like many UI
+                                # elements (icons, text, dark spots). Only trust
+                                # silhouette results when:
+                                #  a) CNN has validated the current position, OR
+                                #  b) Method is motion_roi (actual frame-diff movement)
+                                # Template-only results are NEVER trusted without
+                                # CNN backing, no matter how high the confidence.
+                                sil_trusted = (
+                                    state.cursor_validated or
+                                    track_result.method == "motion_roi"
+                                )
+                                if sil_trusted and tracker:
                                     tracker.set_position(
                                         track_result.x, track_result.y,
                                         method="sil_" + track_result.method)
-                                pos = tracker.position
+                                    pos = tracker.position
                                 state.silhouette_method = track_result.method
                                 state.silhouette_confidence = round(
                                     track_result.confidence, 3)
@@ -655,21 +717,85 @@ def _python_motion_loop():
             time.sleep(1)
 
 
-def jitter_monitor_loop():
+def jitter_loop():
+    """Anti-sleep jitter with opportunistic cursor re-acquisition.
+
+    Replaces ESP32Mouse's built-in anti-sleep thread so we control the
+    timing. Every jitter_interval_s (30s):
+
+    Normal mode: ±Npx jitter (prevents Windows sleep, invisible to user).
+
+    Re-acquisition mode: when CNN confidence has been <0.7 for >15s,
+    the jitter fires a correlation probe instead of simple ±3px.
+    Uses _jitter_reacquire() which does 15px dual-direction probe —
+    large enough for reliable blob correlation but still serves as
+    anti-sleep (any mouse movement resets Windows idle timer).
+    """
+    global _low_confidence_since
+
     while True:
+        time.sleep(config.jitter_interval_s)
+
+        # Update hardware monitoring state
         try:
             state.mouse_connected = mouse.status() == "CONNECTED" if mouse else False
             state.heartbeat_active = (
                 hasattr(mouse, '_heartbeat_stop') and
                 not mouse._heartbeat_stop.is_set()
             ) if mouse else False
-            state.anti_sleep_active = (
-                hasattr(mouse, '_anti_sleep_stop') and
-                not mouse._anti_sleep_stop.is_set()
-            ) if mouse else False
+            state.anti_sleep_active = True  # We ARE the anti-sleep now
         except Exception:
             pass
-        time.sleep(2)
+
+        if not mouse:
+            continue
+
+        use_daemon = daemon_client and daemon_client.is_running()
+        now = time.monotonic()
+
+        # Check if sustained low confidence warrants re-acquisition.
+        # Trigger: confidence has been <0.7 for the entire jitter cycle.
+        need_reacquire = (
+            _low_confidence_since > 0 and
+            (now - _low_confidence_since) > config.jitter_interval_s and
+            (use_daemon or sensor)
+        )
+
+        if need_reacquire:
+            # Correlation probe: the jitter IS the probe signal
+            result = _jitter_reacquire(use_daemon)
+            if result:
+                rx, ry = result
+                state.cursor_x = rx
+                state.cursor_y = ry
+                state.cursor_method = "jitter_reacquire"
+                state.cursor_age_s = 0.0
+                state.cursor_validated = False
+                state.cnn_confidence = 0.0
+                _low_confidence_since = 0.0  # Found it — reset
+                if sil_tracker:
+                    sil_tracker.reset()
+            else:
+                # Probe failed — still do normal jitter for anti-sleep
+                try:
+                    px = config.jitter_pixels
+                    mouse._send_raw(px, 0)
+                    time.sleep(0.1)
+                    mouse._send_raw(-px, 0)
+                except Exception:
+                    pass
+        else:
+            # Normal anti-sleep jitter: ±Npx, net zero displacement
+            try:
+                px = config.jitter_pixels
+                mouse._send_raw(px, 0)
+                time.sleep(0.1)
+                mouse._send_raw(-px, 0)
+            except Exception:
+                pass
+
+        state.last_jitter_time = time.monotonic()
+        state.jitter_count += 1
 
 
 def pi_keyboard_monitor_loop():
@@ -807,13 +933,15 @@ def cursor_validation_loop():
 
     1. If no position or very stale (>60s): dual-probe re-acquire immediately
     2. If position fresh: CNN classify_patch at (x, y)
-       - confidence > 0.7: confirmed, update template
-       - confidence < 0.7: dual-probe re-acquire
+       - confidence > 0.7: confirmed, reset low-confidence clock
+       - confidence < 0.7: start low-confidence clock, try re-acquire
+       - If re-acquire fails, jitter_loop() will retry on next jitter cycle
 
     The dual-probe re-acquire moves cursor right then down, captures 3
     frames, and matches blobs across both directions. Only the real cursor
     follows both movements — UI noise doesn't.
     """
+    global _low_confidence_since
     while True:
         time.sleep(config.cnn_interval_s)
         if not recognizer or not tracker:
@@ -846,10 +974,15 @@ def cursor_validation_loop():
                     if result:
                         reacquired = True
                 if reacquired:
+                    _low_confidence_since = 0.0  # Reset on success
                     state.cursor_validated = False
                     state.cnn_confidence = 0.0
                     if sil_tracker:
                         sil_tracker.reset()
+                else:
+                    # Failed to reacquire — signal jitter_loop to try on next cycle
+                    if _low_confidence_since == 0.0:
+                        _low_confidence_since = time.monotonic()
                 continue
 
             # Position is fresh — validate with CNN
@@ -880,6 +1013,7 @@ def cursor_validation_loop():
 
             if confidence > 0.7:
                 # Cursor confirmed — update template + reset silhouette to tight ROI
+                _low_confidence_since = 0.0  # Reset sustained-low tracker
                 recognizer.update_cursor_template(patch)
                 state.cursor_validated = True
                 if sil_tracker:
@@ -890,11 +1024,18 @@ def cursor_validation_loop():
                     state.sample_count_pos = collector.positive_count
                     state.sample_count_neg = collector.negative_count
             else:
-                # CNN says cursor NOT here — try commanded movement, then legacy
+                # CNN says cursor NOT here — start/keep low-confidence clock.
+                # Do NOT reset clock on re-acquisition "success" — the position
+                # might still be wrong. Only CNN > 0.7 resets the clock.
+                # This lets jitter_loop() see sustained low confidence and fire
+                # its correlation probe as a backup.
+                if _low_confidence_since == 0.0:
+                    _low_confidence_since = time.monotonic()
                 state.cursor_validated = False
                 if sil_tracker:
                     sil_tracker.reset()
-                reacquired = False
+                # Immediate re-acquisition attempt — updates position but
+                # does NOT reset the low-confidence clock
                 if cmd_movement:
                     mr = cmd_movement.escalate(cx, cy)
                     if mr:
@@ -902,8 +1043,7 @@ def cursor_validation_loop():
                         state.cursor_x = mr.x
                         state.cursor_y = mr.y
                         state.cursor_method = mr.method
-                        reacquired = True
-                if not reacquired:
+                else:
                     _jitter_reacquire(use_daemon)
 
         except Exception:
@@ -959,6 +1099,14 @@ async def get_state():
             "heartbeat_active": state.heartbeat_active,
             "anti_sleep_active": state.anti_sleep_active,
         },
+        "jitter": {
+            "last_time": state.last_jitter_time,
+            "count": state.jitter_count,
+            "reacquire_pending": _low_confidence_since > 0 and
+                (time.monotonic() - _low_confidence_since) > config.jitter_interval_s,
+            "low_confidence_s": round(time.monotonic() - _low_confidence_since, 1)
+                if _low_confidence_since > 0 else 0.0,
+        },
         "pi_keyboard": state.pi_keyboard_connected,
         "cnn": {
             "confidence": round(state.cnn_confidence, 3),
@@ -978,6 +1126,16 @@ async def get_state():
             "confidence": state.silhouette_confidence,
             "latency_ms": state.silhouette_latency_ms,
             "misses": state.silhouette_misses,
+        },
+        "vision": {
+            "x": state.vision_x,
+            "y": state.vision_y,
+            "confidence": state.vision_confidence,
+            "cursor_type": state.vision_cursor_type,
+            "latency_ms": state.vision_latency_ms,
+            "age_s": round(time.monotonic() - state.vision_timestamp, 1)
+                if state.vision_timestamp > 0 else -1,
+            "count": state.vision_count,
         },
         "fps": round(state.fps, 1),
         "frame_count": state.frame_count,
@@ -1284,20 +1442,10 @@ async def set_config(request: Request):
         config.cnn_interval_s = max(1.0, min(300.0, float(data["cnn_interval_s"])))
     if "jitter_interval_s" in data:
         config.jitter_interval_s = max(5.0, min(300.0, float(data["jitter_interval_s"])))
-        # Restart jitter with new interval
-        if mouse:
-            mouse.stop_anti_sleep()
-            mouse.start_anti_sleep(
-                interval=config.jitter_interval_s,
-                pixels=config.jitter_pixels)
+        # jitter_loop() reads config each cycle — no restart needed
     if "jitter_pixels" in data:
         config.jitter_pixels = max(1, min(30, int(data["jitter_pixels"])))
-        # Restart jitter with new amplitude
-        if mouse:
-            mouse.stop_anti_sleep()
-            mouse.start_anti_sleep(
-                interval=config.jitter_interval_s,
-                pixels=config.jitter_pixels)
+        # jitter_loop() reads config each cycle — no restart needed
 
     return await get_config()
 
@@ -1337,12 +1485,29 @@ async def claude_detect():
     est_y = pos.y if pos else None
 
     # Run detection
+    t0 = time.monotonic()
     result = await claude_detector.detect(frame, est_x, est_y)
+    detect_ms = (time.monotonic() - t0) * 1000
+
+    # Always update vision state for dashboard display
+    state.vision_timestamp = time.monotonic()
+    state.vision_latency_ms = round(detect_ms, 0)
+    state.vision_count += 1
+    if result.cursor_found and result.cursor_x is not None:
+        state.vision_x = result.cursor_x
+        state.vision_y = result.cursor_y
+        state.vision_confidence = result.confidence or "unknown"
+        state.vision_cursor_type = result.cursor_type or "unknown"
+    else:
+        state.vision_confidence = "not_found"
 
     # If high confidence and not confusing, update tracker and save samples
     saved = 0
     if result.cursor_found and result.confidence in ("high", "medium"):
         if result.cursor_x is not None and result.cursor_y is not None:
+            # Also reset low-confidence clock — Claude Vision is ground truth
+            global _low_confidence_since
+            _low_confidence_since = 0.0
             if tracker:
                 tracker.set_position(
                     result.cursor_x, result.cursor_y, method="claude_vision")
@@ -1350,6 +1515,8 @@ async def claude_detect():
                 state.cursor_y = result.cursor_y
                 state.cursor_method = "claude_vision"
                 state.cursor_age_s = 0.0
+                state.cursor_validated = True
+                state.cnn_confidence = 1.0  # Claude Vision overrides CNN
             if sil_tracker:
                 sil_tracker.reset()  # Re-lock silhouette to Claude-found position
             if collector:
@@ -1848,7 +2015,7 @@ DASHBOARD_HTML = r"""
             position: relative; display: flex; justify-content: center;
             align-items: center; width: 100%; height: 100%;
         }
-        #video-area { position: relative; max-width: 100%; max-height: 100%; }
+        #video-area { position: relative; max-width: 100%; max-height: 100%; overflow: hidden; }
         #video-area img { display: block; max-width: 100%; max-height: calc(100vh - 50px); }
         .cursor-dot {
             position: absolute; width: 24px; height: 24px;
@@ -1998,6 +2165,10 @@ DASHBOARD_HTML = r"""
                     <span class="hw-label">Latency</span>
                     <span class="hw-value" id="sil-latency" style="color:#888">—</span>
                 </div>
+                <div class="hw-row">
+                    <span class="hw-label">Trusted</span>
+                    <span class="hw-value" id="sil-trusted" style="color:#888">—</span>
+                </div>
             </div>
             <div class="panel">
                 <div class="panel-title">CNN Cursor Recognition</div>
@@ -2026,6 +2197,36 @@ DASHBOARD_HTML = r"""
                 </div>
             </div>
             <div class="panel">
+                <div class="panel-title" style="color:#9b59b6">Claude Vision (Ground Truth)</div>
+                <div class="hw-row">
+                    <span class="hw-label">Position</span>
+                    <span class="hw-value" id="vision-pos" style="color:#888">—</span>
+                </div>
+                <div class="hw-row">
+                    <span class="hw-label">Confidence</span>
+                    <span class="hw-value" id="vision-confidence">—</span>
+                </div>
+                <div class="hw-row">
+                    <span class="hw-label">Cursor Type</span>
+                    <span class="hw-value" id="vision-type" style="color:#888">—</span>
+                </div>
+                <div class="hw-row">
+                    <span class="hw-label">Latency</span>
+                    <span class="hw-value" id="vision-latency" style="color:#888">—</span>
+                </div>
+                <div class="hw-row">
+                    <span class="hw-label">Last Run</span>
+                    <span class="hw-value" id="vision-age" style="color:#888">Never</span>
+                </div>
+                <div class="hw-row">
+                    <span class="hw-label">Tracker Delta</span>
+                    <span class="hw-value" id="vision-delta" style="color:#888">—</span>
+                </div>
+                <div style="margin-top:6px;">
+                    <button onclick="runVisionDetect()" id="vision-btn" style="background:#9b59b6; color:#fff; border:none; padding:4px 12px; border-radius:4px; cursor:pointer; font-size:0.7rem;">Run Detection</button>
+                </div>
+            </div>
+            <div class="panel">
                 <div class="panel-title">Anti-Sleep Jitter</div>
                 <div class="hw-row">
                     <span class="hw-label">Status</span>
@@ -2034,7 +2235,7 @@ DASHBOARD_HTML = r"""
                 <div class="jitter-bar" id="jitter-bar">
                     <div class="jitter-pulse"></div>
                 </div>
-                <div style="font-size:0.65rem; color:#444; margin-top:3px;">
+                <div style="font-size:0.65rem; color:#444; margin-top:3px;" id="jitter-desc">
                     ±3px every 30s — prevents Windows sleep
                 </div>
             </div>
@@ -2133,14 +2334,29 @@ DASHBOARD_HTML = r"""
 
                 var jitterStatus = document.getElementById('jitter-status');
                 var jitterBar = document.getElementById('jitter-bar');
-                if (s.hardware.anti_sleep_active) {
+                var jitterDesc = document.getElementById('jitter-desc');
+                if (s.jitter && s.jitter.reacquire_pending) {
+                    jitterStatus.textContent = 'Re-acquiring';
+                    jitterStatus.className = 'hw-value warn';
+                    jitterBar.classList.add('active');
+                    jitterBar.style.background = '#e67e22';
+                    jitterDesc.textContent = 'Low confidence ' +
+                        s.jitter.low_confidence_s.toFixed(0) +
+                        's \u2014 next jitter will probe';
+                    jitterDesc.style.color = '#e67e22';
+                } else if (s.hardware.anti_sleep_active) {
                     jitterStatus.textContent = 'Active';
                     jitterStatus.className = 'hw-value ok';
                     jitterBar.classList.add('active');
+                    jitterBar.style.background = '';
+                    jitterDesc.textContent = '\u00B13px every 30s \u2014 prevents Windows sleep';
+                    jitterDesc.style.color = '#444';
                 } else {
                     jitterStatus.textContent = 'Inactive';
                     jitterStatus.className = 'hw-value warn';
                     jitterBar.classList.remove('active');
+                    jitterBar.style.background = '';
+                    jitterDesc.style.color = '#444';
                 }
 
                 setHW('hw-mouse', s.hardware.mouse_connected, 'Connected', 'Disconnected');
@@ -2171,6 +2387,13 @@ DASHBOARD_HTML = r"""
                         s.silhouette.confidence > 0.3 ? 'warn' : 'err');
                     document.getElementById('sil-latency').textContent =
                         s.silhouette.latency_ms.toFixed(2) + 'ms';
+                    // Trust status: silhouette is trusted if CNN validated OR high confidence OR motion
+                    var trusted = s.cnn.cursor_validated ||
+                        s.silhouette.confidence > 0.7 ||
+                        s.silhouette.method === 'motion_roi';
+                    var trustEl = document.getElementById('sil-trusted');
+                    trustEl.textContent = trusted ? 'Yes' : 'Gated (CNN < 70%)';
+                    trustEl.className = 'hw-value ' + (trusted ? 'ok' : 'warn');
                 }
 
                 // CNN panel
@@ -2189,6 +2412,34 @@ DASHBOARD_HTML = r"""
                     document.getElementById('cnn-inference').textContent = s.cnn.inference_ms + 'ms';
                     document.getElementById('cnn-samples').textContent =
                         s.cnn.samples.pos + ' pos / ' + s.cnn.samples.neg + ' neg';
+                }
+
+                // Claude Vision panel
+                if (s.vision) {
+                    var v = s.vision;
+                    if (v.age_s >= 0) {
+                        document.getElementById('vision-pos').textContent =
+                            '(' + v.x + ', ' + v.y + ')';
+                        var vconf = document.getElementById('vision-confidence');
+                        vconf.textContent = v.confidence;
+                        vconf.className = 'hw-value ' + (
+                            v.confidence === 'high' ? 'ok' :
+                            v.confidence === 'medium' ? 'warn' : 'err');
+                        document.getElementById('vision-type').textContent = v.cursor_type;
+                        document.getElementById('vision-latency').textContent =
+                            (v.latency_ms / 1000).toFixed(1) + 's';
+                        var ageStr = v.age_s < 60 ? v.age_s.toFixed(0) + 's ago' :
+                            (v.age_s / 60).toFixed(1) + 'm ago';
+                        document.getElementById('vision-age').textContent = ageStr;
+                        // Delta between tracker and vision
+                        var dx = Math.abs(s.cursor.x - v.x);
+                        var dy = Math.abs(s.cursor.y - v.y);
+                        var delta = Math.round(Math.sqrt(dx*dx + dy*dy));
+                        var deltaEl = document.getElementById('vision-delta');
+                        deltaEl.textContent = delta + 'px';
+                        deltaEl.className = 'hw-value ' + (
+                            delta < 30 ? 'ok' : delta < 100 ? 'warn' : 'err');
+                    }
                 }
 
                 var errPanel = document.getElementById('error-panel');
@@ -2219,9 +2470,27 @@ DASHBOARD_HTML = r"""
                 dot.style.display = 'none';
                 return;
             }
-            dot.style.left = (cursorX / img.naturalWidth * 100) + '%';
-            dot.style.top = (cursorY / img.naturalHeight * 100) + '%';
+            var pctX = Math.max(0, Math.min(100, cursorX / img.naturalWidth * 100));
+            var pctY = Math.max(0, Math.min(100, cursorY / img.naturalHeight * 100));
+            dot.style.left = pctX + '%';
+            dot.style.top = pctY + '%';
             dot.style.display = 'block';
+        }
+
+        function runVisionDetect() {
+            var btn = document.getElementById('vision-btn');
+            btn.textContent = 'Detecting...';
+            btn.disabled = true;
+            fetch('/api/claude_detect')
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    btn.textContent = 'Run Detection';
+                    btn.disabled = false;
+                })
+                .catch(function() {
+                    btn.textContent = 'Run Detection';
+                    btn.disabled = false;
+                });
         }
 
         // ── Frame updates at 5Hz ──
@@ -2931,8 +3200,9 @@ def init_hardware():
     mouse.start_heartbeat(interval=0.1)
     print("  Heartbeat started (100ms)")
 
-    mouse.start_anti_sleep(interval=30.0, pixels=3)
-    print("  Anti-sleep jitter started (30s)")
+    # Anti-sleep jitter is handled by jitter_loop() — not ESP32Mouse's built-in thread.
+    # This allows us to piggyback correlation probes on jitter when confidence is low.
+    print("  Anti-sleep jitter started (30s)")  # managed by jitter_loop()
 
     tracker = CursorTracker(mouse, sensor, check_interval=999.0, stale_threshold=9999.0)
     tracker.set_position(6, 15, method="manual")
@@ -2965,7 +3235,7 @@ def init_hardware():
     threading.Thread(target=motion_detection_loop, daemon=True).start()
     print("  Motion detection loop started")
 
-    threading.Thread(target=jitter_monitor_loop, daemon=True).start()
+    threading.Thread(target=jitter_loop, daemon=True).start()
     threading.Thread(target=pi_keyboard_monitor_loop, daemon=True).start()
     threading.Thread(target=cursor_validation_loop, daemon=True).start()
     print("  Cursor validation loop started (30s cycle)")
