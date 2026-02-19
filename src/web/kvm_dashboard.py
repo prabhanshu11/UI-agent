@@ -2125,6 +2125,14 @@ DASHBOARD_HTML = r"""
             animation: cursor-pulse 1.5s ease-in-out infinite;
             z-index: 10; display: none;
         }
+        .vision-dot {
+            position: absolute; width: 18px; height: 18px;
+            border-radius: 50%; pointer-events: none;
+            background: radial-gradient(circle, #fff 20%, #a855f7 50%, transparent 70%);
+            box-shadow: 0 0 10px #a855f7, 0 0 20px #a855f788;
+            transform: translate(-50%, -50%);
+            z-index: 9; display: none;
+        }
         @keyframes cursor-pulse {
             0%, 100% { opacity: 1; box-shadow: 0 0 12px #00ff00, 0 0 24px #00ff0088; }
             50% { opacity: 0.7; box-shadow: 0 0 20px #00ff00, 0 0 40px #00ff0066; }
@@ -2212,6 +2220,7 @@ DASHBOARD_HTML = r"""
                 <div id="video-area">
                     <img id="live-frame" src="" alt="Loading...">
                     <div class="cursor-dot" id="cursor-dot"></div>
+                    <div class="vision-dot" id="vision-dot"></div>
                 </div>
             </div>
         </div>
@@ -2539,6 +2548,7 @@ DASHBOARD_HTML = r"""
                         deltaEl.className = 'hw-value ' + (
                             delta < 30 ? 'ok' : delta < 100 ? 'warn' : 'err');
                     }
+                    updateVisionDot(v.x, v.y, v.age_s);
                 }
 
                 var errPanel = document.getElementById('error-panel');
@@ -2574,6 +2584,23 @@ DASHBOARD_HTML = r"""
             dot.style.left = pctX + '%';
             dot.style.top = pctY + '%';
             dot.style.display = 'block';
+        }
+
+        function updateVisionDot(visionX, visionY, ageS) {
+            var img = document.getElementById('live-frame');
+            var dot = document.getElementById('vision-dot');
+            if (!img.naturalWidth || visionX <= 0 || visionY <= 0 || ageS < 0) {
+                dot.style.display = 'none';
+                return;
+            }
+            var pctX = Math.max(0, Math.min(100, visionX / img.naturalWidth * 100));
+            var pctY = Math.max(0, Math.min(100, visionY / img.naturalHeight * 100));
+            dot.style.left = pctX + '%';
+            dot.style.top = pctY + '%';
+            // Fade out as vision ages: fully visible <30s, faded 30-120s, hidden >120s
+            var opacity = ageS < 30 ? 1.0 : ageS < 120 ? 1.0 - (ageS - 30) / 90 : 0;
+            dot.style.opacity = opacity;
+            dot.style.display = opacity > 0.05 ? 'block' : 'none';
         }
 
         function runVisionDetect() {
