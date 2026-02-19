@@ -2523,6 +2523,96 @@ async def profiler_snapshot():
     return snapshot
 
 
+# ── Manual tagging endpoint ─────────────────────────────────────────
+
+_TAG_DIR = Path(__file__).parent.parent.parent / "data" / "tagged"
+_TAG_DIR.mkdir(parents=True, exist_ok=True)
+_TAG_LOG = _TAG_DIR / "tags.jsonl"
+
+
+@app.post("/api/tag")
+async def tag_frame(request: Request):
+    """Save a manually tagged frame with multi-dimensional labels.
+
+    The user sees all algorithm outputs on the dashboard and clicks
+    tag buttons. Each tag saves the current frame + all state + labels.
+
+    Expected JSON body:
+    {
+        "cursor_correct": "yes" | "no" | "unsure",
+        "cursor_type": "arrow" | "hand" | "caret" | "resize" | "other",
+        "movement": "stationary" | "slow" | "medium" | "fast",
+        "track_quality": "accurate" | "drifting" | "wrong_target" | "lost",
+        "context": "desktop" | "browser" | "teams" | "app",
+        "notes": "optional freeform text"
+    }
+    """
+    data = await request.json()
+    now_mono = time.monotonic()
+    now_utc = utc_now_ms()
+
+    # Grab frame
+    with state.lock:
+        frame = state.frame_raw.copy() if state.frame_raw is not None else None
+
+    if frame is None:
+        return {"error": "No frame available"}
+
+    # Save frame
+    ts_id = int(now_mono * 1000)
+    frame_path = _TAG_DIR / f"frame_{ts_id}.jpg"
+    bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(str(frame_path), bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+
+    # Record: tags + all algorithm states
+    record = {
+        "id": ts_id,
+        "utc": now_utc,
+        "tags": {
+            "cursor_correct": data.get("cursor_correct", "unsure"),
+            "cursor_type": data.get("cursor_type", "unknown"),
+            "movement": data.get("movement", "unknown"),
+            "track_quality": data.get("track_quality", "unknown"),
+            "context": data.get("context", "unknown"),
+            "notes": data.get("notes", ""),
+        },
+        "state": {
+            "cursor_x": state.cursor_x,
+            "cursor_y": state.cursor_y,
+            "cursor_method": state.cursor_method,
+            "cursor_validated": state.cursor_validated,
+            "cnn_confidence": round(state.cnn_confidence, 4),
+            "cnn_model": state.cnn_model_version,
+            "silhouette_confidence": round(state.silhouette_confidence, 4),
+            "silhouette_method": state.silhouette_method,
+            "silhouette_roi": state.silhouette_roi_size,
+            "silhouette_misses": state.silhouette_misses,
+            "blob_count": state.blob_count,
+            "vision_x": state.vision_x,
+            "vision_y": state.vision_y,
+            "vision_confidence": state.vision_confidence,
+            "vision_age_s": round(now_mono - state.vision_timestamp, 1) if state.vision_timestamp > 0 else -1,
+        },
+        "noise_grid": noise_grid_features(),
+        "frame": frame_path.name,
+    }
+
+    with open(_TAG_LOG, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+    return {"status": "tagged", "id": ts_id, "frame": frame_path.name}
+
+
+@app.get("/api/tags")
+async def get_tags():
+    """Return all tagged samples for review."""
+    if not _TAG_LOG.exists():
+        return {"tags": [], "count": 0}
+    with open(_TAG_LOG) as f:
+        tags = [json.loads(line) for line in f if line.strip()]
+    return {"tags": tags[-50:], "count": len(tags)}
+
+
 # ── Dashboard HTML ──────────────────────────────────────────────────
 
 DASHBOARD_HTML = r"""
@@ -2597,6 +2687,14 @@ DASHBOARD_HTML = r"""
             overflow-y: auto;
         }
         .panel { border-bottom: 1px solid #1a1a25; padding: 0.8rem; }
+        .tag-btn {
+            background: #333; color: #ccc; border: 1px solid #555; padding: 2px 6px;
+            cursor: pointer; border-radius: 3px; font-size: 0.65rem; margin: 1px;
+            transition: all 0.15s;
+        }
+        .tag-btn:hover { border-color: #f39c12; color: #fff; }
+        .tag-btn.selected { border-color: #f39c12; color: #fff; box-shadow: 0 0 4px #f39c12; }
+        .tag-group { display: flex; flex-wrap: wrap; gap: 2px; }
         .panel-title {
             font-size: 0.7rem; text-transform: uppercase;
             letter-spacing: 2px; color: #ff4444; margin-bottom: 0.6rem;
@@ -2820,6 +2918,60 @@ DASHBOARD_HTML = r"""
                     <span class="hw-label">Frame Count</span>
                     <span class="hw-value" id="hw-frames" style="color:#888">0</span>
                 </div>
+            </div>
+            <div class="panel" style="border-color:#f39c12">
+                <div class="panel-title" style="color:#f39c12">Tag Frame (Training Data)</div>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:4px; font-size:0.7rem;">
+                    <div>
+                        <div style="color:#888; margin-bottom:2px;">Cursor Correct?</div>
+                        <div class="tag-group" id="tag-cursor-correct">
+                            <button class="tag-btn" data-dim="cursor_correct" data-val="yes" style="background:#27ae60">Yes</button>
+                            <button class="tag-btn" data-dim="cursor_correct" data-val="no" style="background:#e74c3c">No</button>
+                            <button class="tag-btn" data-dim="cursor_correct" data-val="unsure" style="background:#7f8c8d">?</button>
+                        </div>
+                    </div>
+                    <div>
+                        <div style="color:#888; margin-bottom:2px;">Cursor Type</div>
+                        <div class="tag-group" id="tag-cursor-type">
+                            <button class="tag-btn" data-dim="cursor_type" data-val="arrow">Arrow</button>
+                            <button class="tag-btn" data-dim="cursor_type" data-val="hand">Hand</button>
+                            <button class="tag-btn" data-dim="cursor_type" data-val="caret">Caret</button>
+                            <button class="tag-btn" data-dim="cursor_type" data-val="other">Other</button>
+                        </div>
+                    </div>
+                    <div>
+                        <div style="color:#888; margin-bottom:2px;">Movement</div>
+                        <div class="tag-group" id="tag-movement">
+                            <button class="tag-btn" data-dim="movement" data-val="stationary">Still</button>
+                            <button class="tag-btn" data-dim="movement" data-val="slow">Slow</button>
+                            <button class="tag-btn" data-dim="movement" data-val="medium">Med</button>
+                            <button class="tag-btn" data-dim="movement" data-val="fast">Fast</button>
+                        </div>
+                    </div>
+                    <div>
+                        <div style="color:#888; margin-bottom:2px;">Track Quality</div>
+                        <div class="tag-group" id="tag-track-quality">
+                            <button class="tag-btn" data-dim="track_quality" data-val="accurate" style="background:#27ae60">Good</button>
+                            <button class="tag-btn" data-dim="track_quality" data-val="drifting" style="background:#f39c12">Drift</button>
+                            <button class="tag-btn" data-dim="track_quality" data-val="wrong_target" style="background:#e74c3c">Wrong</button>
+                            <button class="tag-btn" data-dim="track_quality" data-val="lost" style="background:#c0392b">Lost</button>
+                        </div>
+                    </div>
+                    <div style="grid-column:span 2">
+                        <div style="color:#888; margin-bottom:2px;">Context</div>
+                        <div class="tag-group" id="tag-context">
+                            <button class="tag-btn" data-dim="context" data-val="desktop">Desktop</button>
+                            <button class="tag-btn" data-dim="context" data-val="browser">Browser</button>
+                            <button class="tag-btn" data-dim="context" data-val="teams">Teams</button>
+                            <button class="tag-btn" data-dim="context" data-val="app">App</button>
+                        </div>
+                    </div>
+                </div>
+                <div style="margin-top:6px; display:flex; gap:4px; align-items:center;">
+                    <input id="tag-notes" type="text" placeholder="Notes..." style="flex:1; background:#222; border:1px solid #444; color:#fff; padding:3px 6px; font-size:0.7rem; border-radius:3px;">
+                    <button id="tag-submit" onclick="submitTag()" style="background:#f39c12; color:#000; border:none; padding:4px 12px; cursor:pointer; border-radius:3px; font-weight:bold; font-size:0.7rem;">TAG</button>
+                </div>
+                <div id="tag-status" style="font-size:0.65rem; color:#888; margin-top:3px;"></div>
             </div>
             <div class="panel" id="error-panel" style="display:none">
                 <div class="panel-title" style="color:#e74c3c">Error</div>
@@ -3082,6 +3234,48 @@ DASHBOARD_HTML = r"""
         setInterval(updateState, 200);
         scheduleFrame();
         updateState();
+
+        // ── Tagging system ──
+        var tagState = {};
+        document.querySelectorAll('.tag-btn').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+                var dim = this.dataset.dim;
+                var val = this.dataset.val;
+                // Toggle selection in same group
+                this.parentElement.querySelectorAll('.tag-btn').forEach(function(b) {
+                    b.classList.remove('selected');
+                });
+                this.classList.add('selected');
+                tagState[dim] = val;
+            });
+        });
+
+        async function submitTag() {
+            var notes = document.getElementById('tag-notes').value;
+            tagState.notes = notes;
+            var statusEl = document.getElementById('tag-status');
+            statusEl.textContent = 'Saving...';
+            try {
+                var res = await fetch('/api/tag', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(tagState)
+                });
+                var data = await res.json();
+                if (data.status === 'tagged') {
+                    statusEl.textContent = 'Tagged #' + data.id + ' (' + data.frame + ')';
+                    statusEl.style.color = '#27ae60';
+                    // Flash effect
+                    setTimeout(function() { statusEl.style.color = '#888'; }, 2000);
+                } else {
+                    statusEl.textContent = 'Error: ' + (data.error || 'unknown');
+                    statusEl.style.color = '#e74c3c';
+                }
+            } catch(e) {
+                statusEl.textContent = 'Error: ' + e.message;
+                statusEl.style.color = '#e74c3c';
+            }
+        }
     </script>
 </body>
 </html>
