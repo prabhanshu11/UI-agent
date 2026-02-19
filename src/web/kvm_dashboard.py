@@ -783,8 +783,15 @@ def jitter_loop():
         time.sleep(config.jitter_interval_s)
 
         # Update hardware monitoring state
+        # Don't call mouse.status() here — it sends serial commands that
+        # collide with the heartbeat thread (100ms writes). Instead check
+        # if the serial port is open and heartbeat is running.
         try:
-            state.mouse_connected = mouse.status() == "CONNECTED" if mouse else False
+            state.mouse_connected = (
+                mouse is not None and
+                hasattr(mouse, 'ser') and
+                mouse.ser.is_open
+            )
             state.heartbeat_active = (
                 hasattr(mouse, '_heartbeat_stop') and
                 not mouse._heartbeat_stop.is_set()
