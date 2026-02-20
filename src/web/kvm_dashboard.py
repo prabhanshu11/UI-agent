@@ -595,17 +595,27 @@ def _daemon_motion_loop():
                         state.prof_jpeg_decode_ms = (time.monotonic() - t_decode) * 1000
 
                         # ── YOLO full-screen detection (~10fps) ──
+                        # YOLO expects BGR (OpenCV native), not RGB
                         if yolo_detector and yolo_detector.loaded:
-                            yolo_dets = yolo_detector.detect(frame_rgb)
+                            yolo_dets = yolo_detector.detect(frame)
                             if yolo_dets:
-                                best_yolo = yolo_dets[0]
+                                # Smart selection: if we have a tracked position,
+                                # prefer the detection closest to it (avoid toolbar FPs)
+                                pos_now = tracker.position if tracker else None
+                                if pos_now and len(yolo_dets) > 1:
+                                    yolo_dets.sort(key=lambda d: (
+                                        (d.cx - pos_now.x) ** 2 +
+                                        (d.cy - pos_now.y) ** 2))
+                                    best_yolo = yolo_dets[0]
+                                else:
+                                    best_yolo = yolo_dets[0]  # highest confidence
                                 state.yolo_active = True
-                                state.yolo_x = best_yolo.cx
-                                state.yolo_y = best_yolo.cy
-                                state.yolo_confidence = best_yolo.confidence
-                                state.yolo_bbox = (best_yolo.x1, best_yolo.y1,
-                                                   best_yolo.x2, best_yolo.y2)
-                                state.yolo_inference_ms = best_yolo.inference_ms
+                                state.yolo_x = int(best_yolo.cx)
+                                state.yolo_y = int(best_yolo.cy)
+                                state.yolo_confidence = float(best_yolo.confidence)
+                                state.yolo_bbox = (int(best_yolo.x1), int(best_yolo.y1),
+                                                   int(best_yolo.x2), int(best_yolo.y2))
+                                state.yolo_inference_ms = float(best_yolo.inference_ms)
                                 state.yolo_timestamp = now
                                 state.yolo_detection_count += 1
 
@@ -820,14 +830,18 @@ def _python_motion_loop():
             if yolo_detector and yolo_detector.loaded:
                 yolo_dets = yolo_detector.detect(frame)
                 if yolo_dets:
+                    # Smart selection: prefer detection closest to tracked pos
+                    if pos and len(yolo_dets) > 1:
+                        yolo_dets.sort(key=lambda d: (
+                            (d.cx - pos.x) ** 2 + (d.cy - pos.y) ** 2))
                     best_yolo = yolo_dets[0]
                     state.yolo_active = True
-                    state.yolo_x = best_yolo.cx
-                    state.yolo_y = best_yolo.cy
-                    state.yolo_confidence = best_yolo.confidence
-                    state.yolo_bbox = (best_yolo.x1, best_yolo.y1,
-                                       best_yolo.x2, best_yolo.y2)
-                    state.yolo_inference_ms = best_yolo.inference_ms
+                    state.yolo_x = int(best_yolo.cx)
+                    state.yolo_y = int(best_yolo.cy)
+                    state.yolo_confidence = float(best_yolo.confidence)
+                    state.yolo_bbox = (int(best_yolo.x1), int(best_yolo.y1),
+                                       int(best_yolo.x2), int(best_yolo.y2))
+                    state.yolo_inference_ms = float(best_yolo.inference_ms)
                     state.yolo_timestamp = t0
                     state.yolo_detection_count += 1
 
@@ -1945,7 +1959,7 @@ async def get_state():
             "active": state.yolo_active,
             "x": state.yolo_x, "y": state.yolo_y,
             "confidence": round(state.yolo_confidence, 3),
-            "bbox": state.yolo_bbox,
+            "bbox": [int(v) for v in state.yolo_bbox],
             "inference_ms": round(state.yolo_inference_ms, 1),
             "age_s": round(time.monotonic() - state.yolo_timestamp, 1)
                 if state.yolo_timestamp > 0 else -1,
@@ -2529,7 +2543,7 @@ async def log_experience_snapshot(request: Request):
             "active": state.yolo_active,
             "x": state.yolo_x, "y": state.yolo_y,
             "confidence": round(state.yolo_confidence, 3),
-            "bbox": state.yolo_bbox,
+            "bbox": [int(v) for v in state.yolo_bbox],
             "inference_ms": round(state.yolo_inference_ms, 1),
             "age_s": round(now_mono - state.yolo_timestamp, 1)
                 if state.yolo_timestamp > 0 else -1,
@@ -3436,6 +3450,14 @@ def _capture_snapshot(profile_id: str, step: int, direction: str,
             "fps": round(state.fps, 1),
             "blob_count": state.blob_count,
         },
+        "yolo": {
+            "active": state.yolo_active,
+            "x": state.yolo_x,
+            "y": state.yolo_y,
+            "confidence": round(state.yolo_confidence, 3),
+            "inference_ms": round(state.yolo_inference_ms, 1),
+            "detection_count": state.yolo_detection_count,
+        },
         "noise_grid": noise_grid_features(),
         "error_px": round(error_px, 1),
         "label": _auto_label(error_px),
@@ -3713,6 +3735,396 @@ async def loss_events_page():
     return LOSS_EVENTS_HTML
 
 
+# ── YOLO Gallery API ─────────────────────────────────────────────────
+
+@app.get("/api/yolo/frames")
+async def yolo_frames_list():
+    """List all loss event frames available for YOLO detection."""
+    events_dir = Path(__file__).parent.parent.parent / "data" / "loss_events"
+    if not events_dir.exists():
+        return {"events": [], "total_frames": 0}
+    result = []
+    total = 0
+    for edir in sorted(events_dir.iterdir(), reverse=True):
+        if not edir.is_dir():
+            continue
+        frames_dir = edir / "frames"
+        if not frames_dir.exists():
+            continue
+        fnames = sorted(f.name for f in frames_dir.iterdir() if f.suffix in (".jpg", ".png"))
+        if not fnames:
+            continue
+        # Read manifest for metadata
+        meta = {}
+        mf = edir / "manifest.json"
+        if mf.exists():
+            try:
+                meta = json.loads(mf.read_text())
+            except Exception:
+                pass
+        result.append({
+            "event_id": edir.name,
+            "frames": fnames,
+            "count": len(fnames),
+            "trigger": meta.get("trigger", "unknown"),
+            "timestamp": meta.get("trigger_time", ""),
+        })
+        total += len(fnames)
+    return {"events": result, "total_frames": total}
+
+
+@app.get("/api/yolo/detect/{event_id}/{frame_name:path}")
+async def yolo_detect_frame(event_id: str, frame_name: str):
+    """Run YOLO on a loss-event frame, return annotated JPEG."""
+    global yolo_detector
+    frame_path = Path(__file__).parent.parent.parent / "data" / "loss_events" / event_id / "frames" / frame_name
+    if not frame_path.exists():
+        return Response(status_code=404, content="Frame not found")
+    frame = cv2.imread(str(frame_path))
+    if frame is None:
+        return Response(status_code=500, content="Failed to read frame")
+    # Run YOLO
+    dets = []
+    if yolo_detector is not None:
+        dets = yolo_detector.detect(frame)
+    # Draw detections on frame
+    for d in dets:
+        cv2.rectangle(frame, (d.x1, d.y1), (d.x2, d.y2), (255, 255, 0), 2)
+        label = f"cursor {d.confidence:.2f}"
+        cv2.putText(frame, label, (d.x1, d.y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+        cv2.circle(frame, (d.cx, d.cy), 5, (0, 255, 0), -1)
+    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    return Response(content=buf.tobytes(), media_type="image/jpeg")
+
+
+@app.get("/api/yolo/detect_json/{event_id}/{frame_name:path}")
+async def yolo_detect_json(event_id: str, frame_name: str):
+    """Run YOLO on a loss-event frame, return JSON results."""
+    global yolo_detector
+    frame_path = Path(__file__).parent.parent.parent / "data" / "loss_events" / event_id / "frames" / frame_name
+    if not frame_path.exists():
+        return {"error": "Frame not found"}
+    frame = cv2.imread(str(frame_path))
+    if frame is None:
+        return {"error": "Failed to read frame"}
+    # Read timeline for tracked position
+    tracked_x, tracked_y = None, None
+    tl_path = frame_path.parent.parent / "timeline.jsonl"
+    if tl_path.exists():
+        for line in tl_path.read_text().splitlines():
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            if entry.get("frame", "").endswith(frame_name):
+                tracked_x = entry.get("cursor", {}).get("x")
+                tracked_y = entry.get("cursor", {}).get("y")
+                break
+    dets = []
+    if yolo_detector is not None:
+        dets = yolo_detector.detect(frame)
+    return {
+        "frame": frame_name,
+        "event_id": event_id,
+        "detections": [
+            {"x1": int(d.x1), "y1": int(d.y1), "x2": int(d.x2), "y2": int(d.y2),
+             "cx": int(d.cx), "cy": int(d.cy), "confidence": round(float(d.confidence), 4),
+             "inference_ms": round(float(d.inference_ms), 2)}
+            for d in dets
+        ],
+        "tracked_position": {"x": tracked_x, "y": tracked_y} if tracked_x is not None else None,
+        "yolo_loaded": yolo_detector is not None and yolo_detector.loaded,
+    }
+
+
+@app.get("/yolo", response_class=HTMLResponse)
+async def yolo_gallery_page():
+    """YOLO detection gallery — browse loss event frames with YOLO results."""
+    return YOLO_GALLERY_HTML
+
+
+# ── YOLO Gallery HTML ────────────────────────────────────────────────
+
+YOLO_GALLERY_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>YOLO Cursor Detection Gallery</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'JetBrains Mono', monospace; background: #0a0a0f; color: #c8c8d0; }
+.header { background: #101018; padding: 0.6rem 1.5rem; border-bottom: 2px solid #00e5ff;
+    display: flex; justify-content: space-between; align-items: center; }
+.header h1 { color: #00e5ff; font-size: 1.1rem; letter-spacing: 1px; }
+.nav a { color: #888; text-decoration: none; font-size: 0.75rem; margin-left: 1rem; }
+.nav a:hover { color: #fff; }
+
+.layout { display: flex; height: calc(100vh - 50px); }
+.sidebar { width: 240px; overflow-y: auto; border-right: 1px solid #222; padding: 0.5rem; }
+.event-group { margin-bottom: 0.8rem; }
+.event-title { color: #00e5ff; font-size: 0.7rem; padding: 4px 6px; cursor: pointer;
+    border-radius: 3px; }
+.event-title:hover { background: #1a1a2a; }
+.event-title.active { background: #1a2a3a; }
+.frame-list { display: none; padding-left: 8px; }
+.frame-list.open { display: block; }
+.frame-item { font-size: 0.65rem; padding: 3px 6px; cursor: pointer; color: #888;
+    border-radius: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.frame-item:hover { background: #1a1a2a; color: #ccc; }
+.frame-item.selected { background: #1a3a2a; color: #2ecc71; }
+
+.main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.viewer { flex: 1; display: flex; align-items: center; justify-content: center;
+    background: #050508; overflow: hidden; position: relative; }
+.viewer img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.viewer .empty { color: #555; font-size: 0.9rem; }
+.filmstrip { height: 90px; display: flex; gap: 3px; overflow-x: auto;
+    padding: 4px 8px; background: #101018; border-top: 1px solid #222; }
+.filmstrip .thumb { width: 120px; height: 78px; flex-shrink: 0; cursor: pointer;
+    border: 2px solid transparent; border-radius: 3px; overflow: hidden; }
+.filmstrip .thumb:hover { border-color: #555; }
+.filmstrip .thumb.selected { border-color: #00e5ff; }
+.filmstrip .thumb img { width: 100%; height: 100%; object-fit: cover; }
+
+.detail-bar { height: 60px; display: flex; align-items: center; gap: 2rem;
+    padding: 0 1rem; background: #14141f; border-top: 1px solid #222; font-size: 0.7rem; }
+.detail-bar .label { color: #888; }
+.detail-bar .value { color: #fff; margin-left: 4px; }
+.det-conf { color: #2ecc71; font-weight: bold; }
+.det-none { color: #e74c3c; }
+.loading { color: #555; font-style: italic; }
+
+.key-hint { position: fixed; bottom: 8px; right: 12px; font-size: 0.6rem; color: #444; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>YOLO CURSOR DETECTION</h1>
+  <div class="nav">
+    <a href="/">Dashboard</a>
+    <a href="/validation">Validation</a>
+    <a href="/loss_events">Loss Events</a>
+    <a href="/yolo">YOLO Gallery</a>
+    <a href="/profiler">Profiler</a>
+  </div>
+</div>
+
+<div class="layout">
+  <div class="sidebar" id="sidebar"></div>
+  <div class="main">
+    <div class="viewer" id="viewer"><span class="empty">Select a frame from the sidebar</span></div>
+    <div class="filmstrip" id="filmstrip"></div>
+    <div class="detail-bar" id="detail-bar">
+      <span class="loading">No frame selected</span>
+    </div>
+  </div>
+</div>
+
+<div class="key-hint">Arrow keys: prev/next frame</div>
+
+<script>
+var allEvents = [];
+var currentEvent = null;
+var currentFrames = [];
+var currentIdx = -1;
+
+function loadEvents() {
+  fetch('/api/yolo/frames')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      allEvents = data.events || [];
+      renderSidebar();
+      // Auto-select first event if available
+      if (allEvents.length > 0) selectEvent(allEvents[0].event_id);
+    });
+}
+
+function renderSidebar() {
+  var sb = document.getElementById('sidebar');
+  while (sb.firstChild) sb.removeChild(sb.firstChild);
+
+  if (allEvents.length === 0) {
+    var empty = document.createElement('div');
+    empty.style.cssText = 'padding:2rem 1rem;color:#555;font-size:0.75rem;text-align:center';
+    empty.textContent = 'No loss events found';
+    sb.appendChild(empty);
+    return;
+  }
+
+  allEvents.forEach(function(ev) {
+    var group = document.createElement('div');
+    group.className = 'event-group';
+
+    var title = document.createElement('div');
+    title.className = 'event-title';
+    if (currentEvent === ev.event_id) title.className += ' active';
+    title.textContent = ev.event_id + ' (' + ev.count + ')';
+    title.setAttribute('data-eid', ev.event_id);
+    title.addEventListener('click', function() { selectEvent(ev.event_id); });
+    group.appendChild(title);
+
+    var flist = document.createElement('div');
+    flist.className = 'frame-list' + (currentEvent === ev.event_id ? ' open' : '');
+    ev.frames.forEach(function(fname, i) {
+      var item = document.createElement('div');
+      item.className = 'frame-item';
+      if (currentEvent === ev.event_id && currentIdx === i) item.className += ' selected';
+      item.textContent = fname;
+      item.addEventListener('click', function() { selectFrame(ev.event_id, i); });
+      flist.appendChild(item);
+    });
+    group.appendChild(flist);
+    sb.appendChild(group);
+  });
+}
+
+function selectEvent(eid) {
+  var ev = allEvents.find(function(e) { return e.event_id === eid; });
+  if (!ev) return;
+  currentEvent = eid;
+  currentFrames = ev.frames;
+  renderSidebar();
+  renderFilmstrip();
+  selectFrame(eid, 0);
+}
+
+function renderFilmstrip() {
+  var strip = document.getElementById('filmstrip');
+  while (strip.firstChild) strip.removeChild(strip.firstChild);
+  currentFrames.forEach(function(fname, i) {
+    var thumb = document.createElement('div');
+    thumb.className = 'thumb' + (i === currentIdx ? ' selected' : '');
+    var img = document.createElement('img');
+    img.src = '/api/loss_events/' + currentEvent + '/frame/frames/' + fname;
+    img.alt = fname;
+    thumb.appendChild(img);
+    thumb.addEventListener('click', function() { selectFrame(currentEvent, i); });
+    strip.appendChild(thumb);
+  });
+}
+
+function selectFrame(eid, idx) {
+  currentEvent = eid;
+  currentIdx = idx;
+  var fname = currentFrames[idx];
+  if (!fname) return;
+
+  // Update viewer with YOLO-annotated image
+  var viewer = document.getElementById('viewer');
+  while (viewer.firstChild) viewer.removeChild(viewer.firstChild);
+  var img = document.createElement('img');
+  img.src = '/api/yolo/detect/' + eid + '/' + fname;
+  img.alt = 'YOLO detection: ' + fname;
+  viewer.appendChild(img);
+
+  // Update filmstrip selection
+  var thumbs = document.querySelectorAll('.filmstrip .thumb');
+  thumbs.forEach(function(t, i) {
+    t.className = 'thumb' + (i === idx ? ' selected' : '');
+  });
+
+  // Update sidebar selection
+  var items = document.querySelectorAll('.frame-item');
+  items.forEach(function(item) { item.classList.remove('selected'); });
+  var activeItems = document.querySelectorAll('.frame-list.open .frame-item');
+  if (activeItems[idx]) activeItems[idx].classList.add('selected');
+
+  // Fetch JSON results for detail bar
+  var bar = document.getElementById('detail-bar');
+  while (bar.firstChild) bar.removeChild(bar.firstChild);
+  var loadSpan = document.createElement('span');
+  loadSpan.className = 'loading';
+  loadSpan.textContent = 'Running YOLO...';
+  bar.appendChild(loadSpan);
+
+  fetch('/api/yolo/detect_json/' + eid + '/' + fname)
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      renderDetailBar(data, fname);
+    });
+}
+
+function renderDetailBar(data, fname) {
+  var bar = document.getElementById('detail-bar');
+  while (bar.firstChild) bar.removeChild(bar.firstChild);
+
+  // Frame name
+  addDetail(bar, 'Frame', fname);
+
+  var dets = data.detections || [];
+  if (dets.length === 0) {
+    var nodet = document.createElement('span');
+    nodet.className = 'det-none';
+    nodet.textContent = 'No detection';
+    bar.appendChild(nodet);
+  } else {
+    var d = dets[0];
+    addDetail(bar, 'Position', d.cx + ', ' + d.cy);
+
+    var confSpan = document.createElement('span');
+    var confLabel = document.createElement('span');
+    confLabel.className = 'label';
+    confLabel.textContent = 'Conf:';
+    confSpan.appendChild(confLabel);
+    var confVal = document.createElement('span');
+    confVal.className = 'det-conf';
+    confVal.textContent = ' ' + (d.confidence * 100).toFixed(1) + '%';
+    confSpan.appendChild(confVal);
+    bar.appendChild(confSpan);
+
+    addDetail(bar, 'Inference', d.inference_ms.toFixed(1) + 'ms');
+
+    if (data.tracked_position) {
+      var tp = data.tracked_position;
+      var dist = Math.sqrt(Math.pow(d.cx - tp.x, 2) + Math.pow(d.cy - tp.y, 2));
+      var distColor = dist < 30 ? '#2ecc71' : dist < 80 ? '#f39c12' : '#e74c3c';
+      var distSpan = document.createElement('span');
+      var distLabel = document.createElement('span');
+      distLabel.className = 'label';
+      distLabel.textContent = 'vs Tracked:';
+      distSpan.appendChild(distLabel);
+      var distVal = document.createElement('span');
+      distVal.style.color = distColor;
+      distVal.style.marginLeft = '4px';
+      distVal.textContent = dist.toFixed(0) + 'px';
+      distSpan.appendChild(distVal);
+      bar.appendChild(distSpan);
+    }
+  }
+
+  if (dets.length > 1) {
+    addDetail(bar, 'Total', dets.length + ' detections');
+  }
+}
+
+function addDetail(parent, label, value) {
+  var span = document.createElement('span');
+  var lbl = document.createElement('span');
+  lbl.className = 'label';
+  lbl.textContent = label + ':';
+  span.appendChild(lbl);
+  var val = document.createElement('span');
+  val.className = 'value';
+  val.textContent = ' ' + value;
+  span.appendChild(val);
+  parent.appendChild(span);
+}
+
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+    e.preventDefault();
+    if (currentIdx < currentFrames.length - 1) selectFrame(currentEvent, currentIdx + 1);
+  } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (currentIdx > 0) selectFrame(currentEvent, currentIdx - 1);
+  }
+});
+
+loadEvents();
+</script>
+</body>
+</html>"""
+
+
 # ── Loss Events HTML ────────────────────────────────────────────────
 
 LOSS_EVENTS_HTML = r"""<!DOCTYPE html>
@@ -3790,6 +4202,7 @@ body { font-family: 'JetBrains Mono', monospace; background: #0a0a0f; color: #c8
     <a href="/validation">Validation</a>
     <a href="/profiler">Profiler</a>
     <a href="/loss_events">Loss Events</a>
+    <a href="/yolo">YOLO Gallery</a>
   </div>
 </div>
 
@@ -4109,6 +4522,7 @@ DASHBOARD_HTML = r"""
             <a href="/profiler" style="color:#888; text-decoration:none; font-size:0.75rem;">Profiler</a>
             <a href="/validation" style="color:#888; text-decoration:none; font-size:0.75rem;">Validation</a>
             <a href="/loss_events" style="color:#888; text-decoration:none; font-size:0.75rem;">Loss Events</a>
+            <a href="/yolo" style="color:#888; text-decoration:none; font-size:0.75rem;">YOLO Gallery</a>
             <a href="/concepts" style="color:#888; text-decoration:none; font-size:0.75rem;">Concepts</a>
         </div>
         <div class="status">
@@ -4830,6 +5244,7 @@ tr:hover { background: #12121a; }
       <a href="/profiler" class="nav-link">Profiler</a>
       <a href="/validation" class="nav-link active">Validation</a>
       <a href="/loss_events" class="nav-link">Loss Events</a>
+      <a href="/yolo" class="nav-link">YOLO Gallery</a>
     </div>
   </div>
   <div class="actions">
@@ -5389,6 +5804,9 @@ body { font-family: 'JetBrains Mono', 'Fira Code', monospace; background: #0a0a0
     <div style="display:flex; align-items:center;">
         <h1>PIPELINE PROFILER</h1>
         <a href="/">Dashboard</a>
+        <a href="/validation">Validation</a>
+        <a href="/loss_events">Loss Events</a>
+        <a href="/yolo">YOLO Gallery</a>
         <a href="/concepts">Concepts</a>
     </div>
     <div style="font-size:0.75rem; color:#555;" id="prof-status">Connecting...</div>
@@ -5800,7 +6218,7 @@ def init_hardware():
     print("  Commanded movement initialized (jitter→probe→lissajous)")
 
     # YOLO full-screen cursor detector (GPU-accelerated)
-    yolo_detector = YOLOCursorDetector(conf_threshold=0.3)
+    yolo_detector = YOLOCursorDetector(conf_threshold=0.15)
     if yolo_detector.load():
         print("  YOLO cursor detector initialized ("
               + str(yolo_detector.model_path) + ")")

@@ -61,3 +61,13 @@ data/yolo_training/composites/
 
 # Video recordings (large binaries)
 data/recordings/
+
+# Audio recordings and transcripts
+data/audio/
+
+# Scene discovery data
+data/discovery/
+
+# Pretrained models (downloaded on demand)
+yolov8n.pt
+yolo26n.pt

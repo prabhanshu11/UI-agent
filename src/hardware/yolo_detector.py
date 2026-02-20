@@ -178,7 +178,8 @@ class YOLOCursorDetector:
             if r.boxes is None:
                 continue
             for box in r.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                coords = box.xyxy[0].cpu().numpy().astype(int)
+                x1, y1, x2, y2 = int(coords[0]), int(coords[1]), int(coords[2]), int(coords[3])
                 conf_val = float(box.conf[0].cpu())
                 cls_id = int(box.cls[0].cpu())
                 cx = (x1 + x2) // 2
