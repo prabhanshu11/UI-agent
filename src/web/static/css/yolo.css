@@ -1,0 +1,52 @@
+/* yolo.css — YOLO Gallery page styles */
+.header { border-bottom: 2px solid #00e5ff; }
+.header h1 { color: #00e5ff; }
+
+.layout { display: flex; height: calc(100vh - 50px); }
+.sidebar { width: 240px; overflow-y: auto; border-right: 1px solid #222; padding: 0.5rem; }
+.event-group { margin-bottom: 0.8rem; }
+.event-title {
+    color: #00e5ff; font-size: 0.7rem; padding: 4px 6px;
+    cursor: pointer; border-radius: 3px;
+}
+.event-title:hover { background: #1a1a2a; }
+.event-title.active { background: #1a2a3a; }
+.frame-list { display: none; padding-left: 8px; }
+.frame-list.open { display: block; }
+.frame-item {
+    font-size: 0.65rem; padding: 3px 6px; cursor: pointer; color: #888;
+    border-radius: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.frame-item:hover { background: #1a1a2a; color: #ccc; }
+.frame-item.selected { background: #1a3a2a; color: #2ecc71; }
+
+.main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.viewer {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    background: #050508; overflow: hidden; position: relative;
+}
+.viewer img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.viewer .empty { color: #555; font-size: 0.9rem; }
+.filmstrip {
+    height: 90px; display: flex; gap: 3px; overflow-x: auto;
+    padding: 4px 8px; background: #101018; border-top: 1px solid #222;
+}
+.filmstrip .thumb {
+    width: 120px; height: 78px; flex-shrink: 0; cursor: pointer;
+    border: 2px solid transparent; border-radius: 3px; overflow: hidden;
+}
+.filmstrip .thumb:hover { border-color: #555; }
+.filmstrip .thumb.selected { border-color: #00e5ff; }
+.filmstrip .thumb img { width: 100%; height: 100%; object-fit: cover; }
+
+.detail-bar {
+    height: 60px; display: flex; align-items: center; gap: 2rem;
+    padding: 0 1rem; background: #14141f; border-top: 1px solid #222; font-size: 0.7rem;
+}
+.detail-bar .label { color: #888; }
+.detail-bar .value { color: #fff; margin-left: 4px; }
+.det-conf { color: #2ecc71; font-weight: bold; }
+.det-none { color: #e74c3c; }
+.loading { color: #555; font-style: italic; }
+
+.key-hint { position: fixed; bottom: 8px; right: 12px; font-size: 0.6rem; color: #444; }

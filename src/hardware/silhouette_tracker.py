@@ -39,6 +39,17 @@ class TrackResult:
     latency_ms: float = 0.0  # Tracking latency for this frame
 
 
+@dataclass
+class CandidateBlob:
+    """A motion candidate region for YOLO crop validation."""
+
+    x: int                  # Full-frame center X
+    y: int                  # Full-frame center Y
+    bbox: tuple[int, int, int, int]  # (x1, y1, x2, y2) full-frame
+    area: int               # Contour area in pixels
+    score: float            # Shape-likeness score
+
+
 class SilhouetteTracker:
     """Fast ROI-constrained cursor tracking.
 
@@ -182,6 +193,108 @@ class SilhouetteTracker:
         x1 = min(w, last_x + half)
         y1 = min(h, last_y + half)
         return (x0, y0, x1, y1)
+
+    def get_candidates(
+        self,
+        frame: np.ndarray,
+        last_x: int,
+        last_y: int,
+    ) -> list[CandidateBlob]:
+        """Return all motion candidates in the ROI for YOLO crop validation.
+
+        Unlike track() which returns only the best blob, this returns ALL blobs
+        passing the size/shape filters. Each candidate includes a full-frame
+        bounding box suitable for crop extraction.
+
+        Args:
+            frame: Current full frame (H, W, 3) RGB or (H, W) grayscale.
+            last_x: Last known cursor X in full-frame coordinates.
+            last_y: Last known cursor Y in full-frame coordinates.
+
+        Returns:
+            List of CandidateBlob, sorted by score (best first).
+        """
+        if len(frame.shape) == 3:
+            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = frame
+
+        roi_curr, x0, y0 = self._extract_roi(gray, last_x, last_y)
+
+        if self._prev_gray is None:
+            return []
+
+        roi_prev, _, _ = self._extract_roi(self._prev_gray, last_x, last_y)
+
+        rh = min(roi_curr.shape[0], roi_prev.shape[0])
+        rw = min(roi_curr.shape[1], roi_prev.shape[1])
+        if rh < 20 or rw < 20:
+            return []
+
+        curr = roi_curr[:rh, :rw]
+        prev = roi_prev[:rh, :rw]
+
+        diff = cv2.absdiff(curr, prev)
+        _, mask = cv2.threshold(diff, self.MOTION_THRESHOLD, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if not contours:
+            return []
+
+        candidates = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < self.MIN_BLOB_PIXELS or area > self.MAX_BLOB_PIXELS:
+                continue
+
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            if bw > 100 or bh > 100:
+                continue
+            if max(bw, bh) > 0:
+                aspect = min(bw, bh) / max(bw, bh)
+                if aspect < 0.15:
+                    continue
+
+            M = cv2.moments(cnt)
+            if M["m00"] == 0:
+                continue
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+
+            score = 1.0
+            max_dim = max(bw, bh)
+            if max_dim < 8:
+                score *= 0.3
+            elif max_dim > 80:
+                score *= 0.5
+
+            # Shape scoring via recognizer
+            if self.recognizer.cursor_template is not None:
+                half = PATCH_SIZE // 2
+                if (cx >= half and cy >= half and
+                        cx + half <= rw and cy + half <= rh):
+                    patch = curr[cy - half:cy + half, cx - half:cx + half]
+                    if patch.shape == (PATCH_SIZE, PATCH_SIZE):
+                        shape_score = self.recognizer.score_blob_shape(patch)
+                        score *= (0.5 + shape_score)
+
+            # Full-frame bounding box with padding for YOLO crop
+            pad = 32
+            fx1 = max(0, x0 + bx - pad)
+            fy1 = max(0, y0 + by - pad)
+            fx2 = x0 + bx + bw + pad
+            fy2 = y0 + by + bh + pad
+
+            candidates.append(CandidateBlob(
+                x=x0 + cx,
+                y=y0 + cy,
+                bbox=(fx1, fy1, fx2, fy2),
+                area=area,
+                score=score,
+            ))
+
+        candidates.sort(key=lambda c: c.score, reverse=True)
+        return candidates
 
     def _extract_roi(
         self, gray: np.ndarray, cx: int, cy: int,

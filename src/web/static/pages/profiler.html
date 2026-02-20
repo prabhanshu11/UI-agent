@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>KVM Pipeline Profiler</title>
+<link rel="stylesheet" href="/static/css/base.css">
+<link rel="stylesheet" href="/static/css/profiler.css">
+</head>
+<body>
+<div class="header">
+    <div style="display:flex; align-items:center;">
+        <h1>PIPELINE PROFILER</h1>
+        <a href="/" class="nav-link-plain">Dashboard</a>
+        <a href="/validation" class="nav-link-plain">Validation</a>
+        <a href="/loss_events" class="nav-link-plain">Loss Events</a>
+        <a href="/yolo" class="nav-link-plain">YOLO Gallery</a>
+        <a href="/concepts" class="nav-link-plain">Concepts</a>
+    </div>
+    <div style="font-size:0.75rem; color:#555;" id="prof-status">Connecting...</div>
+</div>
+<div class="main">
+    <!-- UTC Clock Bar -->
+    <div class="utc-bar">
+        <div><div class="utc-lbl">Browser UTC</div><div class="utc-val" id="browser-utc">--:--:--.---</div></div>
+        <div><div class="utc-lbl">Server UTC</div><div class="utc-val" id="server-utc">--:--:--.---</div></div>
+        <div><div class="utc-lbl">Clock Delta</div><div class="utc-delta" id="utc-delta">--ms</div></div>
+        <div style="margin-left:auto;"><div class="utc-lbl">Daemon FPS</div><div class="metric-val" id="daemon-fps">--</div></div>
+        <div><div class="utc-lbl">Blobs</div><div class="metric-val" id="blob-count">--</div></div>
+        <div><div class="utc-lbl">Frame #</div><div class="metric-val" id="frame-count" style="color:#555">--</div></div>
+    </div>
+
+    <!-- Timeline Scrubber (video editor style) -->
+    <div class="row full">
+        <div class="card">
+            <div class="card-title">Pipeline Timeline (per-frame, scrub to inspect)</div>
+            <div class="timeline-container" id="timeline-container">
+                <div class="timeline-track" style="top:0" data-stage="decode">
+                    <span class="track-label">JPEG Decode</span>
+                </div>
+                <div class="timeline-track" style="top:24px" data-stage="track">
+                    <span class="track-label">Sil. Track</span>
+                </div>
+                <div class="timeline-track" style="top:48px" data-stage="overlay">
+                    <span class="track-label">Overlay Draw</span>
+                </div>
+                <div class="timeline-track" style="top:72px" data-stage="encode">
+                    <span class="track-label">JPEG Encode</span>
+                </div>
+                <div class="timeline-track" style="top:96px" data-stage="total">
+                    <span class="track-label">Frame Total</span>
+                </div>
+                <div class="timeline-track" style="top:120px" data-stage="http">
+                    <span class="track-label">HTTP Round-Trip</span>
+                </div>
+                <div class="playhead" id="playhead" style="left:0"></div>
+                <div class="timeline-tooltip" id="timeline-tooltip"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Pipeline Waterfall (current frame) -->
+    <div class="row full">
+        <div class="card">
+            <div class="card-title">Pipeline Waterfall (current frame)</div>
+            <div class="wf-row"><span class="wf-label">JPEG Decode</span><div class="wf-bar-wrap"><div class="wf-bar decode" id="bar-decode"></div></div><span class="wf-val" id="val-decode">&mdash;</span></div>
+            <div class="wf-row"><span class="wf-label">Sil. Track</span><div class="wf-bar-wrap"><div class="wf-bar track" id="bar-track"></div></div><span class="wf-val" id="val-track">&mdash;</span></div>
+            <div class="wf-row"><span class="wf-label">Overlay Draw</span><div class="wf-bar-wrap"><div class="wf-bar overlay" id="bar-overlay"></div></div><span class="wf-val" id="val-overlay">&mdash;</span></div>
+            <div class="wf-row"><span class="wf-label">JPEG Encode</span><div class="wf-bar-wrap"><div class="wf-bar encode" id="bar-encode"></div></div><span class="wf-val" id="val-encode">&mdash;</span></div>
+            <div class="wf-sep"></div>
+            <div class="wf-row"><span class="wf-label">Frame Total</span><div class="wf-bar-wrap"><div class="wf-bar total" id="bar-total"></div></div><span class="wf-val" id="val-total">&mdash;</span></div>
+            <div class="wf-row"><span class="wf-label">HTTP Round-Trip</span><div class="wf-bar-wrap"><div class="wf-bar http" id="bar-http"></div></div><span class="wf-val" id="val-http">&mdash;</span></div>
+        </div>
+    </div>
+
+    <!-- 3-Minute Test + Sparkline + Metrics -->
+    <div class="row triple">
+        <div class="card">
+            <div class="card-title">3-Minute Profiling Test</div>
+            <div style="display:flex; gap:0.5rem; margin-bottom:0.6rem;">
+                <button class="prof-btn primary" id="btn-start" onclick="startTest()">Start 3m Test</button>
+                <button class="prof-btn danger" id="btn-stop" onclick="stopTest()" disabled>Stop</button>
+            </div>
+            <div id="test-status" style="font-size:0.8rem; color:#555; margin-bottom:0.3rem;">Idle</div>
+            <div id="test-progress" style="font-size:0.75rem; color:#444; margin-bottom:0.5rem;"></div>
+            <table class="results-table">
+                <thead><tr><th>Stage</th><th>Min</th><th>Avg</th><th>Max</th><th>P95</th></tr></thead>
+                <tbody id="results-body"><tr><td colspan="5" style="color:#333; text-align:center;">No test data</td></tr></tbody>
+            </table>
+        </div>
+        <div class="card">
+            <div class="card-title">Frame Total (last 100 frames)</div>
+            <canvas id="spark-canvas" class="spark-canvas"></canvas>
+            <div style="display:flex; justify-content:space-between; font-size:0.65rem; color:#444; margin-top:4px;">
+                <span id="spark-min">min: --</span>
+                <span id="spark-avg">avg: --</span>
+                <span id="spark-max">max: --</span>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-title">Backend Metrics</div>
+            <div class="metric-row"><span class="metric-label">Tracking Method</span><span class="metric-val" id="m-method">--</span></div>
+            <div class="metric-row"><span class="metric-label">Tracking Hz</span><span class="metric-val" id="m-hz">--</span></div>
+            <div class="metric-row"><span class="metric-label">Confidence</span><span class="metric-val" id="m-conf">--</span></div>
+            <div class="metric-row"><span class="metric-label">Misses</span><span class="metric-val" id="m-misses">--</span></div>
+            <div class="metric-row"><span class="metric-label">Cursor Age</span><span class="metric-val" id="m-age">--</span></div>
+            <div class="metric-row"><span class="metric-label">Validated</span><span class="metric-val" id="m-validated">--</span></div>
+            <div class="metric-row"><span class="metric-label">Daemon Timestamp</span><span class="metric-val" id="m-ts" style="font-size:0.65rem; color:#555">--</span></div>
+        </div>
+    </div>
+
+    <!-- Live Frame Preview + UTC Latency Measurement -->
+    <div class="row">
+        <div class="card">
+            <div class="card-title">Live Frame Preview</div>
+            <img id="preview-frame" class="preview-img" alt="Preview">
+            <div class="preview-overlay">
+                Cursor: <span id="pv-cursor">(?, ?)</span> |
+                Method: <span id="pv-method">--</span> |
+                Age: <span id="pv-age">--</span>s
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-title">UTC Latency Measurement</div>
+            <div style="font-size:0.7rem; color:#555; margin-bottom:0.6rem;">
+                Open a UTC ms clock on the target machine, then measure.
+                Claude Vision OCR reads the displayed time.
+            </div>
+            <div style="display:flex; gap:0.5rem; align-items:center; margin-bottom:0.5rem;">
+                <button class="prof-btn primary" id="btn-measure" onclick="measureLatency()">Measure</button>
+                <span id="measure-status" style="font-size:0.75rem; color:#555;"></span>
+            </div>
+            <div id="measure-result" style="font-size:0.75rem; white-space:pre-wrap;"></div>
+        </div>
+    </div>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script src="/static/js/profiler.js"></script>
+</body>
+</html>

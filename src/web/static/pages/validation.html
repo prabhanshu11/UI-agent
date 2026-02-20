@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Cursor Sample Validation</title>
+<link rel="stylesheet" href="/static/css/base.css">
+<link rel="stylesheet" href="/static/css/validation.css">
+</head>
+<body>
+<div class="header">
+  <div style="display:flex;align-items:center;gap:16px">
+    <h1>CURSOR SAMPLE VALIDATION</h1>
+    <div class="nav">
+      <a href="/" class="nav-link">Dashboard</a>
+      <a href="/profiler" class="nav-link">Profiler</a>
+      <a href="/validation" class="nav-link active">Validation</a>
+      <a href="/loss_events" class="nav-link">Loss Events</a>
+      <a href="/yolo" class="nav-link">YOLO Gallery</a>
+      <a href="/models" class="nav-link">Models</a>
+    </div>
+  </div>
+  <div class="actions">
+    <button class="info-toggle" onclick="toggleInfo()">? Info</button>
+    <button class="btn btn-retrain" onclick="retrain()">Retrain CNN</button>
+  </div>
+</div>
+
+<div class="info-bar" id="info-bar">
+<div class="info-bar-inner">
+  <div>
+    <h3>What is this page</h3>
+    These are 64x64 grayscale patches extracted around where the system thinks the cursor is.
+    Each patch is fed through <b>TinyCursorNet</b> (14K param CNN) to classify: <b>cursor</b> or <b>not cursor</b>.<br><br>
+    <b>Your job</b>: review samples the CNN gets wrong, tag features, and retrain.
+    The CNN improves only from data you label here.
+    <ul>
+      <li><b>OK</b> — CNN's label is correct for this patch</li>
+      <li><b>X</b> (Wrong) — CNN got it backwards (pos is actually neg, or vice versa)</li>
+      <li><b>Del</b> — bad sample, remove from training set</li>
+    </ul>
+  </div>
+  <div>
+    <h3>Columns &amp; Filters</h3>
+    <ul>
+      <li><b>Label</b>: <code>pos</code> = cursor was here, <code>neg</code> = no cursor at this position</li>
+      <li><b>Type</b>: cursor shape when captured (arrow, hand, I-beam) — only from Claude Vision samples</li>
+      <li><b>Source</b>: how the patch was collected:<br>
+        <code>motion_track</code> — from live tracking loop<br>
+        <code>claude_vision</code> — Vision-confirmed position<br>
+        <code>ground_truth</code> — manually verified</li>
+      <li><b>CNN Conf</b>: model's confidence this patch contains a cursor (0-1). Green &gt;0.7, yellow 0.3-0.7, red &lt;0.3</li>
+      <li><b>Priority</b>: review order — Needs Review (-1) &gt; CNN Disagrees (0) &gt; confusing (1) &gt; uncertain (2) &gt; Vision (3) &gt; easy (4) &gt; reviewed (99)</li>
+    </ul>
+  </div>
+  <div>
+    <h3>Feature Tags (right columns)</h3>
+    Tags are <b>independent</b> — a sample can be "ok" AND "confusing" AND "partial" simultaneously.
+    Click a chip to set it, click again to clear. Saves instantly.
+    <ul>
+      <li><b>quality</b> — ok / wrong / unsure (your judgment of the label)</li>
+      <li><b>confusing</b> — yes / no (would a human struggle to identify the cursor here?)</li>
+      <li><b>cursor_type</b> — arrow / hand / ibeam / busy / crosshair / move</li>
+      <li><b>visibility</b> — full / partial / hidden / offscreen</li>
+      <li><b>background</b> — clean / noisy / animated / textured</li>
+    </ul>
+    New columns appear automatically when you tag with custom keys via the API.
+    <br><br>
+    <h3>Keyboard Shortcuts</h3>
+    <code>J/K</code> or arrows: navigate &nbsp; <code>1</code>: OK &nbsp; <code>2</code>: Wrong &nbsp; <code>3</code>: Confusing &nbsp; <code>4</code>: Del &nbsp; <code>Space</code>: open patch (click to annotate cursor tip)
+  </div>
+</div>
+</div>
+
+<div class="controls">
+  <span class="ctrl-label">Filter</span>
+  <button class="filter-btn active" data-filter="all" onclick="setFilter('all')" title="All samples in the training set">All <span class="filter-count" id="cnt-all"></span></button>
+  <button class="filter-btn" data-filter="unreviewed" onclick="setFilter('unreviewed')" title="Samples you haven't reviewed yet">Unreviewed <span class="filter-count" id="cnt-unreviewed"></span></button>
+  <button class="filter-btn" data-filter="reviewed" onclick="setFilter('reviewed')" title="Samples you've already tagged">Reviewed <span class="filter-count" id="cnt-reviewed"></span></button>
+  <button class="filter-btn" data-filter="claude" onclick="setFilter('claude')" title="Patches from Claude Vision detections">Claude Vision <span class="filter-count" id="cnt-claude"></span></button>
+  <button class="filter-btn" data-filter="disagreement" onclick="setFilter('disagreement')" title="CNN prediction differs from assigned label">CNN Disagrees <span class="filter-count" id="cnt-disagreement"></span></button>
+  <button class="filter-btn" data-filter="needs_review" onclick="setFilter('needs_review')" title="Human-captured samples awaiting ground truth tagging" style="border-color:#FF5722">Needs Review <span class="filter-count" id="cnt-needs_review" style="color:#FF5722"></span></button>
+  <div class="ctrl-sep"></div>
+  <span class="ctrl-label">Label</span>
+  <select class="label-select" onchange="setLabel(this.value)">
+    <option value="all">All</option>
+    <option value="pos">Positive</option>
+    <option value="neg">Negative</option>
+  </select>
+  <div class="ctrl-sep"></div>
+  <span class="ctrl-label">Source</span>
+  <select class="source-select" id="source-select" onchange="setSource(this.value)">
+    <option value="all">All Sources</option>
+  </select>
+  <div class="ctrl-sep"></div>
+  <span class="ctrl-label">Sort</span>
+  <select class="sort-select" onchange="setSort(this.value)">
+    <option value="priority">Priority (review first)</option>
+    <option value="confidence_asc">CNN Conf (low first)</option>
+    <option value="confidence_desc">CNN Conf (high first)</option>
+    <option value="source">Source</option>
+    <option value="recent">Recent</option>
+  </select>
+  <div class="pagination">
+    <button class="btn" onclick="prevPage()">&laquo;</button>
+    <span id="page-info">Page 1</span>
+    <button class="btn" onclick="nextPage()">&raquo;</button>
+  </div>
+</div>
+<div class="stats-bar" id="stats-bar">
+  <span>Loading stats...</span>
+</div>
+<table id="samples-table">
+  <thead>
+    <tr>
+      <th>Patch</th>
+      <th onclick="setSort('source')">Label</th>
+      <th>Type</th>
+      <th onclick="setSort('source')">Source</th>
+      <th onclick="setSort(currentSort==='confidence_asc'?'confidence_desc':'confidence_asc')">CNN Conf</th>
+      <th onclick="setSort('priority')">Priority</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody id="samples-body"></tbody>
+</table>
+<div class="toast" id="toast"></div>
+<div class="preview-overlay" id="preview-overlay">
+  <div class="preview-container" id="preview-container">
+    <img id="preview-img">
+    <div class="tip-marker" id="tip-marker" style="display:none"></div>
+  </div>
+  <div class="preview-info" id="preview-info">Click on the <em>cursor tip</em> to annotate (saves immediately). ESC to close.</div>
+</div>
+<div class="keyboard-hint">J/K: next/prev | 1: OK | 2: Wrong | 3: Confusing | 4: Del | Space: annotate tip</div>
+
+<script src="/static/js/validation.js"></script>
+</body>
+</html>

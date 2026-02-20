@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>YOLO Cursor Detection Gallery</title>
+<link rel="stylesheet" href="/static/css/base.css">
+<link rel="stylesheet" href="/static/css/yolo.css">
+</head>
+<body>
+<div class="header">
+  <h1>YOLO CURSOR DETECTION</h1>
+  <div class="nav">
+    <a href="/">Dashboard</a>
+    <a href="/validation">Validation</a>
+    <a href="/loss_events">Loss Events</a>
+    <a href="/yolo">YOLO Gallery</a>
+    <a href="/profiler">Profiler</a>
+  </div>
+</div>
+
+<div class="layout">
+  <div class="sidebar" id="sidebar"></div>
+  <div class="main">
+    <div class="viewer" id="viewer"><span class="empty">Select a frame from the sidebar</span></div>
+    <div class="filmstrip" id="filmstrip"></div>
+    <div class="detail-bar" id="detail-bar">
+      <span class="loading">No frame selected</span>
+    </div>
+  </div>
+</div>
+
+<div class="key-hint">Arrow keys: prev/next frame</div>
+
+<script src="/static/js/common.js"></script>
+<script src="/static/js/yolo.js"></script>
+</body>
+</html>

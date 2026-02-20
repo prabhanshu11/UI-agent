@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Star Trek Computer Concepts</title>
+<link rel="stylesheet" href="/static/css/base.css">
+<style>
+.header { border-bottom: 2px solid #ff4444; }
+.header h1 { color: #ff4444; }
+.content { max-width: 960px; margin: 2rem auto; padding: 0 2rem; }
+pre { white-space: pre-wrap; word-wrap: break-word; font-size: 0.82rem; line-height: 1.7; }
+</style>
+</head>
+<body>
+<div class="header">
+    <div style="display:flex; align-items:center;">
+        <h1>STAR TREK COMPUTER &mdash; CONCEPTS</h1>
+        <a href="/" class="nav-link-plain">Dashboard</a>
+        <a href="/profiler" class="nav-link-plain">Profiler</a>
+    </div>
+</div>
+<div class="content"><pre id="concepts-text">Loading...</pre></div>
+<script>
+fetch('/api/concepts_text')
+    .then(function(r) { return r.text(); })
+    .then(function(t) { document.getElementById('concepts-text').textContent = t; })
+    .catch(function() { document.getElementById('concepts-text').textContent = 'Failed to load concepts.'; });
+</script>
+</body>
+</html>

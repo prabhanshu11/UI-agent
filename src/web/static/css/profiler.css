@@ -1,0 +1,99 @@
+/* profiler.css — Pipeline profiler with timeline scrubber */
+.header { border-bottom: 2px solid #3498db; }
+.header h1 { color: #3498db; }
+
+.main { padding: 1rem; max-width: 1400px; margin: 0 auto; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1rem; }
+.row.full { grid-template-columns: 1fr; }
+.row.triple { grid-template-columns: 1fr 1fr 1fr; }
+.card-title { color: #3498db; }
+
+/* UTC bar */
+.utc-bar {
+    display: flex; gap: 2rem; align-items: center; margin-bottom: 1rem;
+    background: #101018; border: 1px solid #1a1a25; border-radius: 8px; padding: 0.8rem 1rem;
+}
+.utc-lbl { color: #555; font-size: 0.6rem; text-transform: uppercase; }
+.utc-val { color: #2ecc71; font-size: 1.1rem; font-variant-numeric: tabular-nums; }
+.utc-delta { color: #f1c40f; font-size: 1.1rem; }
+
+/* Waterfall bars */
+.wf-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.wf-label { width: 120px; font-size: 0.75rem; color: #888; text-align: right; flex-shrink: 0; }
+.wf-bar-wrap { flex: 1; height: 28px; background: #0a0a12; border-radius: 4px; overflow: hidden; }
+.wf-bar { height: 100%; border-radius: 4px; transition: width 0.2s; min-width: 2px; }
+.wf-bar.decode { background: #3498db; }
+.wf-bar.track { background: #2ecc71; }
+.wf-bar.overlay { background: #9b59b6; }
+.wf-bar.encode { background: #e67e22; }
+.wf-bar.total { background: #e74c3c; }
+.wf-bar.http { background: #f1c40f; }
+.wf-val { width: 80px; font-size: 0.8rem; color: #aaa; font-variant-numeric: tabular-nums; }
+.wf-sep { border-top: 1px dashed #333; margin: 6px 0; }
+
+/* Timeline scrubber */
+.timeline-container {
+    position: relative; height: 180px;
+    background: #0a0a12; border-radius: 4px; overflow: hidden;
+    cursor: crosshair;
+}
+.timeline-track {
+    position: absolute; left: 0; right: 0; height: 24px;
+    border-bottom: 1px solid #1a1a25;
+}
+.timeline-track .track-label {
+    position: absolute; left: 4px; top: 2px;
+    font-size: 0.55rem; color: #555; text-transform: uppercase; letter-spacing: 1px;
+}
+.timeline-block {
+    position: absolute; height: 20px; top: 2px; border-radius: 2px;
+    min-width: 2px; opacity: 0.8;
+}
+.timeline-block:hover { opacity: 1; }
+.playhead {
+    position: absolute; top: 0; bottom: 0; width: 2px;
+    background: #fff; z-index: 10; pointer-events: none;
+}
+.playhead::after {
+    content: ''; position: absolute; top: -4px; left: -4px;
+    width: 10px; height: 10px; background: #fff;
+    border-radius: 50%;
+}
+.timeline-tooltip {
+    position: absolute; bottom: 4px; background: #1a1a25;
+    border: 1px solid #333; border-radius: 4px; padding: 4px 8px;
+    font-size: 0.65rem; color: #ccc; pointer-events: none;
+    white-space: nowrap; z-index: 20; display: none;
+}
+
+/* Buttons */
+.prof-btn {
+    padding: 6px 16px; border: 1px solid #333; border-radius: 4px;
+    background: #1a1a25; color: #ccc; font-family: inherit; font-size: 0.8rem; cursor: pointer;
+}
+.prof-btn:hover { background: #252530; }
+.prof-btn.primary { border-color: #3498db; color: #3498db; }
+.prof-btn.danger { border-color: #e74c3c; color: #e74c3c; }
+.prof-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Results table */
+.results-table { width: 100%; font-size: 0.75rem; border-collapse: collapse; margin-top: 0.6rem; }
+.results-table th { text-align: right; color: #555; font-weight: normal; padding: 4px 8px; border-bottom: 1px solid #1a1a25; }
+.results-table th:first-child { text-align: left; }
+.results-table td { text-align: right; padding: 4px 8px; font-variant-numeric: tabular-nums; }
+.results-table td:first-child { text-align: left; color: #888; }
+
+/* Metrics */
+.metric-row { display: flex; justify-content: space-between; padding: 4px 0; font-size: 0.8rem; }
+.metric-label { color: #666; }
+.metric-val { font-weight: 600; color: #ccc; font-variant-numeric: tabular-nums; }
+.metric-val.good { color: #2ecc71; }
+.metric-val.warn { color: #f1c40f; }
+.metric-val.bad { color: #e74c3c; }
+
+/* Sparkline */
+.spark-canvas { width: 100%; height: 80px; background: #0a0a12; border-radius: 4px; }
+
+/* Preview */
+.preview-img { max-width: 100%; border-radius: 4px; background: #000; display: block; }
+.preview-overlay { font-size: 0.7rem; color: #888; margin-top: 4px; }

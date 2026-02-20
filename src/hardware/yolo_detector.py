@@ -195,6 +195,89 @@ class YOLOCursorDetector:
         detections.sort(key=lambda d: d.confidence, reverse=True)
         return detections
 
+    def detect_crop(
+        self,
+        frame: np.ndarray,
+        bbox: tuple[int, int, int, int],
+        conf_threshold: Optional[float] = None,
+    ) -> list[YOLODetection]:
+        """Run YOLO on a crop region, returning detections in full-frame coords.
+
+        Extracts the crop from (x1, y1, x2, y2), pads to square, runs inference,
+        then maps detection coordinates back to the full frame.
+
+        Args:
+            frame: Full frame (H, W, 3).
+            bbox: (x1, y1, x2, y2) crop region in frame coordinates.
+            conf_threshold: Override default confidence threshold.
+
+        Returns:
+            List of YOLODetection with coordinates in full-frame space.
+        """
+        if not self._loaded or self._model is None:
+            return []
+
+        x1, y1, x2, y2 = bbox
+        h, w = frame.shape[:2]
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(w, x2)
+        y2 = min(h, y2)
+
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return []
+
+        # Pad to square for better YOLO performance
+        ch, cw = crop.shape[:2]
+        side = max(ch, cw, 64)  # minimum 64px
+        square = np.zeros((side, side, 3), dtype=crop.dtype)
+        oy = (side - ch) // 2
+        ox = (side - cw) // 2
+        square[oy:oy + ch, ox:ox + cw] = crop
+
+        conf = conf_threshold or self.conf_threshold
+        t0 = time.monotonic()
+
+        results = self._model.predict(
+            square,
+            conf=conf,
+            device=self.device,
+            imgsz=max(64, min(self.imgsz, side)),
+            verbose=False,
+        )
+
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        self._last_inference_ms = elapsed_ms
+        self._total_inference_ms += elapsed_ms
+        self._inference_count += 1
+
+        detections = []
+        for r in results:
+            if r.boxes is None:
+                continue
+            for box in r.boxes:
+                coords = box.xyxy[0].cpu().numpy().astype(int)
+                # Map from square coords → crop coords → full-frame coords
+                dx1 = int(coords[0]) - ox + x1
+                dy1 = int(coords[1]) - oy + y1
+                dx2 = int(coords[2]) - ox + x1
+                dy2 = int(coords[3]) - oy + y1
+                conf_val = float(box.conf[0].cpu())
+                cls_id = int(box.cls[0].cpu())
+                cx = (dx1 + dx2) // 2
+                cy = (dy1 + dy2) // 2
+                detections.append(YOLODetection(
+                    x1=dx1, y1=dy1, x2=dx2, y2=dy2,
+                    cx=cx, cy=cy,
+                    confidence=conf_val,
+                    class_id=cls_id,
+                    inference_ms=elapsed_ms,
+                ))
+
+        detections.sort(key=lambda d: d.confidence, reverse=True)
+        return detections
+
     def benchmark(self, frame: np.ndarray, n_warmup: int = 5, n_runs: int = 20) -> dict:
         """Benchmark inference speed on a sample frame.
 

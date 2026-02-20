@@ -1,0 +1,85 @@
+/* validation.css — Cursor sample validation page */
+.header { border-bottom: 1px solid #222; }
+.header h1 { font-size: 16px; color: #ff4444; }
+.header .nav { display: flex; gap: 6px; }
+.nav-link { padding: 5px 12px; border: 1px solid #333; background: #1a1a24; color: #888; text-decoration: none; font-size: 11px; border-radius: 4px; }
+.nav-link:hover { background: #252530; color: #ccc; }
+.nav-link.active { border-color: #ff4444; color: #ff4444; }
+.header .actions { display: flex; gap: 8px; }
+.btn { padding: 6px 14px; border: 1px solid #333; background: #1a1a24; color: #e0e0e0; cursor: pointer; font-size: 12px; font-family: inherit; border-radius: 4px; }
+.btn:hover { background: #252530; }
+.btn-retrain { border-color: #ff4444; color: #ff4444; }
+.btn-retrain:hover { background: #ff444420; }
+.controls { padding: 10px 20px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid #1a1a24; }
+.filter-btn { padding: 4px 10px; border: 1px solid #333; background: transparent; color: #888; cursor: pointer; font-size: 11px; font-family: inherit; border-radius: 3px; }
+.filter-btn.active { border-color: #ff4444; color: #ff4444; background: #ff444410; }
+.filter-count { font-size: 9px; color: #555; margin-left: 2px; }
+.filter-btn.active .filter-count { color: #ff444488; }
+.sort-select, .source-select, .label-select { padding: 4px 8px; border: 1px solid #333; background: #12121a; color: #ccc; font-size: 11px; font-family: inherit; border-radius: 3px; }
+.ctrl-label { font-size: 10px; color: #555; text-transform: uppercase; letter-spacing: 1px; margin-right: 2px; }
+.ctrl-sep { width: 1px; height: 20px; background: #222; margin: 0 4px; }
+.pagination { display: flex; gap: 8px; align-items: center; margin-left: auto; font-size: 11px; color: #666; }
+.pagination .btn { padding: 3px 8px; font-size: 11px; }
+.stats-bar { padding: 8px 20px; background: #0d0d14; font-size: 11px; color: #666; display: flex; gap: 16px; border-bottom: 1px solid #1a1a24; flex-wrap: wrap; }
+.stats-bar span { color: #888; }
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; padding: 8px 12px; font-size: 11px; color: #666; background: #0d0d14; border-bottom: 1px solid #222; cursor: pointer; }
+th:hover { color: #aaa; }
+th.sorted { color: #ff4444; }
+td { padding: 8px 12px; border-bottom: 1px solid #1a1a24; vertical-align: middle; font-size: 12px; }
+tr:hover { background: #12121a; }
+.patch-img { width: 96px; height: 96px; image-rendering: pixelated; border: 1px solid #333; border-radius: 2px; cursor: pointer; }
+.patch-img:hover { border-color: #ff4444; }
+.label-pos { color: #4CAF50; font-weight: bold; }
+.label-neg { color: #ff5252; font-weight: bold; }
+.source { color: #888; font-size: 11px; }
+.source.claude { color: #7c4dff; }
+.source.ground-truth { color: #2ecc71; }
+.confusing-badge { color: #FF9800; font-size: 10px; margin-left: 4px; }
+.disagree-badge { color: #ff5252; font-size: 10px; margin-left: 4px; }
+.conf-bar { width: 60px; height: 6px; background: #1a1a24; border-radius: 3px; display: inline-block; vertical-align: middle; margin-right: 6px; }
+.conf-fill { height: 100%; border-radius: 3px; }
+.conf-high { background: #4CAF50; }
+.conf-mid { background: #FF9800; }
+.conf-low { background: #ff5252; }
+.actions-cell { display: flex; gap: 4px; }
+.btn-ok { border-color: #4CAF50; color: #4CAF50; }
+.btn-ok:hover { background: #4CAF5020; }
+.btn-wrong { border-color: #FF9800; color: #FF9800; }
+.btn-wrong:hover { background: #FF980020; }
+.btn-confuse { border-color: #9C27B0; color: #9C27B0; }
+.btn-confuse:hover { background: #9C27B020; }
+.btn-del { border-color: #ff5252; color: #ff5252; }
+.btn-del:hover { background: #ff525220; }
+.tag-cell { white-space: nowrap; }
+.tag-chip { display: inline-block; padding: 1px 5px; margin: 1px; border: 1px solid #444; border-radius: 8px; font-size: 0.6rem; cursor: pointer; color: #888; transition: all 0.15s; }
+.tag-chip:hover { color: #fff; background: #ffffff10; }
+.tag-chip.active { color: #fff; font-weight: bold; }
+.reviewed { opacity: 0.4; }
+.toast { position: fixed; bottom: 20px; right: 20px; padding: 10px 16px; background: #1a1a24; border: 1px solid #4CAF50; color: #4CAF50; border-radius: 4px; font-size: 12px; display: none; z-index: 100; }
+.preview-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.85); z-index: 200; justify-content: center; align-items: center; flex-direction: column; gap: 12px; }
+.preview-overlay.active { display: flex; }
+.preview-container { position: relative; }
+.preview-overlay img { width: 512px; height: 512px; image-rendering: pixelated; border: 2px solid #444; cursor: crosshair; }
+.tip-marker { position: absolute; width: 12px; height: 12px; border: 2px solid #ff0; border-radius: 50%; transform: translate(-50%, -50%); pointer-events: none; box-shadow: 0 0 8px #ff0; }
+.preview-info { color: #888; font-size: 12px; text-align: center; }
+.preview-info em { color: #ff0; font-style: normal; }
+.cursor-type { font-size: 11px; padding: 2px 6px; border-radius: 3px; }
+.cursor-type.arrow { color: #4CAF50; border: 1px solid #4CAF5040; }
+.cursor-type.hand { color: #2196F3; border: 1px solid #2196F340; }
+.cursor-type.ibeam { color: #FF9800; border: 1px solid #FF980040; }
+.cursor-type.unknown { color: #666; border: 1px solid #33333340; }
+.keyboard-hint { position: fixed; bottom: 20px; left: 20px; font-size: 10px; color: #444; }
+.info-bar { background: #0d0d16; border-bottom: 1px solid #1a1a24; overflow: hidden; transition: max-height 0.3s ease; }
+.info-bar.collapsed { max-height: 0; border: none; }
+.info-bar-inner { padding: 12px 20px; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; font-size: 11px; line-height: 1.6; color: #777; }
+.info-bar-inner h3 { font-size: 11px; color: #ff4444; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; font-weight: 600; }
+.info-bar-inner code { background: #1a1a24; padding: 1px 4px; border-radius: 2px; color: #aaa; font-size: 10px; }
+.info-bar-inner b { color: #ccc; font-weight: 500; }
+.info-bar-inner .kv { display: flex; gap: 4px; }
+.info-bar-inner .kv dt { color: #555; min-width: 80px; }
+.info-bar-inner .kv dd { color: #aaa; }
+.info-bar-inner ul { padding-left: 14px; margin: 2px 0; }
+.info-bar-inner li { margin: 1px 0; }
+.info-toggle { font-size: 10px; color: #555; cursor: pointer; border: 1px solid #333; background: transparent; padding: 2px 8px; border-radius: 3px; font-family: inherit; }
+.info-toggle:hover { color: #aaa; border-color: #555; }

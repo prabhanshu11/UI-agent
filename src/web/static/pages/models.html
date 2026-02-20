@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>KVM Model Tracking</title>
+<link rel="stylesheet" href="/static/css/base.css">
+<link rel="stylesheet" href="/static/css/models.css">
+</head>
+<body>
+<div class="header">
+    <div style="display:flex; align-items:center;">
+        <h1>MODEL TRACKING</h1>
+        <a href="/" class="nav-link-plain">Dashboard</a>
+        <a href="/validation" class="nav-link-plain">Validation</a>
+        <a href="/profiler" class="nav-link-plain">Profiler</a>
+        <a href="/loss_events" class="nav-link-plain">Loss Events</a>
+        <a href="/yolo" class="nav-link-plain">YOLO Gallery</a>
+    </div>
+</div>
+
+<div class="stats-row" id="stats-row">
+    <span style="color:#555">Loading model data...</span>
+</div>
+
+<div class="models-grid" id="models-grid"></div>
+
+<script src="/static/js/common.js"></script>
+<script src="/static/js/models.js"></script>
+</body>
+</html>

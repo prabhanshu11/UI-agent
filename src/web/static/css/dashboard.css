@@ -1,0 +1,136 @@
+/* dashboard.css — Main dashboard layout + sidebar */
+.header { border-bottom: 2px solid #ff4444; }
+.header h1 { color: #ff4444; }
+.header .status { font-size: 0.8rem; display: flex; gap: 1.5rem; }
+
+.main {
+    display: grid;
+    grid-template-columns: 1fr 320px;
+    height: calc(100vh - 50px);
+}
+
+/* ── Feed area (canvas container) ──────────────────────────── */
+.feed {
+    background: #000; overflow: hidden;
+    display: flex; justify-content: center; align-items: center;
+}
+.canvas-wrapper {
+    position: relative; width: 100%; height: 100%;
+    display: flex; justify-content: center; align-items: center;
+}
+#canvas-container {
+    position: relative;
+    max-width: 100%;
+    max-height: calc(100vh - 50px);
+    overflow: hidden;
+}
+#canvas-container canvas {
+    display: block;
+    max-width: 100%;
+    max-height: calc(100vh - 50px);
+    object-fit: contain;
+}
+#pause-overlay {
+    display: none; position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.3); z-index: 10;
+    justify-content: center; align-items: center;
+    font-size: 1.5rem; color: #f39c12; font-weight: bold;
+    letter-spacing: 4px; text-shadow: 0 0 10px #000;
+}
+
+/* ── Sidebar ───────────────────────────────────────────────── */
+.sidebar {
+    background: #101018; border-left: 1px solid #222;
+    overflow-y: auto;
+}
+.panel { border-bottom: 1px solid #1a1a25; padding: 0.8rem; }
+.panel-title {
+    font-size: 0.7rem; text-transform: uppercase;
+    letter-spacing: 2px; color: #ff4444; margin-bottom: 0.6rem;
+}
+
+/* ── Cursor display ────────────────────────────────────────── */
+.cursor-display {
+    background: #0a0a12; border: 1px solid #222;
+    border-radius: 4px; padding: 0.6rem; text-align: center;
+}
+.cursor-coords {
+    font-size: 1.4rem; font-weight: bold;
+    color: #ff4444; margin-bottom: 0.3rem;
+}
+.cursor-meta { font-size: 0.7rem; color: #666; }
+
+/* ── Tier indicator ────────────────────────────────────────── */
+.tier-indicator { display: flex; gap: 4px; margin-top: 4px; }
+.tier {
+    flex: 1; text-align: center; padding: 3px 0; border-radius: 3px;
+    font-size: 0.65rem; background: #1a1a25; color: #444;
+    transition: all 0.3s;
+}
+.tier.active { color: #fff; font-weight: bold; }
+.tier.t1.active { background: #2ecc71; color: #000; }
+.tier.t2.active { background: #f1c40f; color: #000; }
+.tier.t3.active { background: #e74c3c; }
+
+/* ── Blob table ────────────────────────────────────────────── */
+.blob-table { width: 100%; font-size: 0.75rem; border-collapse: collapse; }
+.blob-table th {
+    text-align: left; color: #666; font-weight: normal;
+    padding: 2px 6px; border-bottom: 1px solid #1a1a25;
+}
+.blob-table td { padding: 2px 6px; font-variant-numeric: tabular-nums; }
+
+/* ── Jitter bar ────────────────────────────────────────────── */
+.jitter-bar {
+    height: 20px; background: #0a0a12; border: 1px solid #222;
+    border-radius: 3px; overflow: hidden; position: relative; margin-top: 4px;
+}
+.jitter-pulse {
+    position: absolute; height: 100%;
+    background: linear-gradient(90deg, transparent, #2ecc71, transparent);
+    width: 30px; display: none;
+    animation: jitter-sweep 30s linear infinite;
+}
+.jitter-bar.active .jitter-pulse { display: block; }
+@keyframes jitter-sweep {
+    0% { left: -30px; }
+    0.5% { left: 50%; }
+    1% { left: -30px; }
+    100% { left: -30px; }
+}
+
+/* ── Tag panel ─────────────────────────────────────────────── */
+.tag-btn {
+    background: #333; color: #ccc; border: 1px solid #555; padding: 2px 6px;
+    cursor: pointer; border-radius: 3px; font-size: 0.65rem; margin: 1px;
+    transition: all 0.15s;
+}
+.tag-btn:hover { border-color: #f39c12; color: #fff; }
+.tag-btn.selected { border-color: #f39c12; color: #fff; box-shadow: 0 0 4px #f39c12; }
+.tag-group { display: flex; flex-wrap: wrap; gap: 2px; }
+
+/* ── Overlay toggles ──────────────────────────────────────── */
+.overlay-toggles { display: flex; flex-wrap: wrap; gap: 4px; }
+.overlay-toggle {
+    font-size: 0.65rem; padding: 2px 6px; border-radius: 3px;
+    border: 1px solid #333; background: transparent; color: #666;
+    cursor: pointer; transition: all 0.15s;
+}
+.overlay-toggle.active {
+    border-color: #3498db; color: #3498db; background: rgba(52,152,219,0.1);
+}
+.overlay-toggle:hover { border-color: #555; color: #aaa; }
+
+/* ── Recording panel ──────────────────────────────────────── */
+.rec-panel { display: flex; align-items: center; gap: 8px; }
+.rec-btn {
+    background: #333; color: #ccc; border: 1px solid #555;
+    padding: 4px 12px; cursor: pointer; border-radius: 4px;
+    font-size: 0.7rem; font-weight: bold;
+}
+.rec-btn.recording { background: #e74c3c; color: #fff; border-color: #e74c3c; animation: rec-pulse 1s infinite; }
+@keyframes rec-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.7; }
+}
+.rec-duration { font-size: 0.75rem; color: #e74c3c; font-variant-numeric: tabular-nums; }

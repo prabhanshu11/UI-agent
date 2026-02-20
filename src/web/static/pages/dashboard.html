@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>KVM Motion Detector</title>
+    <link rel="stylesheet" href="/static/css/base.css">
+    <link rel="stylesheet" href="/static/css/dashboard.css">
+</head>
+<body>
+    <div class="header">
+        <div style="display:flex; align-items:center; gap:1rem;">
+            <h1>KVM</h1>
+            <a href="/profiler" class="nav-link-plain">Profiler</a>
+            <a href="/validation" class="nav-link-plain">Validation</a>
+            <a href="/loss_events" class="nav-link-plain">Loss Events</a>
+            <a href="/yolo" class="nav-link-plain">YOLO Gallery</a>
+            <a href="/concepts" class="nav-link-plain">Concepts</a>
+            <a href="/models" class="nav-link-plain">Models</a>
+        </div>
+        <div class="status">
+            <span><span id="dot-mouse" class="dot gray"></span> Mouse</span>
+            <span><span id="dot-heartbeat" class="dot gray"></span> Heartbeat</span>
+            <span><span id="dot-jitter" class="dot gray"></span> Jitter</span>
+            <span><span id="dot-keyboard" class="dot gray"></span> Pi KB</span>
+            <span id="fps-display" style="color: #666;">0 FPS</span>
+        </div>
+    </div>
+    <div class="main">
+        <div class="feed">
+            <div class="canvas-wrapper">
+                <div id="canvas-container">
+                    <!-- canvas-feed.js creates frame-canvas + overlay-canvas here -->
+                </div>
+                <div id="pause-overlay">PAUSED &mdash; TAG &amp; RESUME</div>
+            </div>
+        </div>
+        <div class="sidebar">
+            <!-- Overlay Toggles -->
+            <div class="panel">
+                <div class="panel-title" style="color:#3498db">Overlays</div>
+                <div class="overlay-toggles" id="overlay-toggles"></div>
+            </div>
+            <!-- Recording -->
+            <div class="panel">
+                <div class="panel-title" style="color:#e74c3c">Recording</div>
+                <div class="rec-panel">
+                    <button class="rec-btn" id="rec-btn" onclick="typeof Recorder !== 'undefined' && Recorder.toggle()">REC</button>
+                    <span class="rec-duration" id="rec-duration"></span>
+                    <span id="rec-status" style="font-size:0.65rem;color:#555"></span>
+                </div>
+            </div>
+            <!-- Cursor Position -->
+            <div class="panel">
+                <div class="panel-title">Cursor Position</div>
+                <div class="cursor-display">
+                    <div class="cursor-coords" id="cursor-coords">(?, ?)</div>
+                    <div class="cursor-meta">
+                        <span id="cursor-method">&mdash;</span> |
+                        age: <span id="cursor-age">&mdash;</span>s
+                    </div>
+                </div>
+                <div class="tier-indicator">
+                    <div class="tier t1" id="tier-1" title="Motion tracking or silhouette following">T1 Micro</div>
+                    <div class="tier t2" id="tier-2" title="CNN re-acquisition or macro shake">T2 Macro</div>
+                    <div class="tier t3" id="tier-3" title="Lissajous sweep — brute-force finder">T3 Lissajous</div>
+                </div>
+            </div>
+            <!-- Motion Blobs -->
+            <div class="panel">
+                <div class="panel-title">Motion Blobs (<span id="blob-count">0</span>)</div>
+                <table class="blob-table">
+                    <thead><tr><th>Centroid</th><th>Size</th><th>Angle</th></tr></thead>
+                    <tbody id="blob-list"></tbody>
+                </table>
+            </div>
+            <!-- YOLO -->
+            <div class="panel">
+                <div class="panel-title" style="color:#0ff">YOLO Full-Screen</div>
+                <div class="hw-row"><span class="hw-label">Status</span><span class="hw-value" id="yolo-status">&mdash;</span></div>
+                <div class="hw-row"><span class="hw-label">Position</span><span class="hw-value" id="yolo-position" style="color:#888">&mdash;</span></div>
+                <div class="hw-row"><span class="hw-label">Confidence</span><span class="hw-value" id="yolo-confidence">&mdash;</span></div>
+                <div class="hw-row"><span class="hw-label">Inference</span><span class="hw-value" id="yolo-inference" style="color:#888">&mdash;</span></div>
+                <div class="hw-row"><span class="hw-label">Detections</span><span class="hw-value" id="yolo-count" style="color:#888">&mdash;</span></div>
+            </div>
+            <!-- Silhouette -->
+            <div class="panel">
+                <div class="panel-title">Silhouette Tracking</div>
+                <div class="hw-row"><span class="hw-label">Status</span><span class="hw-value" id="sil-status">&mdash;</span></div>
+                <div class="hw-row"><span class="hw-label">Method</span><span class="hw-value" id="sil-method" style="color:#888">&mdash;</span></div>
+                <div class="hw-row"><span class="hw-label">Hz</span><span class="hw-value" id="sil-hz" style="color:#888">&mdash;</span></div>
+                <div class="hw-row"><span class="hw-label">ROI</span><span class="hw-value" id="sil-roi" style="color:#888">&mdash;</span></div>
+                <div class="hw-row"><span class="hw-label">Confidence</span><span class="hw-value" id="sil-confidence">&mdash;</span></div>
+                <div class="hw-row"><span class="hw-label">Latency</span><span class="hw-value" id="sil-latency" style="color:#888">&mdash;</span></div>
+                <div class="hw-row"><span class="hw-label">Trusted</span><span class="hw-value" id="sil-trusted" style="color:#888">&mdash;</span></div>
+            </div>
+            <!-- CNN -->
+            <div class="panel">
+                <div class="panel-title">CNN Cursor Recognition</div>
+                <div class="hw-row"><span class="hw-label">Confidence</span><span class="hw-value" id="cnn-confidence">&mdash;</span></div>
+                <div style="height:8px; background:#1a1a25; border-radius:4px; overflow:hidden; margin:4px 0;">
+                    <div id="cnn-bar" style="height:100%; width:0%; transition:width 0.3s; border-radius:4px;"></div>
+                </div>
+                <div class="hw-row"><span class="hw-label">Model</span><span class="hw-value" id="cnn-model" style="color:#888">&mdash;</span></div>
+                <div class="hw-row"><span class="hw-label">Validated</span><span class="hw-value" id="cnn-validated">&mdash;</span></div>
+                <div class="hw-row"><span class="hw-label">Inference</span><span class="hw-value" id="cnn-inference" style="color:#888">&mdash;</span></div>
+                <div class="hw-row"><span class="hw-label">Samples</span><span class="hw-value" id="cnn-samples" style="color:#888">0 pos / 0 neg</span></div>
+            </div>
+            <!-- Claude Vision -->
+            <div class="panel">
+                <div class="panel-title" style="color:#9b59b6">Claude Vision (Ground Truth)</div>
+                <div class="hw-row"><span class="hw-label">Position</span><span class="hw-value" id="vision-pos" style="color:#888">&mdash;</span></div>
+                <div class="hw-row"><span class="hw-label">Confidence</span><span class="hw-value" id="vision-confidence">&mdash;</span></div>
+                <div class="hw-row"><span class="hw-label">Cursor Type</span><span class="hw-value" id="vision-type" style="color:#888">&mdash;</span></div>
+                <div class="hw-row"><span class="hw-label">Latency</span><span class="hw-value" id="vision-latency" style="color:#888">&mdash;</span></div>
+                <div class="hw-row"><span class="hw-label">Last Run</span><span class="hw-value" id="vision-age" style="color:#888">Never</span></div>
+                <div class="hw-row"><span class="hw-label">Tracker Delta</span><span class="hw-value" id="vision-delta" style="color:#888">&mdash;</span></div>
+                <div style="margin-top:6px;">
+                    <button onclick="runVisionDetect()" id="vision-btn" style="background:#9b59b6; color:#fff; border:none; padding:4px 12px; border-radius:4px; cursor:pointer; font-size:0.7rem;">Run Detection</button>
+                </div>
+            </div>
+            <!-- Anti-Sleep Jitter -->
+            <div class="panel">
+                <div class="panel-title">Anti-Sleep Jitter</div>
+                <div class="hw-row"><span class="hw-label">Status</span><span class="hw-value" id="jitter-status">&mdash;</span></div>
+                <div class="jitter-bar" id="jitter-bar"><div class="jitter-pulse"></div></div>
+                <div style="font-size:0.65rem; color:#444; margin-top:3px;" id="jitter-desc">&plusmn;3px every 30s &mdash; prevents Windows sleep</div>
+            </div>
+            <!-- Hardware -->
+            <div class="panel">
+                <div class="panel-title">Hardware</div>
+                <div class="hw-row"><span class="hw-label">ESP32 Mouse</span><span class="hw-value" id="hw-mouse">&mdash;</span></div>
+                <div class="hw-row"><span class="hw-label">BLE Heartbeat</span><span class="hw-value" id="hw-heartbeat">&mdash;</span></div>
+                <div class="hw-row"><span class="hw-label">Pi Keyboard</span><span class="hw-value" id="hw-keyboard">&mdash;</span></div>
+                <div class="hw-row"><span class="hw-label">Frame Count</span><span class="hw-value" id="hw-frames" style="color:#888">0</span></div>
+            </div>
+            <!-- Tag Frame -->
+            <div class="panel" style="border-color:#f39c12">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.6rem;">
+                    <div class="panel-title" style="color:#f39c12; margin-bottom:0">Tag Frame</div>
+                    <button id="pause-btn" onclick="togglePause()" style="background:#f39c12; color:#000; border:none; padding:3px 10px; cursor:pointer; border-radius:3px; font-weight:bold; font-size:0.65rem;">PAUSE (TAG)</button>
+                </div>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:4px; font-size:0.7rem;">
+                    <div>
+                        <div style="color:#888; margin-bottom:2px;">Cursor Correct?</div>
+                        <div class="tag-group" id="tag-cursor-correct">
+                            <button class="tag-btn" data-dim="cursor_correct" data-val="yes" style="background:#27ae60">Yes</button>
+                            <button class="tag-btn" data-dim="cursor_correct" data-val="no" style="background:#e74c3c">No</button>
+                            <button class="tag-btn" data-dim="cursor_correct" data-val="unsure" style="background:#7f8c8d">?</button>
+                        </div>
+                    </div>
+                    <div>
+                        <div style="color:#888; margin-bottom:2px;">Cursor Type</div>
+                        <div class="tag-group" id="tag-cursor-type">
+                            <button class="tag-btn" data-dim="cursor_type" data-val="arrow">Arrow</button>
+                            <button class="tag-btn" data-dim="cursor_type" data-val="hand">Hand</button>
+                            <button class="tag-btn" data-dim="cursor_type" data-val="caret">Caret</button>
+                            <button class="tag-btn" data-dim="cursor_type" data-val="other">Other</button>
+                        </div>
+                    </div>
+                    <div>
+                        <div style="color:#888; margin-bottom:2px;">Movement</div>
+                        <div class="tag-group" id="tag-movement">
+                            <button class="tag-btn" data-dim="movement" data-val="stationary">Still</button>
+                            <button class="tag-btn" data-dim="movement" data-val="slow">Slow</button>
+                            <button class="tag-btn" data-dim="movement" data-val="medium">Med</button>
+                            <button class="tag-btn" data-dim="movement" data-val="fast">Fast</button>
+                        </div>
+                    </div>
+                    <div>
+                        <div style="color:#888; margin-bottom:2px;">Track Quality</div>
+                        <div class="tag-group" id="tag-track-quality">
+                            <button class="tag-btn" data-dim="track_quality" data-val="accurate" style="background:#27ae60">Good</button>
+                            <button class="tag-btn" data-dim="track_quality" data-val="drifting" style="background:#f39c12">Drift</button>
+                            <button class="tag-btn" data-dim="track_quality" data-val="wrong_target" style="background:#e74c3c">Wrong</button>
+                            <button class="tag-btn" data-dim="track_quality" data-val="lost" style="background:#c0392b">Lost</button>
+                        </div>
+                    </div>
+                    <div style="grid-column:span 2">
+                        <div style="color:#888; margin-bottom:2px;">Context</div>
+                        <div class="tag-group" id="tag-context">
+                            <button class="tag-btn" data-dim="context" data-val="desktop">Desktop</button>
+                            <button class="tag-btn" data-dim="context" data-val="browser">Browser</button>
+                            <button class="tag-btn" data-dim="context" data-val="teams">Teams</button>
+                            <button class="tag-btn" data-dim="context" data-val="app">App</button>
+                        </div>
+                    </div>
+                </div>
+                <div style="margin-top:6px; display:flex; gap:4px; align-items:center;">
+                    <input id="tag-notes" type="text" placeholder="Notes..." style="flex:1; background:#222; border:1px solid #444; color:#fff; padding:3px 6px; font-size:0.7rem; border-radius:3px;">
+                    <button id="tag-submit" onclick="submitTag()" style="background:#f39c12; color:#000; border:none; padding:4px 12px; cursor:pointer; border-radius:3px; font-weight:bold; font-size:0.7rem;">TAG</button>
+                </div>
+                <div id="tag-status" style="font-size:0.65rem; color:#888; margin-top:3px;"></div>
+            </div>
+            <!-- Error -->
+            <div class="panel" id="error-panel" style="display:none">
+                <div class="panel-title" style="color:#e74c3c">Error</div>
+                <div id="error-text" style="font-size:0.75rem; color:#e74c3c;"></div>
+            </div>
+        </div>
+    </div>
+    <script src="/static/js/common.js"></script>
+    <script src="/static/js/canvas-overlays.js"></script>
+    <script src="/static/js/canvas-feed.js"></script>
+    <script src="/static/js/recorder.js"></script>
+    <script src="/static/js/dashboard.js"></script>
+</body>
+</html>

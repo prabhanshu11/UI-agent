@@ -1,0 +1,103 @@
+/* models.css — Model tracking page styles */
+.header { border-bottom: 2px solid #9b59b6; }
+.header h1 { color: #9b59b6; }
+
+.models-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    padding: 1rem;
+    max-width: 1400px;
+    margin: 0 auto;
+}
+.models-grid.full { grid-template-columns: 1fr; }
+
+.model-family {
+    background: #101018;
+    border: 1px solid #1a1a25;
+    border-radius: 8px;
+    padding: 1rem;
+}
+.family-title {
+    font-size: 0.8rem;
+    font-weight: bold;
+    margin-bottom: 0.8rem;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.family-badge {
+    font-size: 0.6rem;
+    padding: 2px 6px;
+    border-radius: 10px;
+    font-weight: normal;
+}
+.badge-active { background: #1a3a1a; color: #2ecc71; }
+.badge-count { background: #1a1a2a; color: #888; }
+
+/* Model version cards */
+.version-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    padding: 6px 8px;
+    border-bottom: 1px solid #1a1a25;
+    font-size: 0.75rem;
+}
+.version-row:last-child { border-bottom: none; }
+.version-row.active { background: rgba(46, 204, 113, 0.05); }
+.version-name {
+    width: 80px;
+    font-weight: bold;
+    color: #9b59b6;
+    flex-shrink: 0;
+}
+.version-name.active { color: #2ecc71; }
+.version-metric {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.metric-label { color: #555; font-size: 0.6rem; text-transform: uppercase; }
+.metric-value { color: #ccc; font-variant-numeric: tabular-nums; }
+.metric-value.good { color: #2ecc71; }
+.metric-value.ok { color: #f1c40f; }
+.metric-value.bad { color: #e74c3c; }
+
+/* Accuracy bar */
+.acc-bar {
+    height: 6px;
+    background: #1a1a25;
+    border-radius: 3px;
+    overflow: hidden;
+    margin-top: 2px;
+}
+.acc-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.3s;
+}
+
+/* Training curve chart */
+.chart-container {
+    height: 200px;
+    background: #0a0a12;
+    border-radius: 4px;
+    margin-top: 0.8rem;
+    position: relative;
+}
+
+/* Stats summary row */
+.stats-row {
+    display: flex;
+    gap: 1.5rem;
+    padding: 0.8rem 1rem;
+    background: #0d0d16;
+    border-bottom: 1px solid #1a1a25;
+    font-size: 0.75rem;
+    flex-wrap: wrap;
+}
+.stat-item { display: flex; gap: 4px; }
+.stat-label { color: #555; }
+.stat-value { color: #ccc; font-weight: 600; }

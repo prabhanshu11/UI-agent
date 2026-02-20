@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Cursor Loss Events</title>
+<link rel="stylesheet" href="/static/css/base.css">
+<link rel="stylesheet" href="/static/css/loss-events.css">
+</head>
+<body>
+<div class="header">
+  <div style="display:flex;align-items:center;gap:1rem;">
+    <h1>CURSOR LOSS EVENTS</h1>
+    <span class="ring-status" id="ring-status"></span>
+  </div>
+  <div class="nav">
+    <a href="/">Dashboard</a>
+    <a href="/validation">Validation</a>
+    <a href="/profiler">Profiler</a>
+    <a href="/loss_events">Loss Events</a>
+    <a href="/yolo">YOLO Gallery</a>
+  </div>
+</div>
+
+<div class="events-list" id="events-list"></div>
+
+<div class="timeline-view" id="timeline-view">
+  <button class="back-btn" onclick="showList()">&larr; Back to events</button>
+  <div class="tl-header" id="tl-header"></div>
+  <div class="tl-strip" id="tl-strip"></div>
+  <div class="detail-panel" id="detail-panel"></div>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script src="/static/js/loss-events.js"></script>
+</body>
+</html>

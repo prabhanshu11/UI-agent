@@ -23,7 +23,8 @@ from typing import Optional
 import cv2
 import numpy as np
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 
 import sys
 from pathlib import Path
@@ -37,7 +38,7 @@ from src.hardware.cursor_sample_collector import CursorSampleCollector, extract_
 from src.hardware.cursor_recognizer import CursorRecognizer
 from src.hardware.daemon_client import DaemonClient
 from src.hardware.cursor_vision_detector import ClaudeVisionCursorDetector
-from src.hardware.silhouette_tracker import SilhouetteTracker
+from src.hardware.silhouette_tracker import SilhouetteTracker, CandidateBlob
 from src.hardware.commanded_movement import CommandedMovement
 from src.hardware.yolo_detector import YOLOCursorDetector
 
@@ -47,6 +48,16 @@ def utc_now_ms() -> str:
 
 
 app = FastAPI(title="KVM Control Dashboard")
+
+# ── Static files ────────────────────────────────────────────────────
+_STATIC_DIR = Path(__file__).parent / "static"
+_PAGES_DIR = _STATIC_DIR / "pages"
+app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+
+def _serve_page(name: str) -> HTMLResponse:
+    """Serve an HTML page from static/pages/."""
+    return HTMLResponse((_PAGES_DIR / name).read_text())
 
 
 # ── Shared state ────────────────────────────────────────────────────
@@ -594,21 +605,35 @@ def _daemon_motion_loop():
                         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                         state.prof_jpeg_decode_ms = (time.monotonic() - t_decode) * 1000
 
-                        # ── YOLO full-screen detection (~10fps) ──
+                        # ── YOLO detection (crop pipeline + full-frame fallback) ──
                         # YOLO expects BGR (OpenCV native), not RGB
                         if yolo_detector and yolo_detector.loaded:
-                            yolo_dets = yolo_detector.detect(frame)
-                            if yolo_dets:
-                                # Smart selection: if we have a tracked position,
-                                # prefer the detection closest to it (avoid toolbar FPs)
-                                pos_now = tracker.position if tracker else None
-                                if pos_now and len(yolo_dets) > 1:
-                                    yolo_dets.sort(key=lambda d: (
-                                        (d.cx - pos_now.x) ** 2 +
-                                        (d.cy - pos_now.y) ** 2))
+                            best_yolo = None
+                            pos_now = tracker.position if tracker else None
+
+                            # Crop pipeline: silhouette finds candidates → YOLO validates crops
+                            if sil_tracker and pos_now:
+                                candidates = sil_tracker.get_candidates(
+                                    frame_rgb, pos_now.x, pos_now.y)
+                                for cand in candidates[:5]:  # max 5 crops
+                                    crop_dets = yolo_detector.detect_crop(
+                                        frame, cand.bbox)
+                                    if crop_dets:
+                                        best_yolo = crop_dets[0]
+                                        break
+
+                            # Full-frame fallback: discovery mode when no position
+                            # or crop pipeline found nothing
+                            if best_yolo is None:
+                                yolo_dets = yolo_detector.detect(frame)
+                                if yolo_dets:
+                                    if pos_now and len(yolo_dets) > 1:
+                                        yolo_dets.sort(key=lambda d: (
+                                            (d.cx - pos_now.x) ** 2 +
+                                            (d.cy - pos_now.y) ** 2))
                                     best_yolo = yolo_dets[0]
-                                else:
-                                    best_yolo = yolo_dets[0]  # highest confidence
+
+                            if best_yolo:
                                 state.yolo_active = True
                                 state.yolo_x = int(best_yolo.cx)
                                 state.yolo_y = int(best_yolo.cy)
@@ -635,13 +660,10 @@ def _daemon_motion_loop():
                                         _yolo_lockout_until = now + _YOLO_LOCKOUT_S
 
                                 # Priority 2: YOLO disagrees with silhouette → anchor correction
-                                # If YOLO high-conf and silhouette is tracking a different position
                                 elif pos and best_yolo.confidence > 0.7:
                                     drift = ((best_yolo.cx - pos.x) ** 2 +
                                              (best_yolo.cy - pos.y) ** 2) ** 0.5
                                     if drift > 80:
-                                        # YOLO sees cursor at a different position than
-                                        # silhouette is tracking → YOLO wins (full-screen)
                                         if tracker:
                                             tracker.set_position(
                                                 best_yolo.cx, best_yolo.cy,
@@ -826,15 +848,29 @@ def _python_motion_loop():
                 state.cursor_method = pos.method
                 state.cursor_age_s = time.monotonic() - pos.timestamp
 
-            # ── YOLO full-screen detection ──────────────────────
+            # ── YOLO detection (crop pipeline + full-frame fallback) ──
             if yolo_detector and yolo_detector.loaded:
-                yolo_dets = yolo_detector.detect(frame)
-                if yolo_dets:
-                    # Smart selection: prefer detection closest to tracked pos
-                    if pos and len(yolo_dets) > 1:
-                        yolo_dets.sort(key=lambda d: (
-                            (d.cx - pos.x) ** 2 + (d.cy - pos.y) ** 2))
-                    best_yolo = yolo_dets[0]
+                best_yolo = None
+
+                # Crop pipeline: silhouette candidates → YOLO crop validation
+                if sil_tracker and pos:
+                    candidates = sil_tracker.get_candidates(frame, pos.x, pos.y)
+                    for cand in candidates[:5]:
+                        crop_dets = yolo_detector.detect_crop(frame, cand.bbox)
+                        if crop_dets:
+                            best_yolo = crop_dets[0]
+                            break
+
+                # Full-frame fallback for discovery
+                if best_yolo is None:
+                    yolo_dets = yolo_detector.detect(frame)
+                    if yolo_dets:
+                        if pos and len(yolo_dets) > 1:
+                            yolo_dets.sort(key=lambda d: (
+                                (d.cx - pos.x) ** 2 + (d.cy - pos.y) ** 2))
+                        best_yolo = yolo_dets[0]
+
+                if best_yolo:
                     state.yolo_active = True
                     state.yolo_x = int(best_yolo.cx)
                     state.yolo_y = int(best_yolo.cy)
@@ -1879,17 +1915,157 @@ def cursor_validation_loop():
 
 @app.get("/")
 async def dashboard():
-    return HTMLResponse(DASHBOARD_HTML)
+    return _serve_page("dashboard.html")
 
 
 @app.get("/profiler")
 async def profiler_page():
-    return HTMLResponse(PROFILER_HTML)
+    return _serve_page("profiler.html")
 
 
 @app.get("/concepts")
 async def concepts_page():
-    return HTMLResponse(CONCEPTS_HTML)
+    return _serve_page("concepts.html")
+
+
+@app.get("/models")
+async def models_page():
+    return _serve_page("models.html")
+
+
+@app.get("/api/concepts_text")
+async def concepts_text():
+    """Return raw concepts markdown text."""
+    p = Path(__file__).parent.parent.parent / "docs" / "STAR_TREK_COMPUTER_CONCEPTS.md"
+    if p.exists():
+        return Response(content=p.read_text(), media_type="text/plain")
+    return Response(content="Concepts file not found", media_type="text/plain")
+
+
+@app.get("/api/models")
+async def get_models():
+    """Aggregate model metadata for the /models page."""
+    data_dir = Path(__file__).parent.parent.parent / "data"
+
+    # CNN models from training_log.jsonl
+    cnn_models = []
+    active_cnn = state.cnn_model_version if state else "none"
+    log_path = data_dir / "cursor_models" / "training_log.jsonl"
+    if log_path.exists():
+        for line in log_path.read_text().strip().split('\n'):
+            if line.strip():
+                try:
+                    cnn_models.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+
+    # YOLO models
+    yolo_models = []
+    yolo_dir = data_dir / "yolo_models"
+    for pt_file in sorted(yolo_dir.glob("cursor_*.pt")) if yolo_dir.exists() else []:
+        entry = {
+            "name": pt_file.stem,
+            "size_mb": pt_file.stat().st_size / (1024 * 1024),
+            "metrics": {},
+        }
+        # Try to find training metrics in runs/
+        for run_dir in yolo_dir.glob("runs/*/" + pt_file.stem.replace("_best", "")):
+            csv_path = run_dir / "results.csv"
+            if csv_path.exists():
+                lines = csv_path.read_text().strip().split('\n')
+                if len(lines) > 1:
+                    headers = [h.strip() for h in lines[0].split(',')]
+                    last = [v.strip() for v in lines[-1].split(',')]
+                    d = dict(zip(headers, last))
+                    try:
+                        entry["metrics"] = {
+                            "precision": float(d.get("metrics/precision(B)", 0)),
+                            "recall": float(d.get("metrics/recall(B)", 0)),
+                            "map50": float(d.get("metrics/mAP50(B)", 0)),
+                        }
+                    except (ValueError, KeyError):
+                        pass
+        yolo_models.append(entry)
+
+    # Also check runs/detect/ for v2 style
+    detect_dir = yolo_dir / "runs" / "detect" if yolo_dir.exists() else None
+    if detect_dir and detect_dir.exists():
+        for run_dir in sorted(detect_dir.iterdir()):
+            best = run_dir / "weights" / "best.pt"
+            if best.exists():
+                name = run_dir.name
+                if not any(y["name"] == name for y in yolo_models):
+                    entry = {"name": name, "size_mb": best.stat().st_size / (1024 * 1024), "metrics": {}}
+                    csv_path = run_dir / "results.csv"
+                    if csv_path.exists():
+                        lines = csv_path.read_text().strip().split('\n')
+                        if len(lines) > 1:
+                            headers = [h.strip() for h in lines[0].split(',')]
+                            last = [v.strip() for v in lines[-1].split(',')]
+                            d = dict(zip(headers, last))
+                            try:
+                                entry["metrics"] = {
+                                    "precision": float(d.get("metrics/precision(B)", 0)),
+                                    "recall": float(d.get("metrics/recall(B)", 0)),
+                                    "map50": float(d.get("metrics/mAP50(B)", 0)),
+                                }
+                            except (ValueError, KeyError):
+                                pass
+                    yolo_models.append(entry)
+
+    # Sample stats
+    sample_stats = {"total": 0, "positive": 0, "negative": 0, "reviewed": 0, "sources": {}}
+    index_path = data_dir / "cursor_samples" / "index.jsonl"
+    if index_path.exists():
+        for line in index_path.read_text().strip().split('\n'):
+            if not line.strip():
+                continue
+            try:
+                s = json.loads(line)
+                sample_stats["total"] += 1
+                if s.get("label") == "pos":
+                    sample_stats["positive"] += 1
+                else:
+                    sample_stats["negative"] += 1
+                src = s.get("source", "unknown")
+                sample_stats["sources"][src] = sample_stats["sources"].get(src, 0) + 1
+            except json.JSONDecodeError:
+                pass
+    reviews_path = data_dir / "cursor_samples" / "reviews.jsonl"
+    if reviews_path.exists():
+        sample_stats["reviewed"] = sum(1 for l in reviews_path.read_text().strip().split('\n') if l.strip())
+
+    # Velocity test runs
+    velocity_runs = []
+    vtest_dir = data_dir / "velocity_test"
+    if vtest_dir.exists():
+        for run_dir in sorted(vtest_dir.iterdir()):
+            if run_dir.is_dir() and run_dir.name.startswith("run_"):
+                entry = {"run_id": run_dir.name.replace("run_", ""), "summary": {}}
+                summary_path = run_dir / "summary.json"
+                if summary_path.exists():
+                    try:
+                        entry["summary"] = json.loads(summary_path.read_text())
+                    except json.JSONDecodeError:
+                        pass
+                velocity_runs.append(entry)
+
+    # Loss event count
+    loss_dir = data_dir / "loss_events"
+    loss_count = sum(1 for d in loss_dir.iterdir() if d.is_dir()) if loss_dir.exists() else 0
+
+    return {
+        "cnn_models": cnn_models,
+        "cnn_count": len(cnn_models),
+        "active_cnn": active_cnn,
+        "yolo_models": yolo_models,
+        "yolo_count": len(yolo_models),
+        "sample_stats": sample_stats,
+        "total_samples": sample_stats["total"],
+        "velocity_runs": velocity_runs,
+        "velocity_run_count": len(velocity_runs),
+        "loss_event_count": loss_count,
+    }
 
 
 @app.get("/api/frame")
@@ -1898,6 +2074,19 @@ async def get_frame():
         jpeg = state.frame_overlay
     if jpeg:
         return Response(content=jpeg, media_type="image/jpeg",
+                        headers={"X-Frame-UTC": utc_now_ms()})
+    return {"error": "No frame yet"}
+
+
+@app.get("/api/frame_raw")
+async def get_frame_raw():
+    """Raw JPEG frame without overlays (for client-side canvas rendering)."""
+    with state.lock:
+        raw = state.frame_raw
+    if raw is not None:
+        bgr = cv2.cvtColor(raw, cv2.COLOR_RGB2BGR)
+        _, buf = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        return Response(content=buf.tobytes(), media_type="image/jpeg",
                         headers={"X-Frame-UTC": utc_now_ms()})
     return {"error": "No frame yet"}
 
@@ -2581,7 +2770,7 @@ _VALIDATION_REVIEWS_PATH = _VALIDATION_SAMPLES_DIR / "reviews.jsonl"
 @app.get("/validation")
 async def validation_page():
     """Validation GUI for reviewing CNN training samples."""
-    return HTMLResponse(VALIDATION_HTML)
+    return _serve_page("validation.html")
 
 
 @app.get("/api/validation/samples")
@@ -2657,6 +2846,7 @@ async def get_validation_samples(page: int = 0, page_size: int = 20,
         entry_label = entry.get("label", "")
         entry_source = entry.get("source", "")
         is_confusing = entry.get("is_confusing", 0)
+        needs_review = entry.get("needs_review", False)
 
         # Normalize label (some entries use 1/0 instead of pos/neg)
         if entry_label == 1 or entry_label == "1":
@@ -2667,6 +2857,9 @@ async def get_validation_samples(page: int = 0, page_size: int = 20,
         cnn_disagrees = False
         if is_reviewed:
             priority = 99.0
+        elif needs_review:
+            # Human-captured samples get highest priority (ground truth)
+            priority = -1.0
         elif is_confusing:
             priority = 1.0
         elif cnn_conf is not None:
@@ -2689,6 +2882,7 @@ async def get_validation_samples(page: int = 0, page_size: int = 20,
             "priority": round(priority, 3),
             "review": review,
             "cnn_disagrees": cnn_disagrees,
+            "needs_review": needs_review,
             "tags": file_tags.get(filename, {}),
         })
 
@@ -2701,6 +2895,7 @@ async def get_validation_samples(page: int = 0, page_size: int = 20,
                         (e.get("review") and e["review"].get("is_confusing_to_human"))),
         "claude": sum(1 for e in scored_entries if "claude" in e.get("source", "")),
         "disagreement": sum(1 for e in scored_entries if e.get("cnn_disagrees")),
+        "needs_review": sum(1 for e in scored_entries if e.get("needs_review")),
         "pos": sum(1 for e in scored_entries if e["label"] == "pos"),
         "neg": sum(1 for e in scored_entries if e["label"] == "neg"),
     }
@@ -2726,6 +2921,8 @@ async def get_validation_samples(page: int = 0, page_size: int = 20,
         filtered = [e for e in filtered if "claude" in e.get("source", "")]
     elif filter == "disagreement":
         filtered = [e for e in filtered if e.get("cnn_disagrees")]
+    elif filter == "needs_review":
+        filtered = [e for e in filtered if e.get("needs_review")]
 
     if label != "all":
         filtered = [e for e in filtered if e["label"] == label]
@@ -3732,7 +3929,7 @@ async def get_loss_frame(event_id: str, frame_name: str):
 @app.get("/loss_events", response_class=HTMLResponse)
 async def loss_events_page():
     """Timeline viewer for cursor loss events."""
-    return LOSS_EVENTS_HTML
+    return _serve_page("loss-events.html")
 
 
 # ── YOLO Gallery API ─────────────────────────────────────────────────
@@ -3839,2331 +4036,7 @@ async def yolo_detect_json(event_id: str, frame_name: str):
 @app.get("/yolo", response_class=HTMLResponse)
 async def yolo_gallery_page():
     """YOLO detection gallery — browse loss event frames with YOLO results."""
-    return YOLO_GALLERY_HTML
-
-
-# ── YOLO Gallery HTML ────────────────────────────────────────────────
-
-YOLO_GALLERY_HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>YOLO Cursor Detection Gallery</title>
-<style>
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: 'JetBrains Mono', monospace; background: #0a0a0f; color: #c8c8d0; }
-.header { background: #101018; padding: 0.6rem 1.5rem; border-bottom: 2px solid #00e5ff;
-    display: flex; justify-content: space-between; align-items: center; }
-.header h1 { color: #00e5ff; font-size: 1.1rem; letter-spacing: 1px; }
-.nav a { color: #888; text-decoration: none; font-size: 0.75rem; margin-left: 1rem; }
-.nav a:hover { color: #fff; }
-
-.layout { display: flex; height: calc(100vh - 50px); }
-.sidebar { width: 240px; overflow-y: auto; border-right: 1px solid #222; padding: 0.5rem; }
-.event-group { margin-bottom: 0.8rem; }
-.event-title { color: #00e5ff; font-size: 0.7rem; padding: 4px 6px; cursor: pointer;
-    border-radius: 3px; }
-.event-title:hover { background: #1a1a2a; }
-.event-title.active { background: #1a2a3a; }
-.frame-list { display: none; padding-left: 8px; }
-.frame-list.open { display: block; }
-.frame-item { font-size: 0.65rem; padding: 3px 6px; cursor: pointer; color: #888;
-    border-radius: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.frame-item:hover { background: #1a1a2a; color: #ccc; }
-.frame-item.selected { background: #1a3a2a; color: #2ecc71; }
-
-.main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-.viewer { flex: 1; display: flex; align-items: center; justify-content: center;
-    background: #050508; overflow: hidden; position: relative; }
-.viewer img { max-width: 100%; max-height: 100%; object-fit: contain; }
-.viewer .empty { color: #555; font-size: 0.9rem; }
-.filmstrip { height: 90px; display: flex; gap: 3px; overflow-x: auto;
-    padding: 4px 8px; background: #101018; border-top: 1px solid #222; }
-.filmstrip .thumb { width: 120px; height: 78px; flex-shrink: 0; cursor: pointer;
-    border: 2px solid transparent; border-radius: 3px; overflow: hidden; }
-.filmstrip .thumb:hover { border-color: #555; }
-.filmstrip .thumb.selected { border-color: #00e5ff; }
-.filmstrip .thumb img { width: 100%; height: 100%; object-fit: cover; }
-
-.detail-bar { height: 60px; display: flex; align-items: center; gap: 2rem;
-    padding: 0 1rem; background: #14141f; border-top: 1px solid #222; font-size: 0.7rem; }
-.detail-bar .label { color: #888; }
-.detail-bar .value { color: #fff; margin-left: 4px; }
-.det-conf { color: #2ecc71; font-weight: bold; }
-.det-none { color: #e74c3c; }
-.loading { color: #555; font-style: italic; }
-
-.key-hint { position: fixed; bottom: 8px; right: 12px; font-size: 0.6rem; color: #444; }
-</style>
-</head>
-<body>
-<div class="header">
-  <h1>YOLO CURSOR DETECTION</h1>
-  <div class="nav">
-    <a href="/">Dashboard</a>
-    <a href="/validation">Validation</a>
-    <a href="/loss_events">Loss Events</a>
-    <a href="/yolo">YOLO Gallery</a>
-    <a href="/profiler">Profiler</a>
-  </div>
-</div>
-
-<div class="layout">
-  <div class="sidebar" id="sidebar"></div>
-  <div class="main">
-    <div class="viewer" id="viewer"><span class="empty">Select a frame from the sidebar</span></div>
-    <div class="filmstrip" id="filmstrip"></div>
-    <div class="detail-bar" id="detail-bar">
-      <span class="loading">No frame selected</span>
-    </div>
-  </div>
-</div>
-
-<div class="key-hint">Arrow keys: prev/next frame</div>
-
-<script>
-var allEvents = [];
-var currentEvent = null;
-var currentFrames = [];
-var currentIdx = -1;
-
-function loadEvents() {
-  fetch('/api/yolo/frames')
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-      allEvents = data.events || [];
-      renderSidebar();
-      // Auto-select first event if available
-      if (allEvents.length > 0) selectEvent(allEvents[0].event_id);
-    });
-}
-
-function renderSidebar() {
-  var sb = document.getElementById('sidebar');
-  while (sb.firstChild) sb.removeChild(sb.firstChild);
-
-  if (allEvents.length === 0) {
-    var empty = document.createElement('div');
-    empty.style.cssText = 'padding:2rem 1rem;color:#555;font-size:0.75rem;text-align:center';
-    empty.textContent = 'No loss events found';
-    sb.appendChild(empty);
-    return;
-  }
-
-  allEvents.forEach(function(ev) {
-    var group = document.createElement('div');
-    group.className = 'event-group';
-
-    var title = document.createElement('div');
-    title.className = 'event-title';
-    if (currentEvent === ev.event_id) title.className += ' active';
-    title.textContent = ev.event_id + ' (' + ev.count + ')';
-    title.setAttribute('data-eid', ev.event_id);
-    title.addEventListener('click', function() { selectEvent(ev.event_id); });
-    group.appendChild(title);
-
-    var flist = document.createElement('div');
-    flist.className = 'frame-list' + (currentEvent === ev.event_id ? ' open' : '');
-    ev.frames.forEach(function(fname, i) {
-      var item = document.createElement('div');
-      item.className = 'frame-item';
-      if (currentEvent === ev.event_id && currentIdx === i) item.className += ' selected';
-      item.textContent = fname;
-      item.addEventListener('click', function() { selectFrame(ev.event_id, i); });
-      flist.appendChild(item);
-    });
-    group.appendChild(flist);
-    sb.appendChild(group);
-  });
-}
-
-function selectEvent(eid) {
-  var ev = allEvents.find(function(e) { return e.event_id === eid; });
-  if (!ev) return;
-  currentEvent = eid;
-  currentFrames = ev.frames;
-  renderSidebar();
-  renderFilmstrip();
-  selectFrame(eid, 0);
-}
-
-function renderFilmstrip() {
-  var strip = document.getElementById('filmstrip');
-  while (strip.firstChild) strip.removeChild(strip.firstChild);
-  currentFrames.forEach(function(fname, i) {
-    var thumb = document.createElement('div');
-    thumb.className = 'thumb' + (i === currentIdx ? ' selected' : '');
-    var img = document.createElement('img');
-    img.src = '/api/loss_events/' + currentEvent + '/frame/frames/' + fname;
-    img.alt = fname;
-    thumb.appendChild(img);
-    thumb.addEventListener('click', function() { selectFrame(currentEvent, i); });
-    strip.appendChild(thumb);
-  });
-}
-
-function selectFrame(eid, idx) {
-  currentEvent = eid;
-  currentIdx = idx;
-  var fname = currentFrames[idx];
-  if (!fname) return;
-
-  // Update viewer with YOLO-annotated image
-  var viewer = document.getElementById('viewer');
-  while (viewer.firstChild) viewer.removeChild(viewer.firstChild);
-  var img = document.createElement('img');
-  img.src = '/api/yolo/detect/' + eid + '/' + fname;
-  img.alt = 'YOLO detection: ' + fname;
-  viewer.appendChild(img);
-
-  // Update filmstrip selection
-  var thumbs = document.querySelectorAll('.filmstrip .thumb');
-  thumbs.forEach(function(t, i) {
-    t.className = 'thumb' + (i === idx ? ' selected' : '');
-  });
-
-  // Update sidebar selection
-  var items = document.querySelectorAll('.frame-item');
-  items.forEach(function(item) { item.classList.remove('selected'); });
-  var activeItems = document.querySelectorAll('.frame-list.open .frame-item');
-  if (activeItems[idx]) activeItems[idx].classList.add('selected');
-
-  // Fetch JSON results for detail bar
-  var bar = document.getElementById('detail-bar');
-  while (bar.firstChild) bar.removeChild(bar.firstChild);
-  var loadSpan = document.createElement('span');
-  loadSpan.className = 'loading';
-  loadSpan.textContent = 'Running YOLO...';
-  bar.appendChild(loadSpan);
-
-  fetch('/api/yolo/detect_json/' + eid + '/' + fname)
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-      renderDetailBar(data, fname);
-    });
-}
-
-function renderDetailBar(data, fname) {
-  var bar = document.getElementById('detail-bar');
-  while (bar.firstChild) bar.removeChild(bar.firstChild);
-
-  // Frame name
-  addDetail(bar, 'Frame', fname);
-
-  var dets = data.detections || [];
-  if (dets.length === 0) {
-    var nodet = document.createElement('span');
-    nodet.className = 'det-none';
-    nodet.textContent = 'No detection';
-    bar.appendChild(nodet);
-  } else {
-    var d = dets[0];
-    addDetail(bar, 'Position', d.cx + ', ' + d.cy);
-
-    var confSpan = document.createElement('span');
-    var confLabel = document.createElement('span');
-    confLabel.className = 'label';
-    confLabel.textContent = 'Conf:';
-    confSpan.appendChild(confLabel);
-    var confVal = document.createElement('span');
-    confVal.className = 'det-conf';
-    confVal.textContent = ' ' + (d.confidence * 100).toFixed(1) + '%';
-    confSpan.appendChild(confVal);
-    bar.appendChild(confSpan);
-
-    addDetail(bar, 'Inference', d.inference_ms.toFixed(1) + 'ms');
-
-    if (data.tracked_position) {
-      var tp = data.tracked_position;
-      var dist = Math.sqrt(Math.pow(d.cx - tp.x, 2) + Math.pow(d.cy - tp.y, 2));
-      var distColor = dist < 30 ? '#2ecc71' : dist < 80 ? '#f39c12' : '#e74c3c';
-      var distSpan = document.createElement('span');
-      var distLabel = document.createElement('span');
-      distLabel.className = 'label';
-      distLabel.textContent = 'vs Tracked:';
-      distSpan.appendChild(distLabel);
-      var distVal = document.createElement('span');
-      distVal.style.color = distColor;
-      distVal.style.marginLeft = '4px';
-      distVal.textContent = dist.toFixed(0) + 'px';
-      distSpan.appendChild(distVal);
-      bar.appendChild(distSpan);
-    }
-  }
-
-  if (dets.length > 1) {
-    addDetail(bar, 'Total', dets.length + ' detections');
-  }
-}
-
-function addDetail(parent, label, value) {
-  var span = document.createElement('span');
-  var lbl = document.createElement('span');
-  lbl.className = 'label';
-  lbl.textContent = label + ':';
-  span.appendChild(lbl);
-  var val = document.createElement('span');
-  val.className = 'value';
-  val.textContent = ' ' + value;
-  span.appendChild(val);
-  parent.appendChild(span);
-}
-
-document.addEventListener('keydown', function(e) {
-  if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
-    e.preventDefault();
-    if (currentIdx < currentFrames.length - 1) selectFrame(currentEvent, currentIdx + 1);
-  } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
-    e.preventDefault();
-    if (currentIdx > 0) selectFrame(currentEvent, currentIdx - 1);
-  }
-});
-
-loadEvents();
-</script>
-</body>
-</html>"""
-
-
-# ── Loss Events HTML ────────────────────────────────────────────────
-
-LOSS_EVENTS_HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>Cursor Loss Events</title>
-<style>
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: 'JetBrains Mono', monospace; background: #0a0a0f; color: #c8c8d0; }
-.header { background: #101018; padding: 0.6rem 1.5rem; border-bottom: 2px solid #e74c3c;
-    display: flex; justify-content: space-between; align-items: center; }
-.header h1 { color: #e74c3c; font-size: 1.1rem; letter-spacing: 1px; }
-.nav a { color: #888; text-decoration: none; font-size: 0.75rem; margin-left: 1rem; }
-.nav a:hover { color: #fff; }
-.events-list { padding: 1rem; }
-.event-card { background: #14141f; border: 1px solid #222; border-radius: 6px; padding: 1rem; margin-bottom: 0.8rem; cursor: pointer; }
-.event-card:hover { border-color: #e74c3c; }
-.event-card .meta { display: flex; gap: 1.5rem; font-size: 0.75rem; color: #888; margin-top: 0.4rem; }
-.event-card .trigger { color: #e74c3c; font-weight: bold; }
-.event-card .recovered { color: #2ecc71; }
-.event-card .not-recovered { color: #e74c3c; }
-.badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.65rem; }
-.badge-had { background: #1a3a1a; color: #2ecc71; }
-.badge-lost { background: #3a1a1a; color: #e74c3c; }
-.badge-recovered { background: #1a2a3a; color: #3498db; }
-
-/* Timeline view */
-.timeline-view { display: none; padding: 1rem; }
-.timeline-view.active { display: block; }
-.back-btn { background: #222; color: #aaa; border: 1px solid #333; padding: 4px 12px; border-radius: 4px; cursor: pointer; margin-bottom: 1rem; font-size: 0.75rem; }
-.back-btn:hover { color: #fff; border-color: #e74c3c; }
-.tl-header { margin-bottom: 1rem; }
-.tl-header h2 { color: #e74c3c; font-size: 1rem; }
-.tl-header .tl-meta { font-size: 0.75rem; color: #888; margin-top: 0.3rem; }
-
-.tl-strip { display: flex; overflow-x: auto; gap: 4px; padding: 0.5rem 0; }
-.tl-frame { flex-shrink: 0; width: 120px; text-align: center; cursor: pointer; border: 2px solid transparent; border-radius: 4px; padding: 2px; }
-.tl-frame:hover { border-color: #555; }
-.tl-frame.selected { border-color: #e74c3c; }
-.tl-frame.phase-had_it { border-bottom: 3px solid #2ecc71; }
-.tl-frame.phase-lost { border-bottom: 3px solid #e74c3c; }
-.tl-frame.phase-recovering { border-bottom: 3px solid #f39c12; }
-.tl-frame.phase-recovered { border-bottom: 3px solid #3498db; }
-.tl-frame img { width: 116px; height: 65px; object-fit: cover; border-radius: 2px; background: #000; }
-.tl-frame .tl-label { font-size: 0.55rem; color: #888; margin-top: 2px; }
-.tl-frame .tl-conf { font-size: 0.55rem; }
-
-.detail-panel { display: flex; gap: 1rem; margin-top: 1rem; }
-.detail-frame { flex: 1; }
-.detail-frame img { width: 100%; image-rendering: auto; border-radius: 4px; border: 1px solid #333; }
-.detail-patch { width: 200px; }
-.detail-patch img { width: 192px; height: 192px; image-rendering: pixelated; border: 1px solid #333; border-radius: 4px; }
-.detail-info { flex: 1; font-size: 0.7rem; }
-.detail-info table { width: 100%; border-collapse: collapse; }
-.detail-info td { padding: 3px 6px; border-bottom: 1px solid #1a1a2a; }
-.detail-info td:first-child { color: #888; width: 120px; }
-.conf-bar { display: inline-block; height: 8px; border-radius: 2px; }
-.conf-high { background: #2ecc71; }
-.conf-mid { background: #f39c12; }
-.conf-low { background: #e74c3c; }
-.empty-state { text-align: center; padding: 4rem 2rem; color: #555; }
-.empty-state p { margin-top: 0.5rem; font-size: 0.8rem; }
-.ring-status { font-size: 0.7rem; color: #555; margin-left: 1rem; }
-</style>
-</head>
-<body>
-<div class="header">
-  <div style="display:flex;align-items:center;gap:1rem;">
-    <h1>CURSOR LOSS EVENTS</h1>
-    <span class="ring-status" id="ring-status"></span>
-  </div>
-  <div class="nav">
-    <a href="/">Dashboard</a>
-    <a href="/validation">Validation</a>
-    <a href="/profiler">Profiler</a>
-    <a href="/loss_events">Loss Events</a>
-    <a href="/yolo">YOLO Gallery</a>
-  </div>
-</div>
-
-<div class="events-list" id="events-list"></div>
-
-<div class="timeline-view" id="timeline-view">
-  <button class="back-btn" onclick="showList()">&larr; Back to events</button>
-  <div class="tl-header" id="tl-header"></div>
-  <div class="tl-strip" id="tl-strip"></div>
-  <div class="detail-panel" id="detail-panel"></div>
-</div>
-
-<script>
-var events = [];
-var currentTimeline = [];
-var currentEventId = null;
-var selectedIdx = 0;
-
-async function loadEvents() {
-  var res = await fetch('/api/loss_events');
-  var data = await res.json();
-  events = data.events;
-  document.getElementById('ring-status').textContent =
-    'Ring buffer: ' + data.ring_buffer_size + ' frames | ' +
-    (data.active ? 'CAPTURING...' : 'watching');
-  renderEventsList();
-}
-
-function renderEventsList() {
-  var el = document.getElementById('events-list');
-  if (events.length === 0) {
-    el.innerHTML = '<div class="empty-state"><h2>No loss events captured yet</h2>' +
-      '<p>Events are recorded automatically when cursor confidence drops.<br>' +
-      'The ring buffer holds the last 60 seconds — when a loss happens, it saves the timeline.</p></div>';
-    return;
-  }
-  var html = '';
-  for (var i = 0; i < events.length; i++) {
-    var ev = events[i];
-    var recClass = ev.recovered ? 'recovered' : 'not-recovered';
-    var recText = ev.recovered ? 'Recovered' : 'Not recovered';
-    html += '<div class="event-card" onclick="openEvent(\'' + ev.event_id + '\')">' +
-      '<span class="trigger">' + ev.trigger + '</span>' +
-      '<div class="meta">' +
-      '<span>' + ev.trigger_utc + '</span>' +
-      '<span>' + ev.total_frames + ' frames</span>' +
-      '<span>' + ev.duration_s + 's duration</span>' +
-      '<span class="' + recClass + '">' + recText + '</span>' +
-      (ev.phases ? ' <span class="badge badge-had">' + ev.phases.had_it + ' had</span>' +
-        '<span class="badge badge-lost">' + ev.phases.lost + ' lost</span>' +
-        '<span class="badge badge-recovered">' + (ev.phases.recovering + ev.phases.recovered) + ' recovery</span>' : '') +
-      '</div></div>';
-  }
-  el.innerHTML = html;
-}
-
-async function openEvent(eventId) {
-  currentEventId = eventId;
-  var res = await fetch('/api/loss_events/' + eventId + '/timeline');
-  var data = await res.json();
-  currentTimeline = data.timeline;
-
-  document.getElementById('events-list').style.display = 'none';
-  document.getElementById('timeline-view').classList.add('active');
-
-  var m = data.manifest;
-  document.getElementById('tl-header').innerHTML =
-    '<h2>' + m.trigger + '</h2>' +
-    '<div class="tl-meta">' + m.trigger_utc + ' | ' + m.total_frames + ' frames | ' +
-    m.duration_s + 's | ' + (m.recovered ? 'Recovered' : 'Not recovered') + '</div>';
-
-  renderStrip();
-  selectFrame(0);
-}
-
-function renderStrip() {
-  var html = '';
-  for (var i = 0; i < currentTimeline.length; i++) {
-    var t = currentTimeline[i];
-    var confClass = t.live_cnn.confidence > 0.7 ? 'conf-high' : (t.live_cnn.confidence > 0.4 ? 'conf-mid' : 'conf-low');
-    var src = t.frame ? '/api/loss_events/' + currentEventId + '/frame/' + t.frame : '';
-    html += '<div class="tl-frame phase-' + t.phase + (i === selectedIdx ? ' selected' : '') + '" onclick="selectFrame(' + i + ')">' +
-      (src ? '<img src="' + src + '" loading="lazy">' : '<div style="width:116px;height:65px;background:#111"></div>') +
-      '<div class="tl-label">' + t.t_offset_s + 's · ' + t.phase + '</div>' +
-      '<div class="tl-conf"><span class="conf-bar ' + confClass + '" style="width:' + Math.round(t.live_cnn.confidence * 60) + 'px"></span> ' +
-      (t.live_cnn.confidence * 100).toFixed(0) + '%</div>' +
-      '</div>';
-  }
-  document.getElementById('tl-strip').innerHTML = html;
-}
-
-function selectFrame(idx) {
-  selectedIdx = idx;
-  var t = currentTimeline[idx];
-
-  // Update strip selection
-  var frames = document.querySelectorAll('.tl-frame');
-  frames.forEach(function(f, i) { f.classList.toggle('selected', i === idx); });
-  if (frames[idx]) frames[idx].scrollIntoView({behavior: 'smooth', block: 'nearest', inline: 'center'});
-
-  // Build detail panel
-  var frameSrc = t.frame ? '/api/loss_events/' + currentEventId + '/frame/' + t.frame : '';
-  var patchSrc = t.patch ? '/api/loss_events/' + currentEventId + '/frame/' + t.patch : '';
-
-  var liveConf = t.live_cnn.confidence;
-  var retroConf = t.retrospective_cnn.confidence;
-  function confColor(c) { return c > 0.7 ? '#2ecc71' : (c > 0.4 ? '#f39c12' : '#e74c3c'); }
-
-  var html = '<div class="detail-frame">' +
-    (frameSrc ? '<img src="' + frameSrc + '">' : '<div style="height:300px;background:#111;border-radius:4px;"></div>') +
-    '</div>' +
-    '<div class="detail-patch">' +
-    '<div style="font-size:0.65rem;color:#888;margin-bottom:4px">64x64 patch at (' + t.cursor.x + ',' + t.cursor.y + ')</div>' +
-    (patchSrc ? '<img src="' + patchSrc + '">' : '<div style="width:192px;height:192px;background:#111;border-radius:4px;"></div>') +
-    '</div>' +
-    '<div class="detail-info"><table>' +
-    '<tr><td>Time offset</td><td>' + t.t_offset_s + 's</td></tr>' +
-    '<tr><td>Phase</td><td style="color:' + (t.phase === 'had_it' ? '#2ecc71' : t.phase === 'lost' ? '#e74c3c' : '#f39c12') + '">' + t.phase + '</td></tr>' +
-    '<tr><td>Position</td><td>(' + t.cursor.x + ', ' + t.cursor.y + ')</td></tr>' +
-    '<tr><td>Method</td><td>' + t.cursor.method + '</td></tr>' +
-    '<tr><td>Validated</td><td>' + (t.cursor.validated ? '<span style="color:#2ecc71">YES</span>' : '<span style="color:#e74c3c">NO</span>') + '</td></tr>' +
-    '<tr><td>Live CNN</td><td><span style="color:' + confColor(liveConf) + '">' + (liveConf * 100).toFixed(1) + '%</span> (' + t.live_cnn.model + ')</td></tr>' +
-    '<tr><td>Retro CNN</td><td><span style="color:' + confColor(retroConf) + '">' + (retroConf * 100).toFixed(1) + '%</span> (' + t.retrospective_cnn.inference_ms + 'ms)</td></tr>' +
-    '<tr><td>Silhouette</td><td>' + (t.silhouette.confidence * 100).toFixed(0) + '% · ' + t.silhouette.method + ' · ROI ' + t.silhouette.roi_size + ' · misses ' + t.silhouette.misses + '</td></tr>' +
-    '<tr><td>Blobs</td><td>' + t.blob_count + '</td></tr>' +
-    '<tr><td>Velocity</td><td>' + (t.velocity_px_s || 0) + ' px/s</td></tr>' +
-    '<tr><td>Acceleration</td><td>' + (t.acceleration_px_s2 || 0) + ' px/s²</td></tr>' +
-    (t.edge_cases && t.edge_cases.length > 0 ?
-      '<tr><td>Edge cases</td><td>' + t.edge_cases.map(function(c) {
-        return '<span style="background:#3a1a2a;color:#e74c3c;padding:1px 6px;border-radius:8px;font-size:0.6rem;margin-right:4px">' + c + '</span>';
-      }).join('') + '</td></tr>' : '') +
-    '</table>';
-
-  // Blob candidates with CNN scores
-  if (t.blob_candidates && t.blob_candidates.length > 0) {
-    html += '<div style="margin-top:8px;font-size:0.65rem;color:#888">Blob candidates (CNN scored):</div>';
-    html += '<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px">';
-    for (var bi = 0; bi < t.blob_candidates.length; bi++) {
-      var bc = t.blob_candidates[bi];
-      var bcColor = bc.cnn_score > 0.7 ? '#2ecc71' : (bc.cnn_score > 0.4 ? '#f39c12' : '#e74c3c');
-      var bcSrc = '/api/loss_events/' + currentEventId + '/frame/' + bc.patch;
-      html += '<div style="text-align:center">' +
-        '<img src="' + bcSrc + '" style="width:64px;height:64px;image-rendering:pixelated;border:1px solid #333;border-radius:2px">' +
-        '<div style="font-size:0.55rem;color:' + bcColor + '">' + (bc.cnn_score * 100).toFixed(0) + '% (' + bc.centroid[0] + ',' + bc.centroid[1] + ')</div>' +
-        '</div>';
-    }
-    html += '</div>';
-  }
-
-  html += '</div>';
-
-  document.getElementById('detail-panel').innerHTML = html;
-}
-
-function showList() {
-  document.getElementById('events-list').style.display = '';
-  document.getElementById('timeline-view').classList.remove('active');
-}
-
-// Keyboard nav: left/right to scrub timeline
-document.addEventListener('keydown', function(e) {
-  if (!document.getElementById('timeline-view').classList.contains('active')) return;
-  if (e.key === 'ArrowLeft' || e.key === 'j') { e.preventDefault(); if (selectedIdx > 0) selectFrame(selectedIdx - 1); }
-  if (e.key === 'ArrowRight' || e.key === 'k') { e.preventDefault(); if (selectedIdx < currentTimeline.length - 1) selectFrame(selectedIdx + 1); }
-});
-
-loadEvents();
-setInterval(loadEvents, 10000);
-</script>
-</body>
-</html>"""
-
-
-# ── Dashboard HTML ──────────────────────────────────────────────────
-
-DASHBOARD_HTML = r"""
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>KVM Motion Detector</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: 'JetBrains Mono', 'Fira Code', monospace;
-            background: #0a0a0f;
-            color: #c8c8d0;
-        }
-        .header {
-            background: #101018;
-            padding: 0.6rem 1.5rem;
-            border-bottom: 2px solid #ff4444;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .header h1 { color: #ff4444; font-size: 1.1rem; letter-spacing: 1px; }
-        .header .status { font-size: 0.8rem; display: flex; gap: 1.5rem; }
-        .dot {
-            display: inline-block; width: 8px; height: 8px;
-            border-radius: 50%; margin-right: 4px; vertical-align: middle;
-        }
-        .dot.green { background: #2ecc71; box-shadow: 0 0 6px #2ecc71; }
-        .dot.red { background: #e74c3c; box-shadow: 0 0 6px #e74c3c; }
-        .dot.yellow { background: #f1c40f; box-shadow: 0 0 6px #f1c40f; }
-        .dot.gray { background: #555; }
-        .main {
-            display: grid;
-            grid-template-columns: 1fr 320px;
-            height: calc(100vh - 50px);
-        }
-        .feed {
-            background: #000; overflow: hidden;
-            display: flex; justify-content: center; align-items: center;
-        }
-        .video-wrapper {
-            position: relative; display: flex; justify-content: center;
-            align-items: center; width: 100%; height: 100%;
-        }
-        #video-area { position: relative; max-width: 100%; max-height: 100%; overflow: hidden; }
-        #video-area img { display: block; max-width: 100%; max-height: calc(100vh - 50px); }
-        .cursor-dot {
-            position: absolute; width: 24px; height: 24px;
-            border-radius: 50%; pointer-events: none;
-            background: radial-gradient(circle, #fff 20%, #00ff00 50%, transparent 70%);
-            box-shadow: 0 0 12px #00ff00, 0 0 24px #00ff0088;
-            transform: translate(-50%, -50%);
-            animation: cursor-pulse 1.5s ease-in-out infinite;
-            z-index: 10; display: none;
-        }
-        .vision-dot {
-            position: absolute; width: 18px; height: 18px;
-            border-radius: 50%; pointer-events: none;
-            background: radial-gradient(circle, #fff 20%, #a855f7 50%, transparent 70%);
-            box-shadow: 0 0 10px #a855f7, 0 0 20px #a855f788;
-            transform: translate(-50%, -50%);
-            z-index: 9; display: none;
-        }
-        @keyframes cursor-pulse {
-            0%, 100% { opacity: 1; box-shadow: 0 0 12px #00ff00, 0 0 24px #00ff0088; }
-            50% { opacity: 0.7; box-shadow: 0 0 20px #00ff00, 0 0 40px #00ff0066; }
-        }
-        .sidebar {
-            background: #101018; border-left: 1px solid #222;
-            overflow-y: auto;
-        }
-        .panel { border-bottom: 1px solid #1a1a25; padding: 0.8rem; }
-        .tag-btn {
-            background: #333; color: #ccc; border: 1px solid #555; padding: 2px 6px;
-            cursor: pointer; border-radius: 3px; font-size: 0.65rem; margin: 1px;
-            transition: all 0.15s;
-        }
-        .tag-btn:hover { border-color: #f39c12; color: #fff; }
-        .tag-btn.selected { border-color: #f39c12; color: #fff; box-shadow: 0 0 4px #f39c12; }
-        .tag-group { display: flex; flex-wrap: wrap; gap: 2px; }
-        .panel-title {
-            font-size: 0.7rem; text-transform: uppercase;
-            letter-spacing: 2px; color: #ff4444; margin-bottom: 0.6rem;
-        }
-        .blob-table { width: 100%; font-size: 0.75rem; border-collapse: collapse; }
-        .blob-table th {
-            text-align: left; color: #666; font-weight: normal;
-            padding: 2px 6px; border-bottom: 1px solid #1a1a25;
-        }
-        .blob-table td { padding: 2px 6px; font-variant-numeric: tabular-nums; }
-        .hw-row {
-            display: flex; justify-content: space-between;
-            padding: 3px 0; font-size: 0.8rem;
-        }
-        .hw-label { color: #666; }
-        .hw-value { font-weight: 600; }
-        .hw-value.ok { color: #2ecc71; }
-        .hw-value.warn { color: #f1c40f; }
-        .hw-value.err { color: #e74c3c; }
-        .cursor-display {
-            background: #0a0a12; border: 1px solid #222;
-            border-radius: 4px; padding: 0.6rem; text-align: center;
-        }
-        .cursor-coords {
-            font-size: 1.4rem; font-weight: bold;
-            color: #ff4444; margin-bottom: 0.3rem;
-        }
-        .cursor-meta { font-size: 0.7rem; color: #666; }
-        .jitter-bar {
-            height: 20px; background: #0a0a12; border: 1px solid #222;
-            border-radius: 3px; overflow: hidden; position: relative; margin-top: 4px;
-        }
-        .jitter-pulse {
-            position: absolute; height: 100%;
-            background: linear-gradient(90deg, transparent, #2ecc71, transparent);
-            width: 30px; display: none;
-            animation: jitter-sweep 30s linear infinite;
-        }
-        .jitter-bar.active .jitter-pulse { display: block; }
-        @keyframes jitter-sweep {
-            0% { left: -30px; }
-            0.5% { left: 50%; }
-            1% { left: -30px; }
-            100% { left: -30px; }
-        }
-        .tier-indicator { display: flex; gap: 4px; margin-top: 4px; }
-        .tier {
-            flex: 1; text-align: center; padding: 3px 0; border-radius: 3px;
-            font-size: 0.65rem; background: #1a1a25; color: #444;
-            transition: all 0.3s;
-        }
-        .tier.active { color: #fff; font-weight: bold; }
-        .tier.t1.active { background: #2ecc71; color: #000; }
-        .tier.t2.active { background: #f1c40f; color: #000; }
-        .tier.t3.active { background: #e74c3c; }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <div style="display:flex; align-items:center; gap:1rem;">
-            <h1>KVM</h1>
-            <a href="/profiler" style="color:#888; text-decoration:none; font-size:0.75rem;">Profiler</a>
-            <a href="/validation" style="color:#888; text-decoration:none; font-size:0.75rem;">Validation</a>
-            <a href="/loss_events" style="color:#888; text-decoration:none; font-size:0.75rem;">Loss Events</a>
-            <a href="/yolo" style="color:#888; text-decoration:none; font-size:0.75rem;">YOLO Gallery</a>
-            <a href="/concepts" style="color:#888; text-decoration:none; font-size:0.75rem;">Concepts</a>
-        </div>
-        <div class="status">
-            <span><span id="dot-mouse" class="dot gray"></span> Mouse</span>
-            <span><span id="dot-heartbeat" class="dot gray"></span> Heartbeat</span>
-            <span><span id="dot-jitter" class="dot gray"></span> Jitter</span>
-            <span><span id="dot-keyboard" class="dot gray"></span> Pi KB</span>
-            <span id="fps-display" style="color: #666;">0 FPS</span>
-        </div>
-    </div>
-    <div class="main">
-        <div class="feed" id="feed-container">
-            <div class="video-wrapper">
-                <div id="video-area">
-                    <img id="live-frame" src="" alt="Loading...">
-                    <div class="cursor-dot" id="cursor-dot"></div>
-                    <div class="vision-dot" id="vision-dot"></div>
-                    <div id="pause-overlay" style="display:none; position:absolute; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.3); z-index:10; justify-content:center; align-items:center; font-size:1.5rem; color:#f39c12; font-weight:bold; letter-spacing:4px; text-shadow:0 0 10px #000;">PAUSED — TAG &amp; RESUME</div>
-                </div>
-            </div>
-        </div>
-        <div class="sidebar">
-            <div class="panel">
-                <div class="panel-title">Cursor Position</div>
-                <div class="cursor-display">
-                    <div class="cursor-coords" id="cursor-coords">(?, ?)</div>
-                    <div class="cursor-meta">
-                        <span id="cursor-method">—</span> |
-                        age: <span id="cursor-age">—</span>s
-                    </div>
-                </div>
-                <div class="tier-indicator">
-                    <div class="tier t1" id="tier-1" title="Motion tracking or silhouette following — fast, per-frame">T1 Micro</div>
-                    <div class="tier t2" id="tier-2" title="CNN re-acquisition or macro shake — cursor was lost, searching nearby">T2 Macro</div>
-                    <div class="tier t3" id="tier-3" title="Lissajous sweep — brute-force finder, sweeps entire screen">T3 Lissajous</div>
-                </div>
-                <div class="panel-help" id="cursor-help">
-                    Green = fresh position, yellow = stale (&gt;5s), red = lost (&gt;15s).<br>
-                    <b>Method</b>: how the position was last determined — motion_track (frame diff), sil_template (silhouette match), dual_probe (jitter re-acquisition), vision_anchor (Claude Vision).
-                </div>
-            </div>
-            <div class="panel">
-                <div class="panel-title">Motion Blobs (<span id="blob-count">0</span>)</div>
-                <table class="blob-table">
-                    <thead><tr><th>Centroid</th><th>Size</th><th>Angle</th></tr></thead>
-                    <tbody id="blob-list"></tbody>
-                </table>
-            </div>
-            <div class="panel">
-                <div class="panel-title" style="color:#0ff">YOLO Full-Screen</div>
-                <div class="hw-row">
-                    <span class="hw-label">Status</span>
-                    <span class="hw-value" id="yolo-status">—</span>
-                </div>
-                <div class="hw-row">
-                    <span class="hw-label">Position</span>
-                    <span class="hw-value" id="yolo-position" style="color:#888">—</span>
-                </div>
-                <div class="hw-row">
-                    <span class="hw-label">Confidence</span>
-                    <span class="hw-value" id="yolo-confidence">—</span>
-                </div>
-                <div class="hw-row">
-                    <span class="hw-label">Inference</span>
-                    <span class="hw-value" id="yolo-inference" style="color:#888">—</span>
-                </div>
-                <div class="hw-row">
-                    <span class="hw-label">Detections</span>
-                    <span class="hw-value" id="yolo-count" style="color:#888">—</span>
-                </div>
-            </div>
-            <div class="panel">
-                <div class="panel-title">Silhouette Tracking</div>
-                <div class="hw-row">
-                    <span class="hw-label">Status</span>
-                    <span class="hw-value" id="sil-status">—</span>
-                </div>
-                <div class="hw-row">
-                    <span class="hw-label">Method</span>
-                    <span class="hw-value" id="sil-method" style="color:#888">—</span>
-                </div>
-                <div class="hw-row">
-                    <span class="hw-label">Hz</span>
-                    <span class="hw-value" id="sil-hz" style="color:#888">—</span>
-                </div>
-                <div class="hw-row">
-                    <span class="hw-label">ROI</span>
-                    <span class="hw-value" id="sil-roi" style="color:#888">—</span>
-                </div>
-                <div class="hw-row">
-                    <span class="hw-label">Confidence</span>
-                    <span class="hw-value" id="sil-confidence">—</span>
-                </div>
-                <div class="hw-row">
-                    <span class="hw-label">Latency</span>
-                    <span class="hw-value" id="sil-latency" style="color:#888">—</span>
-                </div>
-                <div class="hw-row">
-                    <span class="hw-label">Trusted</span>
-                    <span class="hw-value" id="sil-trusted" style="color:#888">—</span>
-                </div>
-            </div>
-            <div class="panel">
-                <div class="panel-title">CNN Cursor Recognition</div>
-                <div class="hw-row">
-                    <span class="hw-label">Confidence</span>
-                    <span class="hw-value" id="cnn-confidence">—</span>
-                </div>
-                <div style="height:8px; background:#1a1a25; border-radius:4px; overflow:hidden; margin:4px 0;">
-                    <div id="cnn-bar" style="height:100%; width:0%; transition:width 0.3s; border-radius:4px;"></div>
-                </div>
-                <div class="hw-row">
-                    <span class="hw-label">Model</span>
-                    <span class="hw-value" id="cnn-model" style="color:#888">—</span>
-                </div>
-                <div class="hw-row">
-                    <span class="hw-label">Validated</span>
-                    <span class="hw-value" id="cnn-validated">—</span>
-                </div>
-                <div class="hw-row">
-                    <span class="hw-label">Inference</span>
-                    <span class="hw-value" id="cnn-inference" style="color:#888">—</span>
-                </div>
-                <div class="hw-row">
-                    <span class="hw-label">Samples</span>
-                    <span class="hw-value" id="cnn-samples" style="color:#888">0 pos / 0 neg</span>
-                </div>
-            </div>
-            <div class="panel">
-                <div class="panel-title" style="color:#9b59b6">Claude Vision (Ground Truth)</div>
-                <div class="hw-row">
-                    <span class="hw-label">Position</span>
-                    <span class="hw-value" id="vision-pos" style="color:#888">—</span>
-                </div>
-                <div class="hw-row">
-                    <span class="hw-label">Confidence</span>
-                    <span class="hw-value" id="vision-confidence">—</span>
-                </div>
-                <div class="hw-row">
-                    <span class="hw-label">Cursor Type</span>
-                    <span class="hw-value" id="vision-type" style="color:#888">—</span>
-                </div>
-                <div class="hw-row">
-                    <span class="hw-label">Latency</span>
-                    <span class="hw-value" id="vision-latency" style="color:#888">—</span>
-                </div>
-                <div class="hw-row">
-                    <span class="hw-label">Last Run</span>
-                    <span class="hw-value" id="vision-age" style="color:#888">Never</span>
-                </div>
-                <div class="hw-row">
-                    <span class="hw-label">Tracker Delta</span>
-                    <span class="hw-value" id="vision-delta" style="color:#888">—</span>
-                </div>
-                <div style="margin-top:6px;">
-                    <button onclick="runVisionDetect()" id="vision-btn" style="background:#9b59b6; color:#fff; border:none; padding:4px 12px; border-radius:4px; cursor:pointer; font-size:0.7rem;">Run Detection</button>
-                </div>
-            </div>
-            <div class="panel">
-                <div class="panel-title">Anti-Sleep Jitter</div>
-                <div class="hw-row">
-                    <span class="hw-label">Status</span>
-                    <span class="hw-value" id="jitter-status">—</span>
-                </div>
-                <div class="jitter-bar" id="jitter-bar">
-                    <div class="jitter-pulse"></div>
-                </div>
-                <div style="font-size:0.65rem; color:#444; margin-top:3px;" id="jitter-desc">
-                    ±3px every 30s — prevents Windows sleep
-                </div>
-            </div>
-            <div class="panel">
-                <div class="panel-title">Hardware</div>
-                <div class="hw-row">
-                    <span class="hw-label">ESP32 Mouse</span>
-                    <span class="hw-value" id="hw-mouse">—</span>
-                </div>
-                <div class="hw-row">
-                    <span class="hw-label">BLE Heartbeat</span>
-                    <span class="hw-value" id="hw-heartbeat">—</span>
-                </div>
-                <div class="hw-row">
-                    <span class="hw-label">Pi Keyboard</span>
-                    <span class="hw-value" id="hw-keyboard">—</span>
-                </div>
-                <div class="hw-row">
-                    <span class="hw-label">Frame Count</span>
-                    <span class="hw-value" id="hw-frames" style="color:#888">0</span>
-                </div>
-            </div>
-            <div class="panel" style="border-color:#f39c12">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.6rem;">
-                    <div class="panel-title" style="color:#f39c12; margin-bottom:0">Tag Frame</div>
-                    <button id="pause-btn" onclick="togglePause()" style="background:#f39c12; color:#000; border:none; padding:3px 10px; cursor:pointer; border-radius:3px; font-weight:bold; font-size:0.65rem;">PAUSE (TAG)</button>
-                </div>
-                <div style="display:grid; grid-template-columns:1fr 1fr; gap:4px; font-size:0.7rem;">
-                    <div>
-                        <div style="color:#888; margin-bottom:2px;">Cursor Correct?</div>
-                        <div class="tag-group" id="tag-cursor-correct">
-                            <button class="tag-btn" data-dim="cursor_correct" data-val="yes" style="background:#27ae60">Yes</button>
-                            <button class="tag-btn" data-dim="cursor_correct" data-val="no" style="background:#e74c3c">No</button>
-                            <button class="tag-btn" data-dim="cursor_correct" data-val="unsure" style="background:#7f8c8d">?</button>
-                        </div>
-                    </div>
-                    <div>
-                        <div style="color:#888; margin-bottom:2px;">Cursor Type</div>
-                        <div class="tag-group" id="tag-cursor-type">
-                            <button class="tag-btn" data-dim="cursor_type" data-val="arrow">Arrow</button>
-                            <button class="tag-btn" data-dim="cursor_type" data-val="hand">Hand</button>
-                            <button class="tag-btn" data-dim="cursor_type" data-val="caret">Caret</button>
-                            <button class="tag-btn" data-dim="cursor_type" data-val="other">Other</button>
-                        </div>
-                    </div>
-                    <div>
-                        <div style="color:#888; margin-bottom:2px;">Movement</div>
-                        <div class="tag-group" id="tag-movement">
-                            <button class="tag-btn" data-dim="movement" data-val="stationary">Still</button>
-                            <button class="tag-btn" data-dim="movement" data-val="slow">Slow</button>
-                            <button class="tag-btn" data-dim="movement" data-val="medium">Med</button>
-                            <button class="tag-btn" data-dim="movement" data-val="fast">Fast</button>
-                        </div>
-                    </div>
-                    <div>
-                        <div style="color:#888; margin-bottom:2px;">Track Quality</div>
-                        <div class="tag-group" id="tag-track-quality">
-                            <button class="tag-btn" data-dim="track_quality" data-val="accurate" style="background:#27ae60">Good</button>
-                            <button class="tag-btn" data-dim="track_quality" data-val="drifting" style="background:#f39c12">Drift</button>
-                            <button class="tag-btn" data-dim="track_quality" data-val="wrong_target" style="background:#e74c3c">Wrong</button>
-                            <button class="tag-btn" data-dim="track_quality" data-val="lost" style="background:#c0392b">Lost</button>
-                        </div>
-                    </div>
-                    <div style="grid-column:span 2">
-                        <div style="color:#888; margin-bottom:2px;">Context</div>
-                        <div class="tag-group" id="tag-context">
-                            <button class="tag-btn" data-dim="context" data-val="desktop">Desktop</button>
-                            <button class="tag-btn" data-dim="context" data-val="browser">Browser</button>
-                            <button class="tag-btn" data-dim="context" data-val="teams">Teams</button>
-                            <button class="tag-btn" data-dim="context" data-val="app">App</button>
-                        </div>
-                    </div>
-                </div>
-                <div style="margin-top:6px; display:flex; gap:4px; align-items:center;">
-                    <input id="tag-notes" type="text" placeholder="Notes..." style="flex:1; background:#222; border:1px solid #444; color:#fff; padding:3px 6px; font-size:0.7rem; border-radius:3px;">
-                    <button id="tag-submit" onclick="submitTag()" style="background:#f39c12; color:#000; border:none; padding:4px 12px; cursor:pointer; border-radius:3px; font-weight:bold; font-size:0.7rem;">TAG</button>
-                </div>
-                <div id="tag-status" style="font-size:0.65rem; color:#888; margin-top:3px;"></div>
-            </div>
-            <div class="panel" id="error-panel" style="display:none">
-                <div class="panel-title" style="color:#e74c3c">Error</div>
-                <div id="error-text" style="font-size:0.75rem; color:#e74c3c;"></div>
-            </div>
-        </div>
-    </div>
-    <script>
-        const frameImg = document.getElementById('live-frame');
-        let seq = 0;
-
-        function updateFrame() {
-            frameImg.src = '/api/frame?' + seq++;
-        }
-
-        async function updateState() {
-            try {
-                const res = await fetch('/api/state');
-                const s = await res.json();
-                lastState = s;
-
-                document.getElementById('fps-display').textContent = s.fps + ' FPS';
-
-                setDot('dot-mouse', s.hardware.mouse_connected ? 'green' : 'red');
-                setDot('dot-heartbeat', s.hardware.heartbeat_active ? 'green' : 'gray');
-                setDot('dot-jitter', s.hardware.anti_sleep_active ? 'green' : 'gray');
-                setDot('dot-keyboard',
-                    s.pi_keyboard === true ? 'green' :
-                    s.pi_keyboard === false ? 'yellow' : 'gray');
-
-                var coordsEl = document.getElementById('cursor-coords');
-                coordsEl.textContent =
-                    '(' + s.cursor.x + ', ' + s.cursor.y + ')';
-                coordsEl.style.color = s.cursor.quality === 'good' ? '#2ecc71' :
-                    s.cursor.quality === 'stale' ? '#f1c40f' : '#e74c3c';
-                document.getElementById('cursor-method').textContent =
-                    s.cursor.method + ' [' + s.cursor.quality + ']';
-                document.getElementById('cursor-age').textContent =
-                    s.cursor.age_s + 's';
-                updateCursorDot(s.cursor.x, s.cursor.y);
-
-                var m = s.cursor.method;
-                document.getElementById('tier-1').classList.toggle('active',
-                    m === 'micro_shake' || m === 'motion_track' || m === 'shape_track');
-                document.getElementById('tier-2').classList.toggle('active',
-                    m === 'macro_shake' || m === 'cnn_reacquire');
-                document.getElementById('tier-3').classList.toggle('active', m === 'lissajous');
-
-                document.getElementById('blob-count').textContent = s.blob_count;
-                var tbody = document.getElementById('blob-list');
-                while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
-                if (s.blobs.length > 0) {
-                    s.blobs.slice(0, 8).forEach(function(b, i) {
-                        var tr = document.createElement('tr');
-                        if (i === 0) tr.style.color = '#2ecc71';
-                        var td1 = document.createElement('td');
-                        td1.textContent = '(' + b.centroid[0] + ', ' + b.centroid[1] + ')';
-                        var td2 = document.createElement('td');
-                        td2.textContent = b.pixel_count + 'px';
-                        var td3 = document.createElement('td');
-                        td3.textContent = Math.round(b.angle * 180 / Math.PI) + '\u00B0';
-                        tr.appendChild(td1);
-                        tr.appendChild(td2);
-                        tr.appendChild(td3);
-                        tbody.appendChild(tr);
-                    });
-                } else {
-                    var tr = document.createElement('tr');
-                    var td = document.createElement('td');
-                    td.colSpan = 3;
-                    td.style.color = '#444';
-                    td.textContent = 'No motion';
-                    tr.appendChild(td);
-                    tbody.appendChild(tr);
-                }
-
-                var jitterStatus = document.getElementById('jitter-status');
-                var jitterBar = document.getElementById('jitter-bar');
-                var jitterDesc = document.getElementById('jitter-desc');
-                if (s.jitter && s.jitter.reacquire_pending) {
-                    jitterStatus.textContent = 'Re-acquiring';
-                    jitterStatus.className = 'hw-value warn';
-                    jitterBar.classList.add('active');
-                    jitterBar.style.background = '#e67e22';
-                    jitterDesc.textContent = 'Low confidence ' +
-                        s.jitter.low_confidence_s.toFixed(0) +
-                        's \u2014 next jitter will probe';
-                    jitterDesc.style.color = '#e67e22';
-                } else if (s.hardware.anti_sleep_active) {
-                    jitterStatus.textContent = 'Active';
-                    jitterStatus.className = 'hw-value ok';
-                    jitterBar.classList.add('active');
-                    jitterBar.style.background = '';
-                    jitterDesc.textContent = '\u00B13px every 30s \u2014 prevents Windows sleep';
-                    jitterDesc.style.color = '#444';
-                } else {
-                    jitterStatus.textContent = 'Inactive';
-                    jitterStatus.className = 'hw-value warn';
-                    jitterBar.classList.remove('active');
-                    jitterBar.style.background = '';
-                    jitterDesc.style.color = '#444';
-                }
-
-                setHW('hw-mouse', s.hardware.mouse_connected, 'Connected', 'Disconnected');
-                setHW('hw-heartbeat', s.hardware.heartbeat_active, 'Active (100ms)', 'Inactive');
-                setHW('hw-keyboard',
-                    s.pi_keyboard === true, 'BT Connected',
-                    s.pi_keyboard === false ? 'Discoverable' : 'Unreachable');
-                document.getElementById('hw-frames').textContent = s.frame_count;
-
-                // YOLO full-screen panel
-                if (s.yolo) {
-                    var yoloStatus = document.getElementById('yolo-status');
-                    yoloStatus.textContent = s.yolo.active ? 'Detecting' : 'No detection';
-                    yoloStatus.className = 'hw-value ' + (s.yolo.active ? 'ok' : 'warn');
-                    document.getElementById('yolo-position').textContent =
-                        s.yolo.active ? '(' + s.yolo.x + ', ' + s.yolo.y + ')' : '—';
-                    var yoloConf = document.getElementById('yolo-confidence');
-                    yoloConf.textContent = s.yolo.active ? (s.yolo.confidence * 100).toFixed(1) + '%' : '—';
-                    yoloConf.className = 'hw-value ' + (s.yolo.confidence > 0.7 ? 'ok' :
-                        s.yolo.confidence > 0.4 ? 'warn' : 'err');
-                    document.getElementById('yolo-inference').textContent =
-                        s.yolo.inference_ms.toFixed(1) + 'ms';
-                    document.getElementById('yolo-count').textContent = s.yolo.detection_count;
-                }
-
-                // Silhouette tracking panel
-                if (s.silhouette) {
-                    var silStatus = document.getElementById('sil-status');
-                    silStatus.textContent = s.silhouette.active ? 'Active' : 'Inactive';
-                    silStatus.className = 'hw-value ' + (s.silhouette.active ? 'ok' : 'warn');
-                    var silMethod = document.getElementById('sil-method');
-                    silMethod.textContent = s.silhouette.method;
-                    silMethod.style.color = s.silhouette.method === 'template' ? '#2ecc71' :
-                        s.silhouette.method === 'motion_roi' ? '#3498db' :
-                        s.silhouette.method === 'lost' ? '#e74c3c' : '#888';
-                    document.getElementById('sil-hz').textContent = s.silhouette.hz + ' Hz';
-                    var roiEl = document.getElementById('sil-roi');
-                    roiEl.textContent = s.silhouette.roi_size + 'px';
-                    roiEl.style.color = s.silhouette.roi_size <= 200 ? '#2ecc71' :
-                        s.silhouette.roi_size <= 400 ? '#f1c40f' : '#e74c3c';
-                    var silConf = document.getElementById('sil-confidence');
-                    silConf.textContent = (s.silhouette.confidence * 100).toFixed(1) + '%';
-                    silConf.className = 'hw-value ' + (s.silhouette.confidence > 0.5 ? 'ok' :
-                        s.silhouette.confidence > 0.3 ? 'warn' : 'err');
-                    document.getElementById('sil-latency').textContent =
-                        s.silhouette.latency_ms.toFixed(2) + 'ms';
-                    // Trust status: silhouette is trusted if CNN validated OR high confidence OR motion
-                    var trusted = s.cnn.cursor_validated ||
-                        s.silhouette.confidence > 0.7 ||
-                        s.silhouette.method === 'motion_roi';
-                    var trustEl = document.getElementById('sil-trusted');
-                    trustEl.textContent = trusted ? 'Yes' : 'Gated (CNN < 70%)';
-                    trustEl.className = 'hw-value ' + (trusted ? 'ok' : 'warn');
-                }
-
-                // CNN panel
-                if (s.cnn) {
-                    var conf = s.cnn.confidence;
-                    var confEl = document.getElementById('cnn-confidence');
-                    confEl.textContent = (conf * 100).toFixed(1) + '%';
-                    confEl.className = 'hw-value ' + (conf > 0.7 ? 'ok' : conf > 0.3 ? 'warn' : 'err');
-                    var bar = document.getElementById('cnn-bar');
-                    bar.style.width = (conf * 100) + '%';
-                    bar.style.background = conf > 0.7 ? '#2ecc71' : conf > 0.3 ? '#f1c40f' : '#e74c3c';
-                    document.getElementById('cnn-model').textContent = s.cnn.model_version;
-                    var valEl = document.getElementById('cnn-validated');
-                    valEl.textContent = s.cnn.cursor_validated ? 'Yes' : 'No';
-                    valEl.className = 'hw-value ' + (s.cnn.cursor_validated ? 'ok' : 'warn');
-                    document.getElementById('cnn-inference').textContent = s.cnn.inference_ms + 'ms';
-                    document.getElementById('cnn-samples').textContent =
-                        s.cnn.samples.pos + ' pos / ' + s.cnn.samples.neg + ' neg';
-                }
-
-                // Claude Vision panel
-                if (s.vision) {
-                    var v = s.vision;
-                    if (v.age_s >= 0) {
-                        document.getElementById('vision-pos').textContent =
-                            '(' + v.x + ', ' + v.y + ')';
-                        var vconf = document.getElementById('vision-confidence');
-                        vconf.textContent = v.confidence;
-                        vconf.className = 'hw-value ' + (
-                            v.confidence === 'high' ? 'ok' :
-                            v.confidence === 'medium' ? 'warn' : 'err');
-                        document.getElementById('vision-type').textContent = v.cursor_type;
-                        document.getElementById('vision-latency').textContent =
-                            (v.latency_ms / 1000).toFixed(1) + 's';
-                        var ageStr = v.age_s < 60 ? v.age_s.toFixed(0) + 's ago' :
-                            (v.age_s / 60).toFixed(1) + 'm ago';
-                        document.getElementById('vision-age').textContent = ageStr;
-                        // Delta between tracker and vision
-                        var dx = Math.abs(s.cursor.x - v.x);
-                        var dy = Math.abs(s.cursor.y - v.y);
-                        var delta = Math.round(Math.sqrt(dx*dx + dy*dy));
-                        var deltaEl = document.getElementById('vision-delta');
-                        deltaEl.textContent = delta + 'px';
-                        deltaEl.className = 'hw-value ' + (
-                            delta < 30 ? 'ok' : delta < 100 ? 'warn' : 'err');
-                    }
-                    updateVisionDot(v.x, v.y, v.age_s);
-                }
-
-                var errPanel = document.getElementById('error-panel');
-                if (s.error) {
-                    errPanel.style.display = 'block';
-                    document.getElementById('error-text').textContent = s.error;
-                } else {
-                    errPanel.style.display = 'none';
-                }
-            } catch (e) {
-                console.error('State update failed:', e);
-            }
-        }
-
-        function setDot(id, color) {
-            document.getElementById(id).className = 'dot ' + color;
-        }
-        function setHW(id, ok, okText, failText) {
-            var el = document.getElementById(id);
-            el.textContent = ok ? okText : failText;
-            el.className = 'hw-value ' + (ok ? 'ok' : 'err');
-        }
-
-        function updateCursorDot(cursorX, cursorY) {
-            var img = document.getElementById('live-frame');
-            var dot = document.getElementById('cursor-dot');
-            if (!img.naturalWidth || (cursorX <= 0 && cursorY <= 0)) {
-                dot.style.display = 'none';
-                return;
-            }
-            var pctX = Math.max(0, Math.min(100, cursorX / img.naturalWidth * 100));
-            var pctY = Math.max(0, Math.min(100, cursorY / img.naturalHeight * 100));
-            dot.style.left = pctX + '%';
-            dot.style.top = pctY + '%';
-            dot.style.display = 'block';
-        }
-
-        function updateVisionDot(visionX, visionY, ageS) {
-            var img = document.getElementById('live-frame');
-            var dot = document.getElementById('vision-dot');
-            if (!img.naturalWidth || visionX <= 0 || visionY <= 0 || ageS < 0) {
-                dot.style.display = 'none';
-                return;
-            }
-            var pctX = Math.max(0, Math.min(100, visionX / img.naturalWidth * 100));
-            var pctY = Math.max(0, Math.min(100, visionY / img.naturalHeight * 100));
-            dot.style.left = pctX + '%';
-            dot.style.top = pctY + '%';
-            // Fade out as vision ages: fully visible <30s, faded 30-120s, hidden >120s
-            var opacity = ageS < 30 ? 1.0 : ageS < 120 ? 1.0 - (ageS - 30) / 90 : 0;
-            dot.style.opacity = opacity;
-            dot.style.display = opacity > 0.05 ? 'block' : 'none';
-        }
-
-        function runVisionDetect() {
-            var btn = document.getElementById('vision-btn');
-            btn.textContent = 'Detecting...';
-            btn.disabled = true;
-            fetch('/api/claude_detect')
-                .then(function(r) { return r.json(); })
-                .then(function(d) {
-                    btn.textContent = 'Run Detection';
-                    btn.disabled = false;
-                })
-                .catch(function() {
-                    btn.textContent = 'Run Detection';
-                    btn.disabled = false;
-                });
-        }
-
-        // ── Pause / freeze for tagging ──
-        var paused = false;
-        var frozenState = null;
-        var tagCount = 0;
-
-        function togglePause() {
-            paused = !paused;
-            var btn = document.getElementById('pause-btn');
-            var overlay = document.getElementById('pause-overlay');
-            if (paused) {
-                btn.textContent = 'RESUME (LIVE)';
-                btn.style.background = '#e74c3c';
-                overlay.style.display = 'flex';
-                // Freeze current state for tagging
-                frozenState = lastState;
-            } else {
-                btn.textContent = 'PAUSE (TAG)';
-                btn.style.background = '#f39c12';
-                overlay.style.display = 'none';
-                frozenState = null;
-                // Clear tag selections
-                document.querySelectorAll('.tag-btn').forEach(function(b) {
-                    b.classList.remove('selected');
-                });
-                tagState = {};
-                document.getElementById('tag-notes').value = '';
-                document.getElementById('tag-status').textContent = '';
-            }
-        }
-
-        var lastState = null;
-
-        // ── Frame updates at 5Hz (skipped when paused) ──
-        function scheduleFrame() {
-            if (!paused) updateFrame();
-            setTimeout(scheduleFrame, 200);
-        }
-        var stateInterval = setInterval(function() {
-            if (!paused) updateState();
-        }, 200);
-        scheduleFrame();
-        updateState();
-
-        // Store last state for freeze
-        var origUpdateState = updateState;
-
-        // ── Tagging system ──
-        var tagState = {};
-        document.querySelectorAll('.tag-btn').forEach(function(btn) {
-            btn.addEventListener('click', function() {
-                // Auto-pause on first tag button click
-                if (!paused) togglePause();
-                var dim = this.dataset.dim;
-                var val = this.dataset.val;
-                // Toggle selection in same group
-                this.parentElement.querySelectorAll('.tag-btn').forEach(function(b) {
-                    b.classList.remove('selected');
-                });
-                this.classList.add('selected');
-                tagState[dim] = val;
-            });
-        });
-
-        async function submitTag() {
-            var notes = document.getElementById('tag-notes').value;
-            tagState.notes = notes;
-            var statusEl = document.getElementById('tag-status');
-            statusEl.textContent = 'Saving...';
-            try {
-                var res = await fetch('/api/tag', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(tagState)
-                });
-                var data = await res.json();
-                if (data.status === 'tagged') {
-                    tagCount++;
-                    statusEl.textContent = 'Tagged #' + tagCount + ' (' + data.frame + ')';
-                    statusEl.style.color = '#27ae60';
-                    // Auto-resume after successful tag
-                    setTimeout(function() {
-                        togglePause();
-                    }, 800);
-                } else {
-                    statusEl.textContent = 'Error: ' + (data.error || 'unknown');
-                    statusEl.style.color = '#e74c3c';
-                }
-            } catch(e) {
-                statusEl.textContent = 'Error: ' + e.message;
-                statusEl.style.color = '#e74c3c';
-            }
-        }
-    </script>
-</body>
-</html>
-"""
-
-
-# ── Validation HTML ────────────────────────────────────────────────
-
-VALIDATION_HTML = r"""<!DOCTYPE html>
-<html>
-<head>
-<title>Cursor Sample Validation</title>
-<style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { background: #0a0a0f; color: #e0e0e0; font-family: 'JetBrains Mono', monospace; }
-.header { background: #12121a; padding: 12px 20px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #222; }
-.header h1 { font-size: 16px; color: #ff4444; }
-.header .nav { display: flex; gap: 6px; }
-.nav-link { padding: 5px 12px; border: 1px solid #333; background: #1a1a24; color: #888; text-decoration: none; font-size: 11px; border-radius: 4px; }
-.nav-link:hover { background: #252530; color: #ccc; }
-.nav-link.active { border-color: #ff4444; color: #ff4444; }
-.header .actions { display: flex; gap: 8px; }
-.btn { padding: 6px 14px; border: 1px solid #333; background: #1a1a24; color: #e0e0e0; cursor: pointer; font-size: 12px; font-family: inherit; border-radius: 4px; }
-.btn:hover { background: #252530; }
-.btn-retrain { border-color: #ff4444; color: #ff4444; }
-.btn-retrain:hover { background: #ff444420; }
-.controls { padding: 10px 20px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid #1a1a24; }
-.filter-btn { padding: 4px 10px; border: 1px solid #333; background: transparent; color: #888; cursor: pointer; font-size: 11px; font-family: inherit; border-radius: 3px; }
-.filter-btn.active { border-color: #ff4444; color: #ff4444; background: #ff444410; }
-.filter-count { font-size: 9px; color: #555; margin-left: 2px; }
-.filter-btn.active .filter-count { color: #ff444488; }
-.sort-select, .source-select, .label-select { padding: 4px 8px; border: 1px solid #333; background: #12121a; color: #ccc; font-size: 11px; font-family: inherit; border-radius: 3px; }
-.ctrl-label { font-size: 10px; color: #555; text-transform: uppercase; letter-spacing: 1px; margin-right: 2px; }
-.ctrl-sep { width: 1px; height: 20px; background: #222; margin: 0 4px; }
-.pagination { display: flex; gap: 8px; align-items: center; margin-left: auto; font-size: 11px; color: #666; }
-.pagination .btn { padding: 3px 8px; font-size: 11px; }
-.stats-bar { padding: 8px 20px; background: #0d0d14; font-size: 11px; color: #666; display: flex; gap: 16px; border-bottom: 1px solid #1a1a24; flex-wrap: wrap; }
-.stats-bar span { color: #888; }
-table { width: 100%; border-collapse: collapse; }
-th { text-align: left; padding: 8px 12px; font-size: 11px; color: #666; background: #0d0d14; border-bottom: 1px solid #222; cursor: pointer; }
-th:hover { color: #aaa; }
-th.sorted { color: #ff4444; }
-td { padding: 8px 12px; border-bottom: 1px solid #1a1a24; vertical-align: middle; font-size: 12px; }
-tr:hover { background: #12121a; }
-.patch-img { width: 96px; height: 96px; image-rendering: pixelated; border: 1px solid #333; border-radius: 2px; cursor: pointer; }
-.patch-img:hover { border-color: #ff4444; }
-.label-pos { color: #4CAF50; font-weight: bold; }
-.label-neg { color: #ff5252; font-weight: bold; }
-.source { color: #888; font-size: 11px; }
-.source.claude { color: #7c4dff; }
-.source.ground-truth { color: #2ecc71; }
-.confusing-badge { color: #FF9800; font-size: 10px; margin-left: 4px; }
-.disagree-badge { color: #ff5252; font-size: 10px; margin-left: 4px; }
-.conf-bar { width: 60px; height: 6px; background: #1a1a24; border-radius: 3px; display: inline-block; vertical-align: middle; margin-right: 6px; }
-.conf-fill { height: 100%; border-radius: 3px; }
-.conf-high { background: #4CAF50; }
-.conf-mid { background: #FF9800; }
-.conf-low { background: #ff5252; }
-.actions-cell { display: flex; gap: 4px; }
-.btn-ok { border-color: #4CAF50; color: #4CAF50; }
-.btn-ok:hover { background: #4CAF5020; }
-.btn-wrong { border-color: #FF9800; color: #FF9800; }
-.btn-wrong:hover { background: #FF980020; }
-.btn-confuse { border-color: #9c27b0; color: #9c27b0; }
-.btn-confuse:hover { background: #9c27b020; }
-.btn-del { border-color: #ff5252; color: #ff5252; }
-.btn-del:hover { background: #ff525220; }
-.tag-cell { white-space: nowrap; }
-.tag-chip { display: inline-block; padding: 1px 5px; margin: 1px; border: 1px solid #444; border-radius: 8px; font-size: 0.6rem; cursor: pointer; color: #888; transition: all 0.15s; }
-.tag-chip:hover { color: #fff; background: #ffffff10; }
-.tag-chip.active { color: #fff; font-weight: bold; }
-.reviewed { opacity: 0.4; }
-.toast { position: fixed; bottom: 20px; right: 20px; padding: 10px 16px; background: #1a1a24; border: 1px solid #4CAF50; color: #4CAF50; border-radius: 4px; font-size: 12px; display: none; z-index: 100; }
-.preview-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.85); z-index: 200; justify-content: center; align-items: center; flex-direction: column; gap: 12px; }
-.preview-overlay.active { display: flex; }
-.preview-container { position: relative; }
-.preview-overlay img { width: 512px; height: 512px; image-rendering: pixelated; border: 2px solid #444; cursor: crosshair; }
-.tip-marker { position: absolute; width: 12px; height: 12px; border: 2px solid #ff0; border-radius: 50%; transform: translate(-50%, -50%); pointer-events: none; box-shadow: 0 0 8px #ff0; }
-.preview-info { color: #888; font-size: 12px; text-align: center; }
-.preview-info em { color: #ff0; font-style: normal; }
-.cursor-type { font-size: 11px; padding: 2px 6px; border-radius: 3px; }
-.cursor-type.arrow { color: #4CAF50; border: 1px solid #4CAF5040; }
-.cursor-type.hand { color: #2196F3; border: 1px solid #2196F340; }
-.cursor-type.ibeam { color: #FF9800; border: 1px solid #FF980040; }
-.cursor-type.unknown { color: #666; border: 1px solid #33333340; }
-.btn-confuse { border-color: #9C27B0; color: #9C27B0; }
-.btn-confuse:hover { background: #9C27B020; }
-.keyboard-hint { position: fixed; bottom: 20px; left: 20px; font-size: 10px; color: #444; }
-.info-bar { background: #0d0d16; border-bottom: 1px solid #1a1a24; overflow: hidden; transition: max-height 0.3s ease; }
-.info-bar.collapsed { max-height: 0; border: none; }
-.info-bar-inner { padding: 12px 20px; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; font-size: 11px; line-height: 1.6; color: #777; }
-.info-bar-inner h3 { font-size: 11px; color: #ff4444; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; font-weight: 600; }
-.info-bar-inner code { background: #1a1a24; padding: 1px 4px; border-radius: 2px; color: #aaa; font-size: 10px; }
-.info-bar-inner b { color: #ccc; font-weight: 500; }
-.info-toggle { font-size: 10px; color: #555; cursor: pointer; border: 1px solid #333; background: transparent; padding: 2px 8px; border-radius: 3px; font-family: inherit; }
-.info-toggle:hover { color: #aaa; border-color: #555; }
-.info-bar-inner .kv { display: flex; gap: 4px; }
-.info-bar-inner .kv dt { color: #555; min-width: 80px; }
-.info-bar-inner .kv dd { color: #aaa; }
-.info-bar-inner ul { padding-left: 14px; margin: 2px 0; }
-.info-bar-inner li { margin: 1px 0; }
-</style>
-</head>
-<body>
-<div class="header">
-  <div style="display:flex;align-items:center;gap:16px">
-    <h1>CURSOR SAMPLE VALIDATION</h1>
-    <div class="nav">
-      <a href="/" class="nav-link">Dashboard</a>
-      <a href="/profiler" class="nav-link">Profiler</a>
-      <a href="/validation" class="nav-link active">Validation</a>
-      <a href="/loss_events" class="nav-link">Loss Events</a>
-      <a href="/yolo" class="nav-link">YOLO Gallery</a>
-    </div>
-  </div>
-  <div class="actions">
-    <button class="info-toggle" onclick="toggleInfo()">? Info</button>
-    <button class="btn btn-retrain" onclick="retrain()">Retrain CNN</button>
-  </div>
-</div>
-
-<div class="info-bar" id="info-bar">
-<div class="info-bar-inner">
-  <div>
-    <h3>What is this page</h3>
-    These are 64x64 grayscale patches extracted around where the system thinks the cursor is.
-    Each patch is fed through <b>TinyCursorNet</b> (14K param CNN) to classify: <b>cursor</b> or <b>not cursor</b>.<br><br>
-    <b>Your job</b>: review samples the CNN gets wrong, tag features, and retrain.
-    The CNN improves only from data you label here.
-    <ul>
-      <li><b>OK</b> — CNN's label is correct for this patch</li>
-      <li><b>X</b> (Wrong) — CNN got it backwards (pos is actually neg, or vice versa)</li>
-      <li><b>Del</b> — bad sample, remove from training set</li>
-    </ul>
-  </div>
-  <div>
-    <h3>Columns &amp; Filters</h3>
-    <ul>
-      <li><b>Label</b>: <code>pos</code> = cursor was here, <code>neg</code> = no cursor at this position</li>
-      <li><b>Type</b>: cursor shape when captured (arrow, hand, I-beam) — only from Claude Vision samples</li>
-      <li><b>Source</b>: how the patch was collected:<br>
-        <code>motion_track</code> — from live tracking loop<br>
-        <code>claude_vision</code> — Vision-confirmed position<br>
-        <code>ground_truth</code> — manually verified</li>
-      <li><b>CNN Conf</b>: model's confidence this patch contains a cursor (0-1). Green &gt;0.7, yellow 0.3-0.7, red &lt;0.3</li>
-      <li><b>Priority</b>: review order — CNN Disagrees (0) &gt; confusing (1) &gt; uncertain (2) &gt; Vision (3) &gt; easy (4) &gt; reviewed (99)</li>
-    </ul>
-  </div>
-  <div>
-    <h3>Feature Tags (right columns)</h3>
-    Tags are <b>independent</b> — a sample can be "ok" AND "confusing" AND "partial" simultaneously.
-    Click a chip to set it, click again to clear. Saves instantly.
-    <ul>
-      <li><b>quality</b> — ok / wrong / unsure (your judgment of the label)</li>
-      <li><b>confusing</b> — yes / no (would a human struggle to identify the cursor here?)</li>
-      <li><b>cursor_type</b> — arrow / hand / ibeam / busy / crosshair / move</li>
-      <li><b>visibility</b> — full / partial / hidden / offscreen</li>
-      <li><b>background</b> — clean / noisy / animated / textured</li>
-    </ul>
-    New columns appear automatically when you tag with custom keys via the API.
-    <br><br>
-    <h3>Keyboard Shortcuts</h3>
-    <code>J/K</code> or arrows: navigate &nbsp; <code>1</code>: OK &nbsp; <code>2</code>: Wrong &nbsp; <code>3</code>: Confusing &nbsp; <code>4</code>: Del &nbsp; <code>Space</code>: open patch (click to annotate cursor tip)
-  </div>
-</div>
-</div>
-
-<div class="controls">
-  <span class="ctrl-label">Filter</span>
-  <button class="filter-btn active" data-filter="all" onclick="setFilter('all')" title="All samples in the training set">All <span class="filter-count" id="cnt-all"></span></button>
-  <button class="filter-btn" data-filter="unreviewed" onclick="setFilter('unreviewed')" title="Samples you haven't reviewed yet — start here">Unreviewed <span class="filter-count" id="cnt-unreviewed"></span></button>
-  <button class="filter-btn" data-filter="reviewed" onclick="setFilter('reviewed')" title="Samples you've already tagged (dimmed in table)">Reviewed <span class="filter-count" id="cnt-reviewed"></span></button>
-  <button class="filter-btn" data-filter="claude" onclick="setFilter('claude')" title="Patches from Claude Vision detections — higher quality ground truth positions">Claude Vision <span class="filter-count" id="cnt-claude"></span></button>
-  <button class="filter-btn" data-filter="disagreement" onclick="setFilter('disagreement')" title="CNN prediction differs from the assigned label — most valuable to review first">CNN Disagrees <span class="filter-count" id="cnt-disagreement"></span></button>
-  <div class="ctrl-sep"></div>
-  <span class="ctrl-label">Label</span>
-  <select class="label-select" onchange="setLabel(this.value)">
-    <option value="all">All</option>
-    <option value="pos">Positive</option>
-    <option value="neg">Negative</option>
-  </select>
-  <div class="ctrl-sep"></div>
-  <span class="ctrl-label">Source</span>
-  <select class="source-select" id="source-select" onchange="setSource(this.value)">
-    <option value="all">All Sources</option>
-  </select>
-  <div class="ctrl-sep"></div>
-  <span class="ctrl-label">Sort</span>
-  <select class="sort-select" onchange="setSort(this.value)">
-    <option value="priority">Priority (review first)</option>
-    <option value="confidence_asc">CNN Conf (low first)</option>
-    <option value="confidence_desc">CNN Conf (high first)</option>
-    <option value="source">Source</option>
-    <option value="recent">Recent</option>
-  </select>
-  <div class="pagination">
-    <button class="btn" onclick="prevPage()">&laquo;</button>
-    <span id="page-info">Page 1</span>
-    <button class="btn" onclick="nextPage()">&raquo;</button>
-  </div>
-</div>
-<div class="stats-bar" id="stats-bar">
-  <span>Loading stats...</span>
-</div>
-<table id="samples-table">
-  <thead>
-    <tr>
-      <th>Patch</th>
-      <th onclick="setSort('source')">Label</th>
-      <th>Type</th>
-      <th onclick="setSort('source')">Source</th>
-      <th onclick="setSort(currentSort==='confidence_asc'?'confidence_desc':'confidence_asc')">CNN Conf</th>
-      <th onclick="setSort('priority')">Priority</th>
-      <th>Actions</th>
-    </tr>
-  </thead>
-  <tbody id="samples-body"></tbody>
-</table>
-<div class="toast" id="toast"></div>
-<div class="preview-overlay" id="preview-overlay">
-  <div class="preview-container" id="preview-container">
-    <img id="preview-img">
-    <div class="tip-marker" id="tip-marker" style="display:none"></div>
-  </div>
-  <div class="preview-info" id="preview-info">Click on the <em>cursor tip</em> to annotate (saves immediately). ESC to close.</div>
-</div>
-<div class="keyboard-hint">J/K: next/prev | 1: OK | 2: Wrong | 3: Confusing | 4: Del | Space: annotate tip</div>
-
-<script>
-function toggleInfo() {
-  var bar = document.getElementById('info-bar');
-  bar.classList.toggle('collapsed');
-  localStorage.setItem('validation_info', bar.classList.contains('collapsed') ? '0' : '1');
-}
-// Restore info bar state
-if (localStorage.getItem('validation_info') === '0') {
-  document.getElementById('info-bar').classList.add('collapsed');
-}
-
-var currentPage = 0;
-var currentFilter = 'all';
-var currentSort = 'priority';
-var currentLabel = 'all';
-var currentSource = 'all';
-var totalPages = 1;
-var selectedRow = -1;
-var currentSamples = [];
-
-async function loadSamples() {
-  var url = '/api/validation/samples?page=' + currentPage +
-    '&sort=' + currentSort +
-    '&filter=' + currentFilter +
-    '&label=' + currentLabel +
-    '&source_filter=' + currentSource;
-  var res = await fetch(url);
-  var data = await res.json();
-  totalPages = Math.ceil(data.total / data.page_size) || 1;
-  document.getElementById('page-info').textContent =
-    'Page ' + (currentPage + 1) + '/' + totalPages + ' (' + data.total + ' total)';
-
-  // Update filter counts in tabs
-  var fc = data.filter_counts || {};
-  ['all','unreviewed','reviewed','claude','disagreement'].forEach(function(k) {
-    var el = document.getElementById('cnt-' + k);
-    if (el) el.textContent = '(' + (fc[k] || 0) + ')';
-  });
-
-  // Populate source dropdown (once)
-  var srcSel = document.getElementById('source-select');
-  if (fc.sources && srcSel.options.length <= 1) {
-    Object.keys(fc.sources).sort().forEach(function(src) {
-      var opt = document.createElement('option');
-      opt.value = src;
-      opt.textContent = src + ' (' + fc.sources[src] + ')';
-      srcSel.appendChild(opt);
-    });
-  }
-
-  currentSamples = data.samples;
-  var tbody = document.getElementById('samples-body');
-  tbody.replaceChildren();
-  selectedRow = -1;
-
-  data.samples.forEach(function(s, idx) {
-    var tr = document.createElement('tr');
-    if (s.review) tr.classList.add('reviewed');
-    tr.id = 'row-' + s.filename;
-    tr.dataset.idx = idx;
-
-    // Patch image
-    var tdImg = document.createElement('td');
-    var img = document.createElement('img');
-    img.className = 'patch-img';
-    img.src = '/api/validation/patch/' + encodeURIComponent(s.filename);
-    img.onclick = function() { showPreview(s.filename); };
-    tdImg.appendChild(img);
-    tr.appendChild(tdImg);
-
-    // Label
-    var tdLabel = document.createElement('td');
-    var labelSpan = document.createElement('span');
-    labelSpan.className = s.label === 'pos' ? 'label-pos' : 'label-neg';
-    labelSpan.textContent = s.label;
-    tdLabel.appendChild(labelSpan);
-    if (s.review) {
-      var reviewSpan = document.createElement('span');
-      reviewSpan.style.cssText = 'color:#4CAF50;font-size:10px;margin-left:4px';
-      reviewSpan.textContent = '[' + s.review.action + ']';
-      tdLabel.appendChild(reviewSpan);
-    }
-    if (s.cnn_disagrees) {
-      var dBadge = document.createElement('span');
-      dBadge.className = 'disagree-badge';
-      dBadge.textContent = 'DISAGREE';
-      tdLabel.appendChild(dBadge);
-    }
-    tr.appendChild(tdLabel);
-
-    // Cursor type
-    var tdType = document.createElement('td');
-    var ctype = s.cursor_type || '';
-    if (ctype) {
-      var typeSpan = document.createElement('span');
-      var typeClass = 'cursor-type ';
-      if (ctype === 'arrow') typeClass += 'arrow';
-      else if (ctype === 'hand') typeClass += 'hand';
-      else if (ctype === 'ibeam' || ctype === 'I-beam') typeClass += 'ibeam';
-      else typeClass += 'unknown';
-      typeSpan.className = typeClass;
-      typeSpan.textContent = ctype;
-      tdType.appendChild(typeSpan);
-    } else {
-      tdType.style.color = '#333';
-      tdType.textContent = '-';
-    }
-    tr.appendChild(tdType);
-
-    // Source
-    var tdSource = document.createElement('td');
-    var srcSpan = document.createElement('span');
-    var srcClass = 'source';
-    if (s.source && s.source.indexOf('claude') >= 0) srcClass += ' claude';
-    else if (s.source && s.source.indexOf('ground_truth') >= 0) srcClass += ' ground-truth';
-    srcSpan.className = srcClass;
-    srcSpan.textContent = s.source || '?';
-    tdSource.appendChild(srcSpan);
-    if (s.is_confusing) {
-      var badge = document.createElement('span');
-      badge.className = 'confusing-badge';
-      badge.textContent = '\u26A0';
-      tdSource.appendChild(badge);
-    }
-    tr.appendChild(tdSource);
-
-    // CNN Confidence
-    var tdConf = document.createElement('td');
-    var bar = document.createElement('div');
-    bar.className = 'conf-bar';
-    var fill = document.createElement('div');
-    var confVal = s.cnn_confidence != null ? s.cnn_confidence : 0;
-    fill.className = 'conf-fill ' + (confVal > 0.7 ? 'conf-high' : confVal > 0.4 ? 'conf-mid' : 'conf-low');
-    fill.style.width = Math.round(confVal * 100) + '%';
-    bar.appendChild(fill);
-    tdConf.appendChild(bar);
-    tdConf.appendChild(document.createTextNode(s.cnn_confidence != null ? s.cnn_confidence.toFixed(3) : '?'));
-    tr.appendChild(tdConf);
-
-    // Priority
-    var tdPri = document.createElement('td');
-    tdPri.style.color = '#666';
-    tdPri.textContent = s.priority.toFixed(1);
-    tr.appendChild(tdPri);
-
-    // Quick actions (legacy)
-    var tdAct = document.createElement('td');
-    tdAct.className = 'actions-cell';
-    ['OK:correct:btn-ok', 'X:wrong:btn-wrong', 'Del:delete:btn-del'].forEach(function(spec) {
-      var parts = spec.split(':');
-      var btn = document.createElement('button');
-      btn.className = 'btn ' + parts[2];
-      btn.textContent = parts[0];
-      btn.addEventListener('click', function() { reviewSample(s.filename, parts[1]); });
-      tdAct.appendChild(btn);
-    });
-    tr.appendChild(tdAct);
-
-    // Feature tags — one cell per tag column
-    if (window.tagSchema) {
-      Object.keys(window.tagSchema).forEach(function(col) {
-        var tdTag = document.createElement('td');
-        tdTag.className = 'tag-cell';
-        var currentVal = (s.tags && s.tags[col]) || '';
-        var schema = window.tagSchema[col];
-        schema.values.forEach(function(val) {
-          var chip = document.createElement('span');
-          chip.className = 'tag-chip' + (currentVal === val ? ' active' : '');
-          chip.textContent = val;
-          chip.style.borderColor = schema.color;
-          if (currentVal === val) chip.style.background = schema.color + '30';
-          chip.addEventListener('click', function() {
-            // Toggle: click active chip to deselect, otherwise select
-            var newVal = currentVal === val ? '' : val;
-            setTag(s.filename, col, newVal);
-            // Update UI immediately
-            tdTag.querySelectorAll('.tag-chip').forEach(function(c) {
-              c.classList.remove('active');
-              c.style.background = '';
-            });
-            if (newVal) {
-              chip.classList.add('active');
-              chip.style.background = schema.color + '30';
-            }
-            // Update in-memory
-            if (!s.tags) s.tags = {};
-            s.tags[col] = newVal;
-          });
-          tdTag.appendChild(chip);
-        });
-        tr.appendChild(tdTag);
-      });
-    }
-
-    tbody.appendChild(tr);
-  });
-}
-
-async function loadStats() {
-  var res = await fetch('/api/validation/stats');
-  var data = await res.json();
-  var bar = document.getElementById('stats-bar');
-  bar.replaceChildren();
-  var items = [
-    data.pos_count + ' pos', data.neg_count + ' neg',
-    data.review_count + ' reviewed', 'Model: ' + data.model_version
-  ];
-  var sources = data.source_distribution || {};
-  Object.keys(sources).forEach(function(k) { items.push(k + ': ' + sources[k]); });
-  items.forEach(function(txt) {
-    var span = document.createElement('span');
-    span.textContent = txt;
-    bar.appendChild(span);
-  });
-}
-
-async function setTag(filename, column, value) {
-  var tags = {};
-  tags[column] = value;
-  var res = await fetch('/api/validation/tag', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({filename: filename, tags: tags})
-  });
-  if (res.ok) {
-    showToast(column + '=' + (value || '(cleared)') + ' → ' + filename);
-  }
-}
-
-async function loadTagSchema() {
-  var res = await fetch('/api/validation/tag_schema');
-  var data = await res.json();
-  window.tagSchema = data.schema;
-  // Add column headers to the table
-  var thead = document.querySelector('#samples-table thead tr');
-  if (thead) {
-    Object.keys(data.schema).forEach(function(col) {
-      var th = document.createElement('th');
-      th.textContent = col;
-      th.style.color = data.schema[col].color;
-      th.style.fontSize = '0.65rem';
-      th.style.textTransform = 'uppercase';
-      thead.appendChild(th);
-    });
-  }
-}
-
-async function reviewSample(filename, action) {
-  var res = await fetch('/api/validation/review', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({filename: filename, action: action})
-  });
-  if (res.ok) {
-    var row = document.getElementById('row-' + filename);
-    if (row) row.classList.add('reviewed');
-    showToast(action + ': ' + filename);
-  }
-}
-
-async function retrain() {
-  if (!confirm('Start retraining TinyCursorNet?')) return;
-  var res = await fetch('/api/validation/retrain', {method: 'POST'});
-  var data = await res.json();
-  showToast('Training started (PID: ' + data.pid + ')');
-}
-
-function setFilter(f) {
-  currentFilter = f;
-  document.querySelectorAll('.filter-btn').forEach(function(b) {
-    b.classList.toggle('active', b.dataset.filter === f);
-  });
-  currentPage = 0;
-  loadSamples();
-}
-
-function setSort(s) {
-  currentSort = s;
-  document.querySelector('.sort-select').value = s;
-  currentPage = 0;
-  loadSamples();
-}
-
-function setLabel(l) { currentLabel = l; currentPage = 0; loadSamples(); }
-function setSource(s) { currentSource = s; currentPage = 0; loadSamples(); }
-
-function nextPage() { if (currentPage < totalPages - 1) { currentPage++; loadSamples(); } }
-function prevPage() { if (currentPage > 0) { currentPage--; loadSamples(); } }
-
-var previewFilename = null;
-
-function showPreview(filename) {
-  previewFilename = filename;
-  var marker = document.getElementById('tip-marker');
-  marker.style.display = 'none';
-  document.getElementById('preview-img').src = '/api/validation/patch/' + encodeURIComponent(filename);
-  document.getElementById('preview-overlay').classList.add('active');
-  document.getElementById('preview-info').textContent = 'Click on the cursor tip to annotate. ESC to close.';
-}
-
-// Click-to-annotate: click on enlarged patch to mark cursor tip position
-document.getElementById('preview-img').addEventListener('click', async function(e) {
-  if (!previewFilename) return;
-  var img = e.target;
-  var rect = img.getBoundingClientRect();
-  // Click position relative to rendered image (512x512)
-  var renderX = e.clientX - rect.left;
-  var renderY = e.clientY - rect.top;
-  // Scale to actual 64x64 patch coordinates
-  var scaleX = 64 / rect.width;
-  var scaleY = 64 / rect.height;
-  var tipX = Math.round(renderX * scaleX);
-  var tipY = Math.round(renderY * scaleY);
-  tipX = Math.max(0, Math.min(63, tipX));
-  tipY = Math.max(0, Math.min(63, tipY));
-
-  // Show yellow marker at click position
-  var marker = document.getElementById('tip-marker');
-  marker.style.left = renderX + 'px';
-  marker.style.top = renderY + 'px';
-  marker.style.display = 'block';
-
-  // Save annotation
-  var res = await fetch('/api/validation/review', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({filename: previewFilename, action: 'annotate_tip', tip_x: tipX, tip_y: tipY})
-  });
-  if (res.ok) {
-    document.getElementById('preview-info').textContent =
-      'Tip annotated at (' + tipX + ', ' + tipY + ') — saved. Click again to adjust, ESC to close.';
-    showToast('Tip: (' + tipX + ',' + tipY + ') → ' + previewFilename);
-  }
-});
-
-function showToast(msg) {
-  var t = document.getElementById('toast');
-  t.textContent = msg;
-  t.style.display = 'block';
-  setTimeout(function() { t.style.display = 'none'; }, 2000);
-}
-
-// Keyboard shortcuts for fast tagging
-document.addEventListener('keydown', function(e) {
-  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
-  var rows = document.querySelectorAll('#samples-body tr');
-  if (e.key === 'j' || e.key === 'ArrowDown') {
-    e.preventDefault();
-    if (selectedRow < rows.length - 1) {
-      if (selectedRow >= 0) rows[selectedRow].style.outline = '';
-      selectedRow++;
-      rows[selectedRow].style.outline = '1px solid #ff4444';
-      rows[selectedRow].scrollIntoView({block: 'nearest'});
-    }
-  } else if (e.key === 'k' || e.key === 'ArrowUp') {
-    e.preventDefault();
-    if (selectedRow > 0) {
-      rows[selectedRow].style.outline = '';
-      selectedRow--;
-      rows[selectedRow].style.outline = '1px solid #ff4444';
-      rows[selectedRow].scrollIntoView({block: 'nearest'});
-    }
-  } else if (selectedRow >= 0 && selectedRow < currentSamples.length) {
-    var fn = currentSamples[selectedRow].filename;
-    if (e.key === '1') reviewSample(fn, 'correct');
-    else if (e.key === '2') reviewSample(fn, 'wrong');
-    else if (e.key === '3') reviewSample(fn, 'confusing');
-    else if (e.key === '4') reviewSample(fn, 'delete');
-    else if (e.key === ' ') { e.preventDefault(); showPreview(fn); }
-  }
-  if (e.key === 'Escape') document.getElementById('preview-overlay').classList.remove('active');
-});
-
-// Load tag schema first, then samples (schema needed to render tag columns)
-loadTagSchema().then(function() { loadSamples(); });
-loadStats();
-</script>
-</body>
-</html>"""
-
-
-# ── Profiler HTML ──────────────────────────────────────────────────
-
-PROFILER_HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>KVM Pipeline Profiler</title>
-<style>
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: 'JetBrains Mono', 'Fira Code', monospace; background: #0a0a0f; color: #c8c8d0; }
-.header { background: #101018; padding: 0.6rem 1.5rem; border-bottom: 2px solid #3498db;
-    display: flex; justify-content: space-between; align-items: center; }
-.header h1 { color: #3498db; font-size: 1.1rem; letter-spacing: 1px; }
-.header a { color: #888; text-decoration: none; font-size: 0.75rem; margin-left: 1rem; }
-.header a:hover { color: #3498db; }
-.main { padding: 1rem; max-width: 1400px; margin: 0 auto; }
-.row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1rem; }
-.row.full { grid-template-columns: 1fr; }
-.row.triple { grid-template-columns: 1fr 1fr 1fr; }
-.card { background: #101018; border: 1px solid #1a1a25; border-radius: 8px; padding: 1rem; }
-.card-title { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 2px; color: #3498db; margin-bottom: 0.8rem; }
-.utc-bar { display: flex; gap: 2rem; align-items: center; margin-bottom: 1rem;
-    background: #101018; border: 1px solid #1a1a25; border-radius: 8px; padding: 0.8rem 1rem; }
-.utc-lbl { color: #555; font-size: 0.6rem; text-transform: uppercase; }
-.utc-val { color: #2ecc71; font-size: 1.1rem; font-variant-numeric: tabular-nums; }
-.utc-delta { color: #f1c40f; font-size: 1.1rem; }
-/* Waterfall */
-.wf-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
-.wf-label { width: 120px; font-size: 0.75rem; color: #888; text-align: right; flex-shrink: 0; }
-.wf-bar-wrap { flex: 1; height: 28px; background: #0a0a12; border-radius: 4px; overflow: hidden; }
-.wf-bar { height: 100%; border-radius: 4px; transition: width 0.2s; min-width: 2px; }
-.wf-bar.decode { background: #3498db; } .wf-bar.track { background: #2ecc71; }
-.wf-bar.overlay { background: #9b59b6; } .wf-bar.encode { background: #e67e22; }
-.wf-bar.total { background: #e74c3c; } .wf-bar.http { background: #f1c40f; }
-.wf-bar.render { background: #1abc9c; }
-.wf-val { width: 80px; font-size: 0.8rem; color: #aaa; font-variant-numeric: tabular-nums; }
-.wf-sep { border-top: 1px dashed #333; margin: 6px 0; }
-/* Test panel */
-.prof-btn { padding: 6px 16px; border: 1px solid #333; border-radius: 4px;
-    background: #1a1a25; color: #ccc; font-family: inherit; font-size: 0.8rem; cursor: pointer; }
-.prof-btn:hover { background: #252530; }
-.prof-btn.primary { border-color: #3498db; color: #3498db; }
-.prof-btn.danger { border-color: #e74c3c; color: #e74c3c; }
-.prof-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-.results-table { width: 100%; font-size: 0.75rem; border-collapse: collapse; margin-top: 0.6rem; }
-.results-table th { text-align: right; color: #555; font-weight: normal; padding: 4px 8px; border-bottom: 1px solid #1a1a25; }
-.results-table th:first-child { text-align: left; }
-.results-table td { text-align: right; padding: 4px 8px; font-variant-numeric: tabular-nums; }
-.results-table td:first-child { text-align: left; color: #888; }
-/* Metrics */
-.metric-row { display: flex; justify-content: space-between; padding: 4px 0; font-size: 0.8rem; }
-.metric-label { color: #666; }
-.metric-val { font-weight: 600; color: #ccc; font-variant-numeric: tabular-nums; }
-.metric-val.good { color: #2ecc71; } .metric-val.warn { color: #f1c40f; } .metric-val.bad { color: #e74c3c; }
-/* Sparkline */
-.spark-canvas { width: 100%; height: 80px; background: #0a0a12; border-radius: 4px; }
-/* Frame preview */
-.preview-img { max-width: 100%; border-radius: 4px; background: #000; display: block; }
-.preview-overlay { font-size: 0.7rem; color: #888; margin-top: 4px; }
-</style>
-</head>
-<body>
-<div class="header">
-    <div style="display:flex; align-items:center;">
-        <h1>PIPELINE PROFILER</h1>
-        <a href="/">Dashboard</a>
-        <a href="/validation">Validation</a>
-        <a href="/loss_events">Loss Events</a>
-        <a href="/yolo">YOLO Gallery</a>
-        <a href="/concepts">Concepts</a>
-    </div>
-    <div style="font-size:0.75rem; color:#555;" id="prof-status">Connecting...</div>
-</div>
-<div class="main">
-    <!-- UTC Clock Bar -->
-    <div class="utc-bar">
-        <div><div class="utc-lbl">Browser UTC</div><div class="utc-val" id="browser-utc">--:--:--.---</div></div>
-        <div><div class="utc-lbl">Server UTC</div><div class="utc-val" id="server-utc">--:--:--.---</div></div>
-        <div><div class="utc-lbl">Clock Delta</div><div class="utc-delta" id="utc-delta">--ms</div></div>
-        <div style="margin-left:auto;"><div class="utc-lbl">Daemon FPS</div><div class="metric-val" id="daemon-fps">--</div></div>
-        <div><div class="utc-lbl">Blobs</div><div class="metric-val" id="blob-count">--</div></div>
-        <div><div class="utc-lbl">Frame #</div><div class="metric-val" id="frame-count" style="color:#555">--</div></div>
-    </div>
-
-    <!-- Pipeline Waterfall (full width) -->
-    <div class="row full">
-        <div class="card">
-            <div class="card-title">Pipeline Waterfall (per frame)</div>
-            <div class="wf-row"><span class="wf-label">JPEG Decode</span><div class="wf-bar-wrap"><div class="wf-bar decode" id="bar-decode"></div></div><span class="wf-val" id="val-decode">&mdash;</span></div>
-            <div class="wf-row"><span class="wf-label">Sil. Track</span><div class="wf-bar-wrap"><div class="wf-bar track" id="bar-track"></div></div><span class="wf-val" id="val-track">&mdash;</span></div>
-            <div class="wf-row"><span class="wf-label">Overlay Draw</span><div class="wf-bar-wrap"><div class="wf-bar overlay" id="bar-overlay"></div></div><span class="wf-val" id="val-overlay">&mdash;</span></div>
-            <div class="wf-row"><span class="wf-label">JPEG Encode</span><div class="wf-bar-wrap"><div class="wf-bar encode" id="bar-encode"></div></div><span class="wf-val" id="val-encode">&mdash;</span></div>
-            <div class="wf-sep"></div>
-            <div class="wf-row"><span class="wf-label">Frame Total</span><div class="wf-bar-wrap"><div class="wf-bar total" id="bar-total"></div></div><span class="wf-val" id="val-total">&mdash;</span></div>
-            <div class="wf-row"><span class="wf-label">HTTP Round-Trip</span><div class="wf-bar-wrap"><div class="wf-bar http" id="bar-http"></div></div><span class="wf-val" id="val-http">&mdash;</span></div>
-        </div>
-    </div>
-
-    <!-- 3-Minute Test + Live Frame Preview -->
-    <div class="row">
-        <div class="card">
-            <div class="card-title">3-Minute Profiling Test</div>
-            <div style="display:flex; gap:0.5rem; margin-bottom:0.6rem;">
-                <button class="prof-btn primary" id="btn-start" onclick="startTest()">Start 3m Test</button>
-                <button class="prof-btn danger" id="btn-stop" onclick="stopTest()" disabled>Stop</button>
-            </div>
-            <div id="test-status" style="font-size:0.8rem; color:#555; margin-bottom:0.3rem;">Idle</div>
-            <div id="test-progress" style="font-size:0.75rem; color:#444; margin-bottom:0.5rem;"></div>
-            <table class="results-table">
-                <thead><tr><th>Stage</th><th>Min</th><th>Avg</th><th>Max</th><th>P95</th></tr></thead>
-                <tbody id="results-body"><tr><td colspan="5" style="color:#333; text-align:center;">No test data</td></tr></tbody>
-            </table>
-        </div>
-        <div class="card">
-            <div class="card-title">Live Frame Preview</div>
-            <img id="preview-frame" class="preview-img" alt="Preview">
-            <div class="preview-overlay">
-                Cursor: <span id="pv-cursor">(?, ?)</span> |
-                Method: <span id="pv-method">--</span> |
-                Age: <span id="pv-age">--</span>s
-            </div>
-        </div>
-    </div>
-
-    <!-- Historical Sparkline + Backend Metrics + OCR -->
-    <div class="row triple">
-        <div class="card">
-            <div class="card-title">Frame Total (last 100 frames)</div>
-            <canvas id="spark-canvas" class="spark-canvas"></canvas>
-            <div style="display:flex; justify-content:space-between; font-size:0.65rem; color:#444; margin-top:4px;">
-                <span id="spark-min">min: --</span>
-                <span id="spark-avg">avg: --</span>
-                <span id="spark-max">max: --</span>
-            </div>
-        </div>
-        <div class="card">
-            <div class="card-title">Backend Metrics</div>
-            <div class="metric-row"><span class="metric-label">Tracking Method</span><span class="metric-val" id="m-method">--</span></div>
-            <div class="metric-row"><span class="metric-label">Tracking Hz</span><span class="metric-val" id="m-hz">--</span></div>
-            <div class="metric-row"><span class="metric-label">Confidence</span><span class="metric-val" id="m-conf">--</span></div>
-            <div class="metric-row"><span class="metric-label">Misses</span><span class="metric-val" id="m-misses">--</span></div>
-            <div class="metric-row"><span class="metric-label">Cursor Age</span><span class="metric-val" id="m-age">--</span></div>
-            <div class="metric-row"><span class="metric-label">Validated</span><span class="metric-val" id="m-validated">--</span></div>
-            <div class="metric-row"><span class="metric-label">Daemon Timestamp</span><span class="metric-val" id="m-ts" style="font-size:0.65rem; color:#555">--</span></div>
-        </div>
-        <div class="card">
-            <div class="card-title">UTC Latency Measurement</div>
-            <div style="font-size:0.7rem; color:#555; margin-bottom:0.6rem;">
-                Open a UTC ms clock on the target machine, then measure.
-                Claude Vision OCR reads the displayed time.
-            </div>
-            <div style="display:flex; gap:0.5rem; align-items:center; margin-bottom:0.5rem;">
-                <button class="prof-btn primary" id="btn-measure" onclick="measureLatency()">Measure</button>
-                <span id="measure-status" style="font-size:0.75rem; color:#555;"></span>
-            </div>
-            <div id="measure-result" style="font-size:0.75rem; white-space:pre-wrap;"></div>
-        </div>
-    </div>
-</div>
-
-<script>
-var serverUtc = '';
-var httpRt = 0;
-var barMax = 50;
-var history = [];
-var MAX_HISTORY = 100;
-var testRunning = false;
-var testPollId = null;
-var previewSeq = 0;
-
-// UTC clock
-function tickClock() {
-    document.getElementById('browser-utc').textContent = new Date().toISOString().slice(11, 23);
-    if (serverUtc) {
-        var d = Date.now() - new Date(serverUtc).getTime();
-        document.getElementById('utc-delta').textContent = d + 'ms';
-    }
-}
-setInterval(tickClock, 100);
-
-function setBar(name, ms) {
-    var b = document.getElementById('bar-' + name);
-    var v = document.getElementById('val-' + name);
-    if (!b || !v) return;
-    b.style.width = Math.min(100, (ms / barMax) * 100) + '%';
-    v.textContent = ms.toFixed(1) + 'ms';
-}
-
-// Main poll
-async function poll() {
-    try {
-        var t0 = Date.now();
-        var r = await fetch('/api/profiler');
-        httpRt = Date.now() - t0;
-        var d = await r.json();
-        serverUtc = d.utc;
-        document.getElementById('server-utc').textContent = d.utc.slice(11, 23);
-        document.getElementById('prof-status').textContent = 'Live';
-        document.getElementById('prof-status').style.color = '#2ecc71';
-
-        setBar('decode', d.pipeline.jpeg_decode_ms);
-        setBar('track', d.pipeline.silhouette_ms);
-        setBar('overlay', d.pipeline.overlay_draw_ms);
-        setBar('encode', d.pipeline.jpeg_encode_ms);
-        setBar('total', d.pipeline.frame_total_ms);
-        setBar('http', httpRt);
-
-        // Daemon stats in header bar
-        document.getElementById('daemon-fps').textContent = d.daemon.fps.toFixed(1);
-        document.getElementById('blob-count').textContent = d.daemon.blob_count;
-        document.getElementById('frame-count').textContent = d.daemon.frame_count;
-
-        // Backend metrics
-        document.getElementById('m-method').textContent = d.tracking.method;
-        document.getElementById('m-hz').textContent = d.tracking.hz;
-        var conf = d.tracking.confidence;
-        var confEl = document.getElementById('m-conf');
-        confEl.textContent = (conf * 100).toFixed(1) + '%';
-        confEl.className = 'metric-val ' + (conf > 0.7 ? 'good' : conf > 0.3 ? 'warn' : 'bad');
-        document.getElementById('m-misses').textContent = d.tracking.misses;
-        document.getElementById('m-age').textContent = d.tracking.cursor_age_s + 's';
-        document.getElementById('m-validated').textContent = d.cursor.validated ? 'Yes' : 'No';
-        document.getElementById('m-ts').textContent = d.daemon.timestamp_ns;
-
-        // Cursor position for preview
-        document.getElementById('pv-cursor').textContent = '(' + d.cursor.x + ', ' + d.cursor.y + ')';
-        document.getElementById('pv-method').textContent = d.cursor.method;
-        document.getElementById('pv-age').textContent = d.cursor.age_s;
-
-        // Sparkline history
-        history.push(d.pipeline.frame_total_ms);
-        if (history.length > MAX_HISTORY) history.shift();
-        drawSparkline();
-    } catch (e) {
-        document.getElementById('prof-status').textContent = 'Disconnected';
-        document.getElementById('prof-status').style.color = '#e74c3c';
-    }
-}
-setInterval(poll, 200);
-
-// Preview frame at 2Hz
-function updatePreview() {
-    document.getElementById('preview-frame').src = '/api/frame?' + previewSeq++;
-}
-setInterval(updatePreview, 500);
-
-// Sparkline
-function drawSparkline() {
-    var canvas = document.getElementById('spark-canvas');
-    var ctx = canvas.getContext('2d');
-    var W = canvas.offsetWidth, H = canvas.offsetHeight;
-    canvas.width = W * (window.devicePixelRatio || 1);
-    canvas.height = H * (window.devicePixelRatio || 1);
-    ctx.scale(window.devicePixelRatio || 1, window.devicePixelRatio || 1);
-
-    ctx.clearRect(0, 0, W, H);
-    if (history.length < 2) return;
-
-    var min = Math.min.apply(null, history);
-    var max = Math.max.apply(null, history);
-    var avg = history.reduce(function(a,b){return a+b;}, 0) / history.length;
-    var range = Math.max(max - min, 1);
-
-    document.getElementById('spark-min').textContent = 'min: ' + min.toFixed(1) + 'ms';
-    document.getElementById('spark-avg').textContent = 'avg: ' + avg.toFixed(1) + 'ms';
-    document.getElementById('spark-max').textContent = 'max: ' + max.toFixed(1) + 'ms';
-
-    // Average line
-    var avgY = H - ((avg - min) / range) * (H - 10) - 5;
-    ctx.strokeStyle = '#333';
-    ctx.setLineDash([4, 4]);
-    ctx.beginPath(); ctx.moveTo(0, avgY); ctx.lineTo(W, avgY); ctx.stroke();
-    ctx.setLineDash([]);
-
-    // Data line
-    ctx.strokeStyle = '#e74c3c';
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    for (var i = 0; i < history.length; i++) {
-        var x = (i / (MAX_HISTORY - 1)) * W;
-        var y = H - ((history[i] - min) / range) * (H - 10) - 5;
-        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-
-    // Fill under curve
-    ctx.lineTo((history.length - 1) / (MAX_HISTORY - 1) * W, H);
-    ctx.lineTo(0, H);
-    ctx.closePath();
-    ctx.fillStyle = 'rgba(231, 76, 60, 0.1)';
-    ctx.fill();
-}
-
-// 3-minute test
-var STAGE_NAMES = {
-    jpeg_decode_ms: 'JPEG Decode', silhouette_ms: 'Sil. Track',
-    overlay_draw_ms: 'Overlay Draw', jpeg_encode_ms: 'JPEG Encode',
-    frame_total_ms: 'Frame Total'
-};
-
-async function startTest() {
-    await fetch('/api/profiler/start', {method:'POST'});
-    testRunning = true;
-    document.getElementById('btn-start').disabled = true;
-    document.getElementById('btn-stop').disabled = false;
-    document.getElementById('test-status').textContent = 'Running...';
-    document.getElementById('test-status').style.color = '#2ecc71';
-    testPollId = setInterval(pollResults, 1000);
-}
-
-async function stopTest() {
-    await fetch('/api/profiler/stop', {method:'POST'});
-    testRunning = false;
-    document.getElementById('btn-start').disabled = false;
-    document.getElementById('btn-stop').disabled = true;
-    document.getElementById('test-status').textContent = 'Complete';
-    document.getElementById('test-status').style.color = '#f1c40f';
-    if (testPollId) { clearInterval(testPollId); testPollId = null; }
-    pollResults();
-}
-
-async function pollResults() {
-    try {
-        var r = await fetch('/api/profiler/results');
-        var d = await r.json();
-        if (d.status === 'no_data') return;
-        document.getElementById('test-progress').textContent =
-            'Samples: ' + d.samples + ' | ' + d.elapsed_s + 's / ' + d.duration_s + 's';
-        if (d.status === 'complete' && testRunning) {
-            testRunning = false;
-            document.getElementById('btn-start').disabled = false;
-            document.getElementById('btn-stop').disabled = true;
-            document.getElementById('test-status').textContent = 'Complete';
-            document.getElementById('test-status').style.color = '#f1c40f';
-            if (testPollId) { clearInterval(testPollId); testPollId = null; }
-        }
-        if (d.stages) {
-            var tbody = document.getElementById('results-body');
-            while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
-            var keys = Object.keys(STAGE_NAMES);
-            for (var i = 0; i < keys.length; i++) {
-                if (d.stages[keys[i]]) {
-                    var s = d.stages[keys[i]];
-                    var tr = document.createElement('tr');
-                    [STAGE_NAMES[keys[i]], s.min.toFixed(1), s.avg.toFixed(1), s.max.toFixed(1), s.p95.toFixed(1)].forEach(function(v) {
-                        var td = document.createElement('td');
-                        td.textContent = v;
-                        tr.appendChild(td);
-                    });
-                    tbody.appendChild(tr);
-                }
-            }
-        }
-    } catch(e) {}
-}
-
-// OCR Latency measurement
-async function measureLatency() {
-    var btn = document.getElementById('btn-measure');
-    var st = document.getElementById('measure-status');
-    var res = document.getElementById('measure-result');
-    btn.disabled = true;
-    st.textContent = 'Capturing + OCR...';
-    st.style.color = '#f1c40f';
-    res.textContent = '';
-    try {
-        var r = await fetch('/api/profiler/measure_latency', {method:'POST'});
-        var d = await r.json();
-        btn.disabled = false;
-        if (d.error) { st.textContent = 'Error'; st.style.color = '#e74c3c'; res.textContent = d.error; return; }
-        st.textContent = 'Done'; st.style.color = '#2ecc71';
-        var lines = [];
-        lines.push('Capture: ' + d.capture_ms.toFixed(1) + 'ms');
-        lines.push('Inference: ' + d.inference_ms.toFixed(0) + 'ms');
-        lines.push('Local UTC: ' + d.capture_utc);
-        lines.push('Screen UTC: ' + (d.displayed_utc || 'not detected'));
-        if (d.delta_ms !== null && d.delta_ms !== undefined) lines.push('Delta: ' + d.delta_ms + 'ms');
-        if (d.ocr_result && d.ocr_result.notes) lines.push('Notes: ' + d.ocr_result.notes);
-        res.textContent = lines.join('\n');
-    } catch(e) { btn.disabled = false; st.textContent = 'Failed'; st.style.color = '#e74c3c'; }
-}
-
-poll();
-</script>
-</body>
-</html>"""
-
-
-# ── Concepts HTML ──────────────────────────────────────────────────
-
-_CONCEPTS_PATH = Path(__file__).parent.parent.parent / "docs" / "STAR_TREK_COMPUTER_CONCEPTS.md"
-_CONCEPTS_TEXT = ""
-if _CONCEPTS_PATH.exists():
-    _raw = _CONCEPTS_PATH.read_text()
-    _CONCEPTS_TEXT = _raw.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-else:
-    _CONCEPTS_TEXT = "Concepts file not found at " + str(_CONCEPTS_PATH)
-
-CONCEPTS_HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>Star Trek Computer Concepts</title>
-<style>
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: 'JetBrains Mono', 'Fira Code', monospace; background: #0a0a0f; color: #c8c8d0; line-height: 1.6; }
-.header { background: #101018; padding: 0.6rem 1.5rem; border-bottom: 2px solid #ff4444;
-    display: flex; justify-content: space-between; align-items: center; }
-.header h1 { color: #ff4444; font-size: 1.1rem; letter-spacing: 1px; }
-.header a { color: #888; text-decoration: none; font-size: 0.75rem; margin-left: 1rem; }
-.header a:hover { color: #ff4444; }
-.content { max-width: 960px; margin: 2rem auto; padding: 0 2rem; }
-pre { white-space: pre-wrap; word-wrap: break-word; font-size: 0.82rem; line-height: 1.7; }
-</style>
-</head>
-<body>
-<div class="header">
-    <div style="display:flex; align-items:center;">
-        <h1>STAR TREK COMPUTER &mdash; CONCEPTS</h1>
-        <a href="/">Dashboard</a>
-        <a href="/profiler">Profiler</a>
-    </div>
-</div>
-<div class="content"><pre>""" + _CONCEPTS_TEXT + r"""</pre></div>
-</body>
-</html>"""
+    return _serve_page("yolo.html")
 
 
 # ── Startup ─────────────────────────────────────────────────────────
