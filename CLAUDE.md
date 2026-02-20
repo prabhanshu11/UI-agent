@@ -108,7 +108,7 @@ Check the "Proven vs Untested" table in the research doc (§11) before choosing 
 - `docs/RECORDING_LIFECYCLE_PLAN.md` — datalake sync, retention engine, dashboard storage tab, archive to external drive. Not yet implemented.
 - `docs/BLOB_DATASET_PLAN.md` — Per-frame blob JSONL logging in cursor-daemon (C-side, background thread, lock-free ring buffer). Not yet implemented.
 - `docs/DASHBOARD_SUBPANELS_PLAN.md` — 3 sub-panels below HDMI feed: motion blob map, model inference status with live staleness counters, mouse trail visualization (ESP32 + detected + passthrough). Not yet implemented.
-- `docs/EXPERIENCE_VALIDATION_PLAN.md` — `/experiences` page for human review of agent reasoning chain: situational awareness, conclusion quality, action decision, execution, direction, certainty, verdict. Tags stored as `validation.json` alongside experience data. Not yet implemented.
+- `docs/EXPERIENCE_VALIDATION_PLAN.md` — `/experiences` page for human review of agent reasoning chain: situational awareness, conclusion quality, action decision, execution, direction, certainty, verdict. Tags stored as `validation.json` alongside experience data. Claude Code skill (`/experience-feedback`) queries these tags for live agent feedback. Not yet implemented.
 
 **Stopgap if urgent:**
 ```bash

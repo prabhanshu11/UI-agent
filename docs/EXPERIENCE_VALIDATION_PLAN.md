@@ -437,6 +437,53 @@ time window:
 This gives the human reviewer **the actual evidence** to judge whether a "pass" or "fail"
 evaluation was correct — not just the agent's narrative, but the raw sensor data.
 
+## Claude Code Skill: Live Agent Feedback
+
+### Purpose
+
+A Claude Code skill (`experience-feedback`) enables agents to query human-validated
+experience tags during live sessions. This closes the feedback loop: human reviews
+experiences on `/experiences` → agent reads tags via skill → agent adjusts behavior.
+
+### Components
+
+| Component | Location | Description |
+|-----------|----------|-------------|
+| Query script | `scripts/query-experience-tags.py` | PEP 723 script, zero deps, scans `logs/experiences/` for `validation.json` files |
+| Skill definition | `~/.claude/skills/experience-feedback/SKILL.md` | Frontmatter + instructions for Claude Code skill invocation |
+
+### Query Script Features
+
+- `--verdict <value>` — Filter by overall verdict (problematic, exemplary, valuable, neutral)
+- `--unreviewed` — List sessions without human review
+- `--session <id>` — Single session detail view
+- `--json` — Machine-readable JSON output for programmatic use
+
+### Invocation
+
+```bash
+# Agent calls during a session:
+uv run ~/Programs/UI-agent/scripts/query-experience-tags.py --verdict problematic
+
+# Or via /experience-feedback slash command in Claude Code
+```
+
+### Feedback Loop
+
+```
+Human reviews experience on /experiences page
+    ↓
+Tags saved as validation.json
+    ↓
+Agent invokes /experience-feedback skill
+    ↓
+Query script reads validation.json files
+    ↓
+Agent receives tagged experience summary in context
+    ↓
+Agent adjusts behavior (avoid problematic patterns, replicate exemplary ones)
+```
+
 ## Open Questions
 
 - **Event timeline viewer:** Should the detail panel show a scrollable event timeline (like a mini-log viewer) in addition to the narrative? This would show the raw JSONL events with timestamps. More useful for debugging but adds complexity. **Update: Yes — the profiler-correlated timeline described above IS this timeline. It's essential for validating pass/fail conclusions.**
