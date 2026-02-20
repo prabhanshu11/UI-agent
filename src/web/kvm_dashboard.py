@@ -123,6 +123,54 @@ profiler_running: bool = False
 profiler_start_time: float = 0.0
 PROFILER_DURATION_S = 180  # 3 minutes
 
+# ── Velocity test state ───────────────────────────────────────────
+_vtest_running: bool = False
+_vtest_results: list[dict] = []
+_vtest_progress: dict = {"profile": "", "step": 0, "total": 0, "phase": "idle"}
+_vtest_summary: dict = {}
+_VTEST_DIR = Path(__file__).parent.parent.parent / "data" / "velocity_test"
+
+VELOCITY_PROFILES = {
+    "V0": {"desc": "Stationary", "dx": 0, "dy": 0, "steps": 50, "delay_ms": 200},
+    "V1": {"desc": "Slow diagonal", "dx": 2, "dy": 2, "steps": 25, "delay_ms": 200},
+    "V2": {"desc": "Medium horizontal", "dx": 10, "dy": 0, "steps": 30, "delay_ms": 100},
+    "V3": {"desc": "Fast sweep", "dx": 50, "dy": 0, "steps": 10, "delay_ms": 80},
+    "V4": {"desc": "Snap to corner", "dx": 400, "dy": 300, "steps": 1, "delay_ms": 2000},
+    "A1": {"desc": "Accelerating", "accel": "up", "start_speed": 2, "end_speed": 30, "steps": 20, "delay_ms": 150},
+    "A2": {"desc": "Decelerate+stop", "accel": "down", "start_speed": 30, "end_speed": 0, "steps": 20, "delay_ms": 150},
+    "A3": {"desc": "Tiny jitter", "dx": 2, "dy": 0, "steps": 50, "delay_ms": 200, "alternate": True},
+}
+
+
+def _auto_label(error_px: float) -> str:
+    if error_px < 20:
+        return "accurate"
+    if error_px < 80:
+        return "drift"
+    if error_px < 200:
+        return "wrong"
+    return "lost"
+
+
+# ── Loss event sampling (ring buffer + trigger) ─────────────────
+from collections import deque
+
+_LOSS_EVENT_DIR = Path(__file__).parent.parent.parent / "data" / "loss_events"
+_RING_BUFFER_SIZE = 300   # ~60s at 5Hz
+_RING_BUFFER_HZ = 5.0
+_LOSS_PRE_WINDOW_S = 10.0
+_LOSS_POST_WINDOW_S = 15.0
+_LOSS_COOLDOWN_S = 30.0
+
+_ring_buffer: deque = deque(maxlen=_RING_BUFFER_SIZE)
+_ring_last_t: float = 0.0
+_ring_lock = threading.Lock()
+
+_loss_event_active: bool = False
+_loss_event_cooldown: float = 0.0
+_loss_prev = {"validated": False, "cnn": 0.0, "sil": 0.0, "x": 0, "y": 0}
+_loss_events_log: list[dict] = []  # in-memory index of captured events
+
 
 mouse: Optional[ESP32Mouse] = None
 sensor: Optional[HDMISensor] = None
@@ -635,6 +683,9 @@ def _daemon_motion_loop():
                 else:
                     state.cursor_age_s = 999.0
 
+            # Feed loss-event ring buffer (rate-limited internally to ~5Hz)
+            _ring_capture(getattr(state, 'frame_overlay', None))
+
             time.sleep(0.05)  # 20Hz state polling
 
         except Exception as e:
@@ -828,12 +879,428 @@ def _python_motion_loop():
             state.fps = len(frame_times) / 2.0 if len(frame_times) > 1 else 0
 
             prev_frame = frame
+
+            # Feed loss-event ring buffer
+            _ring_capture(getattr(state, 'frame_overlay', None))
+
             elapsed = time.monotonic() - t0
             time.sleep(max(0, 0.05 - elapsed))
 
         except Exception as e:
             state.error = str(e)
             time.sleep(1)
+
+
+# ── Loss Event Sampling ──────────────────────────────────────────
+
+def _ring_capture(jpeg_bytes: bytes | None):
+    """Feed ring buffer from motion loop. Rate-limited to ~5Hz."""
+    global _ring_last_t
+    now = time.monotonic()
+    if now - _ring_last_t < 1.0 / _RING_BUFFER_HZ:
+        return
+    _ring_last_t = now
+
+    # Snapshot blob centroids — these are all the candidate cursor positions
+    blobs_snap = []
+    try:
+        for b in (state.blobs or [])[:10]:
+            blobs_snap.append({
+                "centroid": b.centroid if hasattr(b, 'centroid') else (0, 0),
+                "bbox": b.bbox if hasattr(b, 'bbox') else (0, 0, 0, 0),
+                "px": b.pixel_count if hasattr(b, 'pixel_count') else 0,
+            })
+    except Exception:
+        pass
+
+    entry = {
+        "t": now,
+        "utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "jpeg": jpeg_bytes,
+        "cx": state.cursor_x, "cy": state.cursor_y,
+        "method": state.cursor_method,
+        "validated": state.cursor_validated,
+        "cnn_conf": state.cnn_confidence,
+        "cnn_model": state.cnn_model_version,
+        "cnn_ms": state.cnn_inference_ms,
+        "sil_conf": state.silhouette_confidence,
+        "sil_method": state.silhouette_method,
+        "sil_roi": state.silhouette_roi_size,
+        "sil_misses": state.silhouette_misses,
+        "blob_count": state.blob_count,
+        "blobs": blobs_snap,
+        "fps": state.fps,
+        "vision_x": state.vision_x, "vision_y": state.vision_y,
+    }
+    with _ring_lock:
+        _ring_buffer.append(entry)
+
+    # Check for loss event trigger
+    _check_loss_trigger(now)
+
+
+def _check_loss_trigger(now: float):
+    """Detect confidence transitions that indicate cursor loss."""
+    global _loss_event_active, _loss_event_cooldown, _loss_prev
+
+    if _loss_event_active or now < _loss_event_cooldown:
+        return
+
+    trigger = None
+    prev = _loss_prev
+
+    # Validated True → False
+    if prev["validated"] and not state.cursor_validated:
+        trigger = "validation_lost"
+
+    # CNN drops from high (>0.7) to low (<0.5)
+    if prev["cnn"] > 0.7 and state.cnn_confidence < 0.5:
+        trigger = "cnn_drop"
+
+    # Silhouette drops from good (>0.7) to bad (<0.3)
+    if prev["sil"] > 0.7 and state.silhouette_confidence < 0.3:
+        trigger = "silhouette_drop"
+
+    # Position jump > 200px
+    if prev["x"] > 0 or prev["y"] > 0:
+        dx = state.cursor_x - prev["x"]
+        dy = state.cursor_y - prev["y"]
+        jump = (dx * dx + dy * dy) ** 0.5
+        if jump > 200:
+            trigger = f"position_jump_{int(jump)}px"
+
+    # Update previous state
+    _loss_prev = {
+        "validated": state.cursor_validated,
+        "cnn": state.cnn_confidence,
+        "sil": state.silhouette_confidence,
+        "x": state.cursor_x, "y": state.cursor_y,
+    }
+
+    if trigger:
+        _start_loss_event(trigger, now)
+
+
+def _start_loss_event(trigger: str, trigger_time: float):
+    """Snapshot ring buffer (pre-event) and start post-event capture thread."""
+    global _loss_event_active
+    _loss_event_active = True
+
+    with _ring_lock:
+        cutoff = trigger_time - _LOSS_PRE_WINDOW_S
+        pre = [e for e in _ring_buffer if e["t"] >= cutoff]
+
+    event_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    print(f"[loss_event] TRIGGERED: {trigger} — capturing {len(pre)} pre-frames → {event_id}")
+
+    threading.Thread(
+        target=_capture_loss_post,
+        args=(event_id, trigger, trigger_time, list(pre)),
+        daemon=True,
+    ).start()
+
+
+def _capture_loss_post(event_id: str, trigger: str, trigger_time: float, pre: list[dict]):
+    """Background: capture post-event frames until recovery or timeout, then save."""
+    global _loss_event_active, _loss_event_cooldown
+
+    post: list[dict] = []
+    deadline = trigger_time + _LOSS_POST_WINDOW_S
+    recovered = False
+    recovery_time = 0.0
+
+    try:
+        while time.monotonic() < deadline:
+            time.sleep(1.0 / _RING_BUFFER_HZ)
+
+            # Grab frame
+            jpeg = None
+            try:
+                if daemon_client and daemon_client.is_running():
+                    jpeg = daemon_client.read_jpeg()
+                elif sensor:
+                    frame = sensor.capture(settle_frames=1)
+                    _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    jpeg = buf.tobytes()
+            except Exception:
+                continue
+
+            entry = {
+                "t": time.monotonic(),
+                "utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                "jpeg": jpeg,
+                "cx": state.cursor_x, "cy": state.cursor_y,
+                "method": state.cursor_method,
+                "validated": state.cursor_validated,
+                "cnn_conf": state.cnn_confidence,
+                "cnn_model": state.cnn_model_version,
+                "sil_conf": state.silhouette_confidence,
+                "sil_method": state.silhouette_method,
+                "sil_roi": state.silhouette_roi_size,
+                "sil_misses": state.silhouette_misses,
+                "blob_count": state.blob_count,
+                "fps": state.fps,
+            }
+            post.append(entry)
+
+            # Check recovery: validated + CNN confident
+            if state.cursor_validated and state.cnn_confidence > 0.7:
+                recovered = True
+                recovery_time = time.monotonic()
+                # Capture a few more frames after recovery
+                for _ in range(int(_RING_BUFFER_HZ * 2)):
+                    time.sleep(1.0 / _RING_BUFFER_HZ)
+                    try:
+                        jpeg2 = None
+                        if daemon_client and daemon_client.is_running():
+                            jpeg2 = daemon_client.read_jpeg()
+                        elif sensor:
+                            f2 = sensor.capture(settle_frames=1)
+                            _, b2 = cv2.imencode('.jpg', f2, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                            jpeg2 = b2.tobytes()
+                    except Exception:
+                        jpeg2 = None
+                    post.append({
+                        "t": time.monotonic(),
+                        "utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                        "jpeg": jpeg2,
+                        "cx": state.cursor_x, "cy": state.cursor_y,
+                        "method": state.cursor_method,
+                        "validated": state.cursor_validated,
+                        "cnn_conf": state.cnn_confidence,
+                        "cnn_model": state.cnn_model_version,
+                        "sil_conf": state.silhouette_confidence,
+                        "sil_method": state.silhouette_method,
+                        "sil_roi": state.silhouette_roi_size,
+                        "sil_misses": state.silhouette_misses,
+                        "blob_count": state.blob_count,
+                        "fps": state.fps,
+                    })
+                break
+
+        # Save everything to disk
+        _save_loss_event(event_id, trigger, trigger_time, pre, post, recovered, recovery_time)
+
+    finally:
+        _loss_event_cooldown = time.monotonic() + _LOSS_COOLDOWN_S
+        _loss_event_active = False
+
+
+def _save_loss_event(event_id, trigger, trigger_time, pre, post, recovered, recovery_time):
+    """Write loss event to disk with full analysis:
+    - Frames + patches at tracked position (CNN re-inference)
+    - Patches at EACH blob centroid (candidate cursor positions → CNN scoring)
+    - Velocity/acceleration profile across the timeline
+    - Edge case tags (partial cursor, near-edge, noisy background)
+    - Peak velocity/acceleration markers
+    """
+    event_dir = _LOSS_EVENT_DIR / event_id
+    frames_dir = event_dir / "frames"
+    patches_dir = event_dir / "patches"
+    blob_patches_dir = event_dir / "blob_patches"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    patches_dir.mkdir(parents=True, exist_ok=True)
+    blob_patches_dir.mkdir(parents=True, exist_ok=True)
+
+    all_entries = pre + post
+    timeline = []
+
+    # ── Pass 1: Compute velocity/acceleration across timeline ──
+    velocities = []   # px/s at each frame
+    accels = []       # px/s² at each frame
+    for i in range(len(all_entries)):
+        if i == 0:
+            velocities.append(0.0)
+            accels.append(0.0)
+            continue
+        e, prev_e = all_entries[i], all_entries[i - 1]
+        dt = e["t"] - prev_e["t"]
+        if dt <= 0:
+            velocities.append(velocities[-1] if velocities else 0.0)
+            accels.append(0.0)
+            continue
+        dx = e["cx"] - prev_e["cx"]
+        dy = e["cy"] - prev_e["cy"]
+        speed = ((dx * dx + dy * dy) ** 0.5) / dt  # px/s
+        velocities.append(round(speed, 1))
+        if len(velocities) >= 2:
+            dv = velocities[-1] - velocities[-2]
+            accels.append(round(dv / dt, 1))
+        else:
+            accels.append(0.0)
+
+    # Find velocity/acceleration peaks
+    peak_vel_idx = max(range(len(velocities)), key=lambda i: velocities[i]) if velocities else 0
+    peak_accel_idx = max(range(len(accels)), key=lambda i: abs(accels[i])) if accels else 0
+
+    # Frame dimensions for edge detection (assume 1920x1080)
+    FRAME_W, FRAME_H = 1920, 1080
+    EDGE_MARGIN = 32  # cursor is 64x64, so within 32px of edge = partial
+
+    # ── Pass 2: Process each frame ──
+    for i, e in enumerate(all_entries):
+        t_offset = e["t"] - trigger_time
+
+        # Phase
+        if e["t"] < trigger_time:
+            phase = "had_it"
+        elif recovered and e["t"] > recovery_time:
+            phase = "recovered"
+        elif e["validated"]:
+            phase = "recovering"
+        else:
+            phase = "lost"
+
+        # Edge case tags
+        edge_cases = []
+        cx, cy = e["cx"], e["cy"]
+        if cx < EDGE_MARGIN or cy < EDGE_MARGIN or cx > FRAME_W - EDGE_MARGIN or cy > FRAME_H - EDGE_MARGIN:
+            edge_cases.append("partial_cursor")
+        if e["blob_count"] > 5:
+            edge_cases.append("noisy_background")
+        if velocities[i] > 500:
+            edge_cases.append("high_speed")
+        if abs(accels[i]) > 2000:
+            edge_cases.append("high_accel")
+        if i == peak_vel_idx and velocities[i] > 50:
+            edge_cases.append("peak_velocity")
+        if i == peak_accel_idx and abs(accels[i]) > 100:
+            edge_cases.append("peak_acceleration")
+
+        # Save frame JPEG
+        frame_name = f"f{i:04d}_{t_offset:+06.1f}s.jpg"
+        if e["jpeg"]:
+            (frames_dir / frame_name).write_bytes(e["jpeg"])
+
+        frame_np = None
+        if e["jpeg"]:
+            try:
+                frame_np = cv2.imdecode(np.frombuffer(e["jpeg"], np.uint8), cv2.IMREAD_COLOR)
+            except Exception:
+                pass
+
+        # ── Patch at tracked position → CNN re-inference ──
+        patch_name = None
+        retro_cnn = 0.0
+        retro_ms = 0.0
+        if frame_np is not None and cx > 0 and cy > 0:
+            try:
+                patch = extract_gray_patch(frame_np, cx, cy)
+                if patch is not None and recognizer:
+                    t0 = time.monotonic()
+                    retro_cnn = recognizer.classify_patch(patch)
+                    retro_ms = (time.monotonic() - t0) * 1000
+                    patch_name = f"p{i:04d}_{t_offset:+06.1f}s.png"
+                    cv2.imwrite(str(patches_dir / patch_name), patch)
+            except Exception:
+                pass
+
+        # ── Patches at EACH blob centroid → CNN scoring ──
+        # These are all the places the system thought could be the cursor
+        blob_results = []
+        if frame_np is not None and recognizer and e.get("blobs"):
+            for bi, blob in enumerate(e["blobs"][:6]):
+                bx, by = blob["centroid"]
+                if bx <= 0 or by <= 0:
+                    continue
+                try:
+                    bp = extract_gray_patch(frame_np, bx, by)
+                    if bp is not None:
+                        bt0 = time.monotonic()
+                        b_cnn = recognizer.classify_patch(bp)
+                        b_ms = (time.monotonic() - bt0) * 1000
+                        bp_name = f"b{i:04d}_{bi}_{t_offset:+06.1f}s.png"
+                        cv2.imwrite(str(blob_patches_dir / bp_name), bp)
+                        blob_results.append({
+                            "centroid": [bx, by],
+                            "bbox": blob["bbox"],
+                            "cnn_score": round(b_cnn, 4),
+                            "cnn_ms": round(b_ms, 1),
+                            "patch": f"blob_patches/{bp_name}",
+                        })
+                except Exception:
+                    pass
+
+        timeline.append({
+            "index": i,
+            "t_offset_s": round(t_offset, 2),
+            "utc": e["utc"],
+            "phase": phase,
+            "cursor": {"x": cx, "y": cy, "method": e["method"], "validated": e["validated"]},
+            "live_cnn": {"confidence": round(e["cnn_conf"], 4), "model": e["cnn_model"],
+                         "inference_ms": e.get("cnn_ms", 0)},
+            "retrospective_cnn": {"confidence": round(retro_cnn, 4), "inference_ms": round(retro_ms, 1)},
+            "silhouette": {
+                "confidence": round(e["sil_conf"], 3),
+                "method": e["sil_method"],
+                "roi_size": e["sil_roi"],
+                "misses": e["sil_misses"],
+            },
+            "velocity_px_s": velocities[i],
+            "acceleration_px_s2": accels[i],
+            "blob_count": e["blob_count"],
+            "blob_candidates": blob_results,
+            "edge_cases": edge_cases,
+            "vision": {"x": e.get("vision_x", 0), "y": e.get("vision_y", 0)},
+            "frame": f"frames/{frame_name}" if e["jpeg"] else None,
+            "patch": f"patches/{patch_name}" if patch_name else None,
+        })
+
+    # ── Velocity/acceleration summary ──
+    vel_summary = {}
+    if velocities:
+        vel_summary = {
+            "max_velocity_px_s": round(max(velocities), 1),
+            "max_velocity_at_offset_s": round(all_entries[peak_vel_idx]["t"] - trigger_time, 2),
+            "max_accel_px_s2": round(max(abs(a) for a in accels), 1),
+            "max_accel_at_offset_s": round(all_entries[peak_accel_idx]["t"] - trigger_time, 2),
+            "avg_velocity_pre": round(
+                sum(velocities[:len(pre)]) / max(1, len(pre)), 1),
+            "avg_velocity_post": round(
+                sum(velocities[len(pre):]) / max(1, len(post)), 1),
+        }
+
+    # Count total blob patches generated
+    total_blob_patches = sum(len(t.get("blob_candidates", [])) for t in timeline)
+
+    # Manifest
+    manifest = {
+        "event_id": event_id,
+        "trigger": trigger,
+        "trigger_utc": datetime.fromtimestamp(
+            time.time() - (time.monotonic() - trigger_time), tz=timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "recovered": recovered,
+        "duration_s": round(all_entries[-1]["t"] - all_entries[0]["t"], 1) if all_entries else 0,
+        "total_frames": len(all_entries),
+        "pre_frames": len(pre),
+        "post_frames": len(post),
+        "total_tracked_patches": sum(1 for t in timeline if t["patch"]),
+        "total_blob_patches": total_blob_patches,
+        "phases": {
+            "had_it": sum(1 for t in timeline if t["phase"] == "had_it"),
+            "lost": sum(1 for t in timeline if t["phase"] == "lost"),
+            "recovering": sum(1 for t in timeline if t["phase"] == "recovering"),
+            "recovered": sum(1 for t in timeline if t["phase"] == "recovered"),
+        },
+        "velocity": vel_summary,
+        "edge_cases_found": list(set(
+            tag for t in timeline for tag in t.get("edge_cases", [])
+        )),
+    }
+
+    with open(event_dir / "manifest.json", "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    with open(event_dir / "timeline.jsonl", "w") as f:
+        for t_entry in timeline:
+            f.write(json.dumps(t_entry) + "\n")
+
+    _loss_events_log.append(manifest)
+
+    print(f"[loss_event] Saved {event_id}: {trigger} | {len(all_entries)} frames "
+          f"({len(pre)} pre + {len(post)} post) | {total_blob_patches} blob patches | "
+          f"peak_vel={vel_summary.get('max_velocity_px_s', 0)}px/s | recovered={recovered}")
 
 
 def jitter_loop():
@@ -854,6 +1321,10 @@ def jitter_loop():
 
     while True:
         time.sleep(config.jitter_interval_s)
+
+        # Pause jitter during velocity tests — mouse is under test control
+        if _vtest_running:
+            continue
 
         # Update hardware monitoring state
         # Check _ser (private) to avoid triggering the lazy-init property.
@@ -1949,15 +2420,20 @@ async def validation_page():
 
 @app.get("/api/validation/samples")
 async def get_validation_samples(page: int = 0, page_size: int = 20,
-                                  sort: str = "priority"):
-    """Get paginated sample list for validation.
+                                  sort: str = "priority",
+                                  filter: str = "all",
+                                  label: str = "all",
+                                  source_filter: str = "all"):
+    """Get paginated sample list for validation with server-side filtering.
 
-    Sort options: priority (default), recent, confidence_asc, confidence_desc.
+    Sort: priority, recent, confidence_asc, confidence_desc, source
+    Filter: all, unreviewed, reviewed, confusing, claude, disagreement
+    Label: all, pos, neg
+    Source: all, motion_track, claude_vision, ground_truth
     """
-    # Load index
     index_path = _VALIDATION_SAMPLES_DIR / "index.jsonl"
     if not index_path.exists():
-        return {"samples": [], "total": 0, "page": page}
+        return {"samples": [], "total": 0, "page": page, "filter_counts": {}}
 
     entries = []
     with open(index_path) as f:
@@ -1971,6 +2447,7 @@ async def get_validation_samples(page: int = 0, page_size: int = 20,
 
     # Load reviews
     reviewed = {}
+    file_tags = {}  # filename → {col: value, ...} aggregated from all tag actions
     if _VALIDATION_REVIEWS_PATH.exists():
         with open(_VALIDATION_REVIEWS_PATH) as f:
             for line in f:
@@ -1978,11 +2455,18 @@ async def get_validation_samples(page: int = 0, page_size: int = 20,
                 if line:
                     try:
                         review = json.loads(line)
-                        reviewed[review["filename"]] = review
+                        fn = review["filename"]
+                        if review.get("action") == "tag" and "tags" in review:
+                            # Multi-dimensional tags — merge into file_tags
+                            if fn not in file_tags:
+                                file_tags[fn] = {}
+                            file_tags[fn].update(review["tags"])
+                        else:
+                            reviewed[fn] = review
                     except (json.JSONDecodeError, KeyError):
                         continue
 
-    # Run CNN inference on each sample for priority scoring
+    # Score all entries (CNN inference for priority)
     model = recognizer._cnn_model if recognizer else None
     import torch
 
@@ -1992,7 +2476,6 @@ async def get_validation_samples(page: int = 0, page_size: int = 20,
         review = reviewed.get(filename)
         is_reviewed = review is not None
 
-        # Get CNN confidence for this sample
         cnn_conf = None
         if model is not None:
             patch_path = _VALIDATION_SAMPLES_DIR / filename
@@ -2004,52 +2487,111 @@ async def get_validation_samples(page: int = 0, page_size: int = 20,
                     with torch.no_grad():
                         cnn_conf = model(tensor).item()
 
-        # Compute priority score (lower = review first)
         priority = 5.0
-        label = entry.get("label", "")
-        source = entry.get("source", "")
+        entry_label = entry.get("label", "")
+        entry_source = entry.get("source", "")
         is_confusing = entry.get("is_confusing", 0)
 
+        # Normalize label (some entries use 1/0 instead of pos/neg)
+        if entry_label == 1 or entry_label == "1":
+            entry_label = "pos"
+        elif entry_label == 0 or entry_label == "0":
+            entry_label = "neg"
+
+        cnn_disagrees = False
         if is_reviewed:
-            priority = 99.0  # Already reviewed
+            priority = 99.0
         elif is_confusing:
-            priority = 1.0  # Confusing images need human judgment
+            priority = 1.0
         elif cnn_conf is not None:
             predicted_pos = cnn_conf > 0.5
-            labeled_pos = label == "pos"
+            labeled_pos = entry_label == "pos"
             if predicted_pos != labeled_pos:
-                priority = 0.0 + abs(cnn_conf - 0.5)  # CNN disagrees = highest priority
+                priority = 0.0 + abs(cnn_conf - 0.5)
+                cnn_disagrees = True
             elif abs(cnn_conf - 0.5) < 0.2:
-                priority = 2.0  # Low confidence
-            elif source == "claude_vision":
-                priority = 3.0  # Claude-labeled, CNN agrees
+                priority = 2.0
+            elif "claude" in entry_source:
+                priority = 3.0
             else:
                 priority = 4.0
 
         scored_entries.append({
             **entry,
+            "label": entry_label,  # normalized
             "cnn_confidence": round(cnn_conf, 3) if cnn_conf is not None else None,
             "priority": round(priority, 3),
             "review": review,
+            "cnn_disagrees": cnn_disagrees,
+            "tags": file_tags.get(filename, {}),
         })
+
+    # Compute filter counts BEFORE filtering (so tabs show totals)
+    filter_counts = {
+        "all": len(scored_entries),
+        "unreviewed": sum(1 for e in scored_entries if not e["review"]),
+        "reviewed": sum(1 for e in scored_entries if e["review"]),
+        "confusing": sum(1 for e in scored_entries if e.get("is_confusing") or
+                        (e.get("review") and e["review"].get("is_confusing_to_human"))),
+        "claude": sum(1 for e in scored_entries if "claude" in e.get("source", "")),
+        "disagreement": sum(1 for e in scored_entries if e.get("cnn_disagrees")),
+        "pos": sum(1 for e in scored_entries if e["label"] == "pos"),
+        "neg": sum(1 for e in scored_entries if e["label"] == "neg"),
+    }
+    # Source breakdown
+    source_counts = {}
+    for e in scored_entries:
+        src = e.get("source", "unknown")
+        # Group by prefix (motion_track, claude_vision, ground_truth)
+        prefix = src.split("_neg")[0] if "_neg" in src else src
+        source_counts[prefix] = source_counts.get(prefix, 0) + 1
+    filter_counts["sources"] = source_counts
+
+    # Apply server-side filters
+    filtered = scored_entries
+    if filter == "unreviewed":
+        filtered = [e for e in filtered if not e["review"]]
+    elif filter == "reviewed":
+        filtered = [e for e in filtered if e["review"]]
+    elif filter == "confusing":
+        filtered = [e for e in filtered if e.get("is_confusing") or
+                    (e.get("review") and e["review"].get("is_confusing_to_human"))]
+    elif filter == "claude":
+        filtered = [e for e in filtered if "claude" in e.get("source", "")]
+    elif filter == "disagreement":
+        filtered = [e for e in filtered if e.get("cnn_disagrees")]
+
+    if label != "all":
+        filtered = [e for e in filtered if e["label"] == label]
+
+    if source_filter != "all":
+        filtered = [e for e in filtered if source_filter in e.get("source", "")]
 
     # Sort
     if sort == "priority":
-        scored_entries.sort(key=lambda e: e["priority"])
+        filtered.sort(key=lambda e: e["priority"])
     elif sort == "recent":
-        scored_entries.sort(key=lambda e: e.get("timestamp", 0), reverse=True)
+        filtered.sort(key=lambda e: e.get("timestamp", 0), reverse=True)
     elif sort == "confidence_asc":
-        scored_entries.sort(key=lambda e: e.get("cnn_confidence") or 0)
+        filtered.sort(key=lambda e: e.get("cnn_confidence") or 0)
     elif sort == "confidence_desc":
-        scored_entries.sort(key=lambda e: e.get("cnn_confidence") or 0, reverse=True)
+        filtered.sort(key=lambda e: e.get("cnn_confidence") or 0, reverse=True)
+    elif sort == "source":
+        filtered.sort(key=lambda e: e.get("source", ""))
 
     # Paginate
-    total = len(scored_entries)
+    total = len(filtered)
     start = page * page_size
     end = start + page_size
-    page_entries = scored_entries[start:end]
+    page_entries = filtered[start:end]
 
-    return {"samples": page_entries, "total": total, "page": page, "page_size": page_size}
+    return {
+        "samples": page_entries,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "filter_counts": filter_counts,
+    }
 
 
 @app.get("/api/validation/patch/{filename}")
@@ -2071,15 +2613,16 @@ async def get_validation_patch(filename: str):
 async def submit_review(request: Request):
     """Submit a review for a sample.
 
-    Body: {"filename": "pos_000123.png", "action": "correct"|"wrong"|"delete",
-           "cursor_type": "arrow"|null}
+    Body: {"filename": "pos_000123.png", "action": "correct"|"wrong"|"delete"|"confusing"|"annotate_tip",
+           "cursor_type": "arrow"|null, "tip_x": int|null, "tip_y": int|null}
     """
     data = await request.json()
     filename = data.get("filename")
     action = data.get("action")
 
-    if not filename or action not in ("correct", "wrong", "delete"):
-        return {"error": "Invalid review: need filename and action (correct/wrong/delete)"}
+    valid_actions = ("correct", "wrong", "confusing", "delete", "annotate_tip")
+    if not filename or action not in valid_actions:
+        return {"error": f"Invalid review: need filename and action ({'/'.join(valid_actions)})"}
 
     review = {
         "filename": filename,
@@ -2088,15 +2631,82 @@ async def submit_review(request: Request):
     }
     if data.get("cursor_type"):
         review["cursor_type"] = data["cursor_type"]
+    if action == "confusing":
+        review["is_confusing_to_human"] = True
     if action == "wrong":
-        # Determine corrected label
         current_label = "pos" if filename.startswith("pos_") else "neg"
         review["corrected_label"] = "neg" if current_label == "pos" else "pos"
+    if data.get("tip_x") is not None and data.get("tip_y") is not None:
+        review["tip_x"] = int(data["tip_x"])
+        review["tip_y"] = int(data["tip_y"])
 
     with open(_VALIDATION_REVIEWS_PATH, "a") as f:
         f.write(json.dumps(review) + "\n")
 
     return {"ok": True, "review": review}
+
+
+@app.post("/api/validation/tag")
+async def submit_tags(request: Request):
+    """Multi-dimensional tagging: set multiple independent features on a sample.
+
+    Body: {"filename": "pos_000123.png", "tags": {"quality": "ok", "confusing": "yes",
+           "cursor_type": "arrow", "visibility": "partial", "background": "noisy"}}
+
+    Tags are key-value pairs. Each tag is independent — setting one doesn't affect others.
+    Previous tags for the same key on the same file are superseded by the latest.
+    """
+    data = await request.json()
+    filename = data.get("filename")
+    tags = data.get("tags", {})
+
+    if not filename or not tags:
+        return {"error": "Need filename and tags dict"}
+
+    record = {
+        "filename": filename,
+        "action": "tag",
+        "tags": tags,
+        "timestamp": time.time(),
+    }
+
+    with open(_VALIDATION_REVIEWS_PATH, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+    return {"ok": True, "record": record}
+
+
+@app.get("/api/validation/tag_schema")
+async def get_tag_schema():
+    """Return the current tag columns and their possible values.
+
+    Columns are discovered from existing reviews + a default schema.
+    """
+    default_schema = {
+        "quality": {"values": ["ok", "wrong", "unsure"], "color": "#3498db"},
+        "confusing": {"values": ["yes", "no"], "color": "#e67e22"},
+        "cursor_type": {"values": ["arrow", "hand", "ibeam", "busy", "crosshair", "move", "unknown"], "color": "#9b59b6"},
+        "visibility": {"values": ["full", "partial", "hidden", "offscreen"], "color": "#2ecc71"},
+        "background": {"values": ["clean", "noisy", "animated", "textured"], "color": "#e74c3c"},
+    }
+
+    # Discover extra columns from existing reviews
+    if _VALIDATION_REVIEWS_PATH.exists():
+        for line in _VALIDATION_REVIEWS_PATH.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                r = json.loads(line)
+                if r.get("action") == "tag" and "tags" in r:
+                    for k, v in r["tags"].items():
+                        if k not in default_schema:
+                            default_schema[k] = {"values": [], "color": "#888"}
+                        if v not in default_schema[k]["values"]:
+                            default_schema[k]["values"].append(v)
+            except Exception:
+                pass
+
+    return {"schema": default_schema}
 
 
 @app.post("/api/validation/retrain")
@@ -2613,6 +3223,594 @@ async def get_tags():
     return {"tags": tags[-50:], "count": len(tags)}
 
 
+# ── Velocity / Acceleration Testing ────────────────────────────────
+
+def _capture_snapshot(profile_id: str, step: int, direction: str,
+                      commanded_dx: int, commanded_dy: int,
+                      commanded_total_x: float, commanded_total_y: float,
+                      run_dir: Path) -> dict:
+    """Capture full sensor state for one velocity test step.
+
+    Returns a dict suitable for JSONL logging.
+    """
+    now_mono = time.monotonic()
+
+    # Save frame for CNN training
+    frame_name = f"frame_{profile_id}_{direction}_{step:03d}.jpg"
+    frame_path = run_dir / "frames" / frame_name
+    if daemon_client and daemon_client.is_running():
+        jpeg = daemon_client.read_jpeg()
+        if jpeg:
+            frame_path.parent.mkdir(parents=True, exist_ok=True)
+            frame_path.write_bytes(jpeg)
+
+    tracked_x = state.cursor_x
+    tracked_y = state.cursor_y
+    error_px = ((tracked_x - commanded_total_x) ** 2 +
+                (tracked_y - commanded_total_y) ** 2) ** 0.5
+
+    return {
+        "utc": utc_now_ms(),
+        "monotonic": now_mono,
+        "profile": profile_id,
+        "step": step,
+        "direction": direction,
+        "commanded": {
+            "dx": commanded_dx,
+            "dy": commanded_dy,
+            "total_x": round(commanded_total_x, 1),
+            "total_y": round(commanded_total_y, 1),
+        },
+        "tracked": {
+            "x": tracked_x,
+            "y": tracked_y,
+            "method": state.cursor_method,
+            "age_s": round(state.cursor_age_s, 1),
+            "validated": state.cursor_validated,
+        },
+        "silhouette": {
+            "confidence": round(state.silhouette_confidence, 3),
+            "method": state.silhouette_method,
+            "roi_size": state.silhouette_roi_size,
+            "misses": state.silhouette_misses,
+            "hz": state.silhouette_hz,
+        },
+        "cnn": {
+            "confidence": round(state.cnn_confidence, 3),
+            "validated": state.cursor_validated,
+            "model": state.cnn_model_version,
+        },
+        "daemon": {
+            "fps": round(state.fps, 1),
+            "blob_count": state.blob_count,
+        },
+        "noise_grid": noise_grid_features(),
+        "error_px": round(error_px, 1),
+        "label": _auto_label(error_px),
+        "frame": frame_name,
+    }
+
+
+def _run_velocity_test(profiles: list[str]):
+    """Background thread: run velocity test profiles sequentially.
+
+    For each profile:
+      1. Establish starting position (current tracker + ESP32 estimated)
+      2. Move RIGHT for N steps, recording at each step
+      3. Return to start
+      4. Move DOWN for N steps, recording at each step
+      5. Return to start
+    """
+    global _vtest_running, _vtest_results, _vtest_progress, _vtest_summary
+
+    _vtest_running = True
+    _vtest_results = []
+
+    # Create run directory
+    run_ts = time.strftime("%Y%m%d_%H%M%S")
+    run_dir = _VTEST_DIR / f"run_{run_ts}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "frames").mkdir(exist_ok=True)
+
+    log_path = run_dir / "results.jsonl"
+
+    try:
+        for pid in profiles:
+            if not _vtest_running:
+                break  # Stopped early
+            if pid not in VELOCITY_PROFILES:
+                continue
+
+            prof = VELOCITY_PROFILES[pid]
+            steps = prof["steps"]
+            delay_s = prof["delay_ms"] / 1000.0
+            is_accel = "accel" in prof
+            is_alternate = prof.get("alternate", False)
+
+            # Run test in two directions: RIGHT then DOWN
+            for direction, axis in [("right", 0), ("down", 1)]:
+                if not _vtest_running:
+                    break
+
+                total_steps = steps
+                _vtest_progress = {
+                    "profile": pid,
+                    "direction": direction,
+                    "step": 0,
+                    "total": total_steps,
+                    "phase": "testing",
+                }
+
+                # Record starting position
+                start_esp_x = mouse.estimated_x if mouse else 0
+                start_esp_y = mouse.estimated_y if mouse else 0
+                cum_dx, cum_dy = 0.0, 0.0
+
+                for step_i in range(total_steps):
+                    if not _vtest_running:
+                        break
+
+                    # Calculate step displacement.
+                    # Speed magnitude comes from profile; axis selects X or Y.
+                    if is_accel:
+                        t = step_i / max(1, total_steps - 1)
+                        speed = round(prof["start_speed"] + t * (prof["end_speed"] - prof["start_speed"]))
+                    elif is_alternate:
+                        sign = 1 if step_i % 2 == 0 else -1
+                        speed = sign * (prof["dx"] or prof.get("dy", 2))
+                    else:
+                        # Use dx for RIGHT, dy for DOWN (fallback to dx if dy==0)
+                        speed = prof["dx"] if axis == 0 else (prof["dy"] if prof["dy"] else prof["dx"])
+
+                    dx = speed if axis == 0 else 0
+                    dy = speed if axis == 1 else 0
+
+                    # Move mouse
+                    if mouse and (dx != 0 or dy != 0):
+                        actual_dx, actual_dy = mouse.move(dx, dy)
+                        cum_dx += actual_dx
+                        cum_dy += actual_dy
+                    else:
+                        # V0 stationary — no movement, just observe
+                        pass
+
+                    # Wait for tracker to process the movement
+                    time.sleep(delay_s)
+
+                    # Capture state
+                    commanded_x = start_esp_x + cum_dx
+                    commanded_y = start_esp_y + cum_dy
+                    snapshot = _capture_snapshot(
+                        pid, step_i, direction, dx, dy,
+                        commanded_x, commanded_y, run_dir,
+                    )
+                    _vtest_results.append(snapshot)
+
+                    # Write to JSONL
+                    with open(log_path, "a") as f:
+                        f.write(json.dumps(snapshot) + "\n")
+
+                    _vtest_progress["step"] = step_i + 1
+
+                # Return to start position after direction run
+                if mouse and (cum_dx != 0 or cum_dy != 0):
+                    mouse.move(int(-cum_dx), int(-cum_dy))
+                    time.sleep(0.5)  # Settle after return
+
+        # Compute summary stats per profile
+        _vtest_summary = _compute_vtest_summary(_vtest_results)
+
+        # Save summary
+        with open(run_dir / "summary.json", "w") as f:
+            json.dump(_vtest_summary, f, indent=2)
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        _vtest_progress["phase"] = f"error: {e}"
+    finally:
+        _vtest_running = False
+        _vtest_progress["phase"] = "done"
+
+
+def _compute_vtest_summary(results: list[dict]) -> dict:
+    """Aggregate velocity test results per profile + direction."""
+    from collections import defaultdict
+    import statistics
+
+    groups = defaultdict(list)
+    for r in results:
+        key = f"{r['profile']}_{r['direction']}"
+        groups[key].append(r)
+
+    summary = {}
+    for key, records in groups.items():
+        errors = [r["error_px"] for r in records]
+        labels = [r["label"] for r in records]
+        n = len(records)
+        label_counts = {
+            "accurate": labels.count("accurate"),
+            "drift": labels.count("drift"),
+            "wrong": labels.count("wrong"),
+            "lost": labels.count("lost"),
+        }
+        summary[key] = {
+            "count": n,
+            "error_mean": round(statistics.mean(errors), 1) if errors else 0,
+            "error_max": round(max(errors), 1) if errors else 0,
+            "error_min": round(min(errors), 1) if errors else 0,
+            "error_p95": round(sorted(errors)[int(n * 0.95)] if n >= 2 else errors[0], 1) if errors else 0,
+            "labels": label_counts,
+            "accuracy_pct": round(100 * label_counts["accurate"] / n, 1) if n > 0 else 0,
+            "methods": list(set(r["tracked"]["method"] for r in records)),
+        }
+
+    return summary
+
+
+@app.post("/api/velocity_test")
+async def start_velocity_test(request: Request):
+    """Start velocity/acceleration test in background thread.
+
+    POST body (optional): {"profiles": ["V0","V1","V2","V3","V4","A1","A2","A3"]}
+    Omit profiles to run all.
+    """
+    global _vtest_running
+    if _vtest_running:
+        return {"error": "Test already running", "progress": _vtest_progress}
+    if not mouse:
+        return {"error": "Mouse not initialized"}
+
+    body = {}
+    if request.headers.get("content-type") == "application/json":
+        body = await request.json()
+    profiles = body.get("profiles", list(VELOCITY_PROFILES.keys()))
+
+    threading.Thread(
+        target=_run_velocity_test, args=(profiles,), daemon=True
+    ).start()
+
+    return {"status": "started", "profiles": profiles, "utc": utc_now_ms()}
+
+
+@app.post("/api/velocity_test/stop")
+async def stop_velocity_test():
+    """Stop a running velocity test early."""
+    global _vtest_running
+    if not _vtest_running:
+        return {"error": "No test running"}
+    _vtest_running = False
+    return {"status": "stopping", "results_so_far": len(_vtest_results)}
+
+
+@app.get("/api/velocity_test/status")
+async def velocity_test_status():
+    """Get current velocity test progress."""
+    return {
+        "running": _vtest_running,
+        "progress": _vtest_progress,
+        "results_count": len(_vtest_results),
+    }
+
+
+@app.get("/api/velocity_test/results")
+async def velocity_test_results():
+    """Get velocity test results and summary."""
+    return {
+        "running": _vtest_running,
+        "summary": _vtest_summary,
+        "total_steps": len(_vtest_results),
+        "last_10": _vtest_results[-10:] if _vtest_results else [],
+    }
+
+
+# ── Loss Event Sampling API ─────────────────────────────────────
+
+@app.get("/api/loss_events")
+async def list_loss_events():
+    """List all captured loss events (newest first)."""
+    # Rebuild index from disk if in-memory list is empty
+    if not _loss_events_log and _LOSS_EVENT_DIR.exists():
+        for d in sorted(_LOSS_EVENT_DIR.iterdir(), reverse=True):
+            mf = d / "manifest.json"
+            if mf.exists():
+                try:
+                    _loss_events_log.append(json.loads(mf.read_text()))
+                except Exception:
+                    pass
+
+    return {
+        "events": list(reversed(_loss_events_log)),
+        "total": len(_loss_events_log),
+        "ring_buffer_size": len(_ring_buffer),
+        "active": _loss_event_active,
+    }
+
+
+@app.get("/api/loss_events/{event_id}/timeline")
+async def get_loss_timeline(event_id: str):
+    """Get full timeline for a loss event."""
+    tl_path = _LOSS_EVENT_DIR / event_id / "timeline.jsonl"
+    if not tl_path.exists():
+        return {"error": "Event not found"}
+    entries = []
+    for line in tl_path.read_text().splitlines():
+        if line.strip():
+            entries.append(json.loads(line))
+    manifest = {}
+    mf = _LOSS_EVENT_DIR / event_id / "manifest.json"
+    if mf.exists():
+        manifest = json.loads(mf.read_text())
+    return {"manifest": manifest, "timeline": entries}
+
+
+@app.get("/api/loss_events/{event_id}/frame/{frame_name:path}")
+async def get_loss_frame(event_id: str, frame_name: str):
+    """Serve a frame or patch image from a loss event."""
+    file_path = _LOSS_EVENT_DIR / event_id / frame_name
+    if not file_path.exists():
+        return Response(status_code=404, content="Not found")
+    suffix = file_path.suffix.lower()
+    media = "image/jpeg" if suffix == ".jpg" else "image/png"
+    return Response(content=file_path.read_bytes(), media_type=media)
+
+
+@app.get("/loss_events", response_class=HTMLResponse)
+async def loss_events_page():
+    """Timeline viewer for cursor loss events."""
+    return LOSS_EVENTS_HTML
+
+
+# ── Loss Events HTML ────────────────────────────────────────────────
+
+LOSS_EVENTS_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Cursor Loss Events</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'JetBrains Mono', monospace; background: #0a0a0f; color: #c8c8d0; }
+.header { background: #101018; padding: 0.6rem 1.5rem; border-bottom: 2px solid #e74c3c;
+    display: flex; justify-content: space-between; align-items: center; }
+.header h1 { color: #e74c3c; font-size: 1.1rem; letter-spacing: 1px; }
+.nav a { color: #888; text-decoration: none; font-size: 0.75rem; margin-left: 1rem; }
+.nav a:hover { color: #fff; }
+.events-list { padding: 1rem; }
+.event-card { background: #14141f; border: 1px solid #222; border-radius: 6px; padding: 1rem; margin-bottom: 0.8rem; cursor: pointer; }
+.event-card:hover { border-color: #e74c3c; }
+.event-card .meta { display: flex; gap: 1.5rem; font-size: 0.75rem; color: #888; margin-top: 0.4rem; }
+.event-card .trigger { color: #e74c3c; font-weight: bold; }
+.event-card .recovered { color: #2ecc71; }
+.event-card .not-recovered { color: #e74c3c; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.65rem; }
+.badge-had { background: #1a3a1a; color: #2ecc71; }
+.badge-lost { background: #3a1a1a; color: #e74c3c; }
+.badge-recovered { background: #1a2a3a; color: #3498db; }
+
+/* Timeline view */
+.timeline-view { display: none; padding: 1rem; }
+.timeline-view.active { display: block; }
+.back-btn { background: #222; color: #aaa; border: 1px solid #333; padding: 4px 12px; border-radius: 4px; cursor: pointer; margin-bottom: 1rem; font-size: 0.75rem; }
+.back-btn:hover { color: #fff; border-color: #e74c3c; }
+.tl-header { margin-bottom: 1rem; }
+.tl-header h2 { color: #e74c3c; font-size: 1rem; }
+.tl-header .tl-meta { font-size: 0.75rem; color: #888; margin-top: 0.3rem; }
+
+.tl-strip { display: flex; overflow-x: auto; gap: 4px; padding: 0.5rem 0; }
+.tl-frame { flex-shrink: 0; width: 120px; text-align: center; cursor: pointer; border: 2px solid transparent; border-radius: 4px; padding: 2px; }
+.tl-frame:hover { border-color: #555; }
+.tl-frame.selected { border-color: #e74c3c; }
+.tl-frame.phase-had_it { border-bottom: 3px solid #2ecc71; }
+.tl-frame.phase-lost { border-bottom: 3px solid #e74c3c; }
+.tl-frame.phase-recovering { border-bottom: 3px solid #f39c12; }
+.tl-frame.phase-recovered { border-bottom: 3px solid #3498db; }
+.tl-frame img { width: 116px; height: 65px; object-fit: cover; border-radius: 2px; background: #000; }
+.tl-frame .tl-label { font-size: 0.55rem; color: #888; margin-top: 2px; }
+.tl-frame .tl-conf { font-size: 0.55rem; }
+
+.detail-panel { display: flex; gap: 1rem; margin-top: 1rem; }
+.detail-frame { flex: 1; }
+.detail-frame img { width: 100%; image-rendering: auto; border-radius: 4px; border: 1px solid #333; }
+.detail-patch { width: 200px; }
+.detail-patch img { width: 192px; height: 192px; image-rendering: pixelated; border: 1px solid #333; border-radius: 4px; }
+.detail-info { flex: 1; font-size: 0.7rem; }
+.detail-info table { width: 100%; border-collapse: collapse; }
+.detail-info td { padding: 3px 6px; border-bottom: 1px solid #1a1a2a; }
+.detail-info td:first-child { color: #888; width: 120px; }
+.conf-bar { display: inline-block; height: 8px; border-radius: 2px; }
+.conf-high { background: #2ecc71; }
+.conf-mid { background: #f39c12; }
+.conf-low { background: #e74c3c; }
+.empty-state { text-align: center; padding: 4rem 2rem; color: #555; }
+.empty-state p { margin-top: 0.5rem; font-size: 0.8rem; }
+.ring-status { font-size: 0.7rem; color: #555; margin-left: 1rem; }
+</style>
+</head>
+<body>
+<div class="header">
+  <div style="display:flex;align-items:center;gap:1rem;">
+    <h1>CURSOR LOSS EVENTS</h1>
+    <span class="ring-status" id="ring-status"></span>
+  </div>
+  <div class="nav">
+    <a href="/">Dashboard</a>
+    <a href="/validation">Validation</a>
+    <a href="/profiler">Profiler</a>
+    <a href="/loss_events">Loss Events</a>
+  </div>
+</div>
+
+<div class="events-list" id="events-list"></div>
+
+<div class="timeline-view" id="timeline-view">
+  <button class="back-btn" onclick="showList()">&larr; Back to events</button>
+  <div class="tl-header" id="tl-header"></div>
+  <div class="tl-strip" id="tl-strip"></div>
+  <div class="detail-panel" id="detail-panel"></div>
+</div>
+
+<script>
+var events = [];
+var currentTimeline = [];
+var currentEventId = null;
+var selectedIdx = 0;
+
+async function loadEvents() {
+  var res = await fetch('/api/loss_events');
+  var data = await res.json();
+  events = data.events;
+  document.getElementById('ring-status').textContent =
+    'Ring buffer: ' + data.ring_buffer_size + ' frames | ' +
+    (data.active ? 'CAPTURING...' : 'watching');
+  renderEventsList();
+}
+
+function renderEventsList() {
+  var el = document.getElementById('events-list');
+  if (events.length === 0) {
+    el.innerHTML = '<div class="empty-state"><h2>No loss events captured yet</h2>' +
+      '<p>Events are recorded automatically when cursor confidence drops.<br>' +
+      'The ring buffer holds the last 60 seconds — when a loss happens, it saves the timeline.</p></div>';
+    return;
+  }
+  var html = '';
+  for (var i = 0; i < events.length; i++) {
+    var ev = events[i];
+    var recClass = ev.recovered ? 'recovered' : 'not-recovered';
+    var recText = ev.recovered ? 'Recovered' : 'Not recovered';
+    html += '<div class="event-card" onclick="openEvent(\'' + ev.event_id + '\')">' +
+      '<span class="trigger">' + ev.trigger + '</span>' +
+      '<div class="meta">' +
+      '<span>' + ev.trigger_utc + '</span>' +
+      '<span>' + ev.total_frames + ' frames</span>' +
+      '<span>' + ev.duration_s + 's duration</span>' +
+      '<span class="' + recClass + '">' + recText + '</span>' +
+      (ev.phases ? ' <span class="badge badge-had">' + ev.phases.had_it + ' had</span>' +
+        '<span class="badge badge-lost">' + ev.phases.lost + ' lost</span>' +
+        '<span class="badge badge-recovered">' + (ev.phases.recovering + ev.phases.recovered) + ' recovery</span>' : '') +
+      '</div></div>';
+  }
+  el.innerHTML = html;
+}
+
+async function openEvent(eventId) {
+  currentEventId = eventId;
+  var res = await fetch('/api/loss_events/' + eventId + '/timeline');
+  var data = await res.json();
+  currentTimeline = data.timeline;
+
+  document.getElementById('events-list').style.display = 'none';
+  document.getElementById('timeline-view').classList.add('active');
+
+  var m = data.manifest;
+  document.getElementById('tl-header').innerHTML =
+    '<h2>' + m.trigger + '</h2>' +
+    '<div class="tl-meta">' + m.trigger_utc + ' | ' + m.total_frames + ' frames | ' +
+    m.duration_s + 's | ' + (m.recovered ? 'Recovered' : 'Not recovered') + '</div>';
+
+  renderStrip();
+  selectFrame(0);
+}
+
+function renderStrip() {
+  var html = '';
+  for (var i = 0; i < currentTimeline.length; i++) {
+    var t = currentTimeline[i];
+    var confClass = t.live_cnn.confidence > 0.7 ? 'conf-high' : (t.live_cnn.confidence > 0.4 ? 'conf-mid' : 'conf-low');
+    var src = t.frame ? '/api/loss_events/' + currentEventId + '/frame/' + t.frame : '';
+    html += '<div class="tl-frame phase-' + t.phase + (i === selectedIdx ? ' selected' : '') + '" onclick="selectFrame(' + i + ')">' +
+      (src ? '<img src="' + src + '" loading="lazy">' : '<div style="width:116px;height:65px;background:#111"></div>') +
+      '<div class="tl-label">' + t.t_offset_s + 's · ' + t.phase + '</div>' +
+      '<div class="tl-conf"><span class="conf-bar ' + confClass + '" style="width:' + Math.round(t.live_cnn.confidence * 60) + 'px"></span> ' +
+      (t.live_cnn.confidence * 100).toFixed(0) + '%</div>' +
+      '</div>';
+  }
+  document.getElementById('tl-strip').innerHTML = html;
+}
+
+function selectFrame(idx) {
+  selectedIdx = idx;
+  var t = currentTimeline[idx];
+
+  // Update strip selection
+  var frames = document.querySelectorAll('.tl-frame');
+  frames.forEach(function(f, i) { f.classList.toggle('selected', i === idx); });
+  if (frames[idx]) frames[idx].scrollIntoView({behavior: 'smooth', block: 'nearest', inline: 'center'});
+
+  // Build detail panel
+  var frameSrc = t.frame ? '/api/loss_events/' + currentEventId + '/frame/' + t.frame : '';
+  var patchSrc = t.patch ? '/api/loss_events/' + currentEventId + '/frame/' + t.patch : '';
+
+  var liveConf = t.live_cnn.confidence;
+  var retroConf = t.retrospective_cnn.confidence;
+  function confColor(c) { return c > 0.7 ? '#2ecc71' : (c > 0.4 ? '#f39c12' : '#e74c3c'); }
+
+  var html = '<div class="detail-frame">' +
+    (frameSrc ? '<img src="' + frameSrc + '">' : '<div style="height:300px;background:#111;border-radius:4px;"></div>') +
+    '</div>' +
+    '<div class="detail-patch">' +
+    '<div style="font-size:0.65rem;color:#888;margin-bottom:4px">64x64 patch at (' + t.cursor.x + ',' + t.cursor.y + ')</div>' +
+    (patchSrc ? '<img src="' + patchSrc + '">' : '<div style="width:192px;height:192px;background:#111;border-radius:4px;"></div>') +
+    '</div>' +
+    '<div class="detail-info"><table>' +
+    '<tr><td>Time offset</td><td>' + t.t_offset_s + 's</td></tr>' +
+    '<tr><td>Phase</td><td style="color:' + (t.phase === 'had_it' ? '#2ecc71' : t.phase === 'lost' ? '#e74c3c' : '#f39c12') + '">' + t.phase + '</td></tr>' +
+    '<tr><td>Position</td><td>(' + t.cursor.x + ', ' + t.cursor.y + ')</td></tr>' +
+    '<tr><td>Method</td><td>' + t.cursor.method + '</td></tr>' +
+    '<tr><td>Validated</td><td>' + (t.cursor.validated ? '<span style="color:#2ecc71">YES</span>' : '<span style="color:#e74c3c">NO</span>') + '</td></tr>' +
+    '<tr><td>Live CNN</td><td><span style="color:' + confColor(liveConf) + '">' + (liveConf * 100).toFixed(1) + '%</span> (' + t.live_cnn.model + ')</td></tr>' +
+    '<tr><td>Retro CNN</td><td><span style="color:' + confColor(retroConf) + '">' + (retroConf * 100).toFixed(1) + '%</span> (' + t.retrospective_cnn.inference_ms + 'ms)</td></tr>' +
+    '<tr><td>Silhouette</td><td>' + (t.silhouette.confidence * 100).toFixed(0) + '% · ' + t.silhouette.method + ' · ROI ' + t.silhouette.roi_size + ' · misses ' + t.silhouette.misses + '</td></tr>' +
+    '<tr><td>Blobs</td><td>' + t.blob_count + '</td></tr>' +
+    '<tr><td>Velocity</td><td>' + (t.velocity_px_s || 0) + ' px/s</td></tr>' +
+    '<tr><td>Acceleration</td><td>' + (t.acceleration_px_s2 || 0) + ' px/s²</td></tr>' +
+    (t.edge_cases && t.edge_cases.length > 0 ?
+      '<tr><td>Edge cases</td><td>' + t.edge_cases.map(function(c) {
+        return '<span style="background:#3a1a2a;color:#e74c3c;padding:1px 6px;border-radius:8px;font-size:0.6rem;margin-right:4px">' + c + '</span>';
+      }).join('') + '</td></tr>' : '') +
+    '</table>';
+
+  // Blob candidates with CNN scores
+  if (t.blob_candidates && t.blob_candidates.length > 0) {
+    html += '<div style="margin-top:8px;font-size:0.65rem;color:#888">Blob candidates (CNN scored):</div>';
+    html += '<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px">';
+    for (var bi = 0; bi < t.blob_candidates.length; bi++) {
+      var bc = t.blob_candidates[bi];
+      var bcColor = bc.cnn_score > 0.7 ? '#2ecc71' : (bc.cnn_score > 0.4 ? '#f39c12' : '#e74c3c');
+      var bcSrc = '/api/loss_events/' + currentEventId + '/frame/' + bc.patch;
+      html += '<div style="text-align:center">' +
+        '<img src="' + bcSrc + '" style="width:64px;height:64px;image-rendering:pixelated;border:1px solid #333;border-radius:2px">' +
+        '<div style="font-size:0.55rem;color:' + bcColor + '">' + (bc.cnn_score * 100).toFixed(0) + '% (' + bc.centroid[0] + ',' + bc.centroid[1] + ')</div>' +
+        '</div>';
+    }
+    html += '</div>';
+  }
+
+  html += '</div>';
+
+  document.getElementById('detail-panel').innerHTML = html;
+}
+
+function showList() {
+  document.getElementById('events-list').style.display = '';
+  document.getElementById('timeline-view').classList.remove('active');
+}
+
+// Keyboard nav: left/right to scrub timeline
+document.addEventListener('keydown', function(e) {
+  if (!document.getElementById('timeline-view').classList.contains('active')) return;
+  if (e.key === 'ArrowLeft' || e.key === 'j') { e.preventDefault(); if (selectedIdx > 0) selectFrame(selectedIdx - 1); }
+  if (e.key === 'ArrowRight' || e.key === 'k') { e.preventDefault(); if (selectedIdx < currentTimeline.length - 1) selectFrame(selectedIdx + 1); }
+});
+
+loadEvents();
+setInterval(loadEvents, 10000);
+</script>
+</body>
+</html>"""
+
+
 # ── Dashboard HTML ──────────────────────────────────────────────────
 
 DASHBOARD_HTML = r"""
@@ -2757,6 +3955,8 @@ DASHBOARD_HTML = r"""
         <div style="display:flex; align-items:center; gap:1rem;">
             <h1>KVM</h1>
             <a href="/profiler" style="color:#888; text-decoration:none; font-size:0.75rem;">Profiler</a>
+            <a href="/validation" style="color:#888; text-decoration:none; font-size:0.75rem;">Validation</a>
+            <a href="/loss_events" style="color:#888; text-decoration:none; font-size:0.75rem;">Loss Events</a>
             <a href="/concepts" style="color:#888; text-decoration:none; font-size:0.75rem;">Concepts</a>
         </div>
         <div class="status">
@@ -2774,6 +3974,7 @@ DASHBOARD_HTML = r"""
                     <img id="live-frame" src="" alt="Loading...">
                     <div class="cursor-dot" id="cursor-dot"></div>
                     <div class="vision-dot" id="vision-dot"></div>
+                    <div id="pause-overlay" style="display:none; position:absolute; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.3); z-index:10; justify-content:center; align-items:center; font-size:1.5rem; color:#f39c12; font-weight:bold; letter-spacing:4px; text-shadow:0 0 10px #000;">PAUSED — TAG &amp; RESUME</div>
                 </div>
             </div>
         </div>
@@ -2788,9 +3989,13 @@ DASHBOARD_HTML = r"""
                     </div>
                 </div>
                 <div class="tier-indicator">
-                    <div class="tier t1" id="tier-1">T1 Micro</div>
-                    <div class="tier t2" id="tier-2">T2 Macro</div>
-                    <div class="tier t3" id="tier-3">T3 Lissajous</div>
+                    <div class="tier t1" id="tier-1" title="Motion tracking or silhouette following — fast, per-frame">T1 Micro</div>
+                    <div class="tier t2" id="tier-2" title="CNN re-acquisition or macro shake — cursor was lost, searching nearby">T2 Macro</div>
+                    <div class="tier t3" id="tier-3" title="Lissajous sweep — brute-force finder, sweeps entire screen">T3 Lissajous</div>
+                </div>
+                <div class="panel-help" id="cursor-help">
+                    Green = fresh position, yellow = stale (&gt;5s), red = lost (&gt;15s).<br>
+                    <b>Method</b>: how the position was last determined — motion_track (frame diff), sil_template (silhouette match), dual_probe (jitter re-acquisition), vision_anchor (Claude Vision).
                 </div>
             </div>
             <div class="panel">
@@ -2920,7 +4125,10 @@ DASHBOARD_HTML = r"""
                 </div>
             </div>
             <div class="panel" style="border-color:#f39c12">
-                <div class="panel-title" style="color:#f39c12">Tag Frame (Training Data)</div>
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.6rem;">
+                    <div class="panel-title" style="color:#f39c12; margin-bottom:0">Tag Frame</div>
+                    <button id="pause-btn" onclick="togglePause()" style="background:#f39c12; color:#000; border:none; padding:3px 10px; cursor:pointer; border-radius:3px; font-weight:bold; font-size:0.65rem;">PAUSE (TAG)</button>
+                </div>
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:4px; font-size:0.7rem;">
                     <div>
                         <div style="color:#888; margin-bottom:2px;">Cursor Correct?</div>
@@ -2991,6 +4199,7 @@ DASHBOARD_HTML = r"""
             try {
                 const res = await fetch('/api/state');
                 const s = await res.json();
+                lastState = s;
 
                 document.getElementById('fps-display').textContent = s.fps + ' FPS';
 
@@ -3226,19 +4435,58 @@ DASHBOARD_HTML = r"""
                 });
         }
 
-        // ── Frame updates at 5Hz ──
+        // ── Pause / freeze for tagging ──
+        var paused = false;
+        var frozenState = null;
+        var tagCount = 0;
+
+        function togglePause() {
+            paused = !paused;
+            var btn = document.getElementById('pause-btn');
+            var overlay = document.getElementById('pause-overlay');
+            if (paused) {
+                btn.textContent = 'RESUME (LIVE)';
+                btn.style.background = '#e74c3c';
+                overlay.style.display = 'flex';
+                // Freeze current state for tagging
+                frozenState = lastState;
+            } else {
+                btn.textContent = 'PAUSE (TAG)';
+                btn.style.background = '#f39c12';
+                overlay.style.display = 'none';
+                frozenState = null;
+                // Clear tag selections
+                document.querySelectorAll('.tag-btn').forEach(function(b) {
+                    b.classList.remove('selected');
+                });
+                tagState = {};
+                document.getElementById('tag-notes').value = '';
+                document.getElementById('tag-status').textContent = '';
+            }
+        }
+
+        var lastState = null;
+
+        // ── Frame updates at 5Hz (skipped when paused) ──
         function scheduleFrame() {
-            updateFrame();
+            if (!paused) updateFrame();
             setTimeout(scheduleFrame, 200);
         }
-        setInterval(updateState, 200);
+        var stateInterval = setInterval(function() {
+            if (!paused) updateState();
+        }, 200);
         scheduleFrame();
         updateState();
+
+        // Store last state for freeze
+        var origUpdateState = updateState;
 
         // ── Tagging system ──
         var tagState = {};
         document.querySelectorAll('.tag-btn').forEach(function(btn) {
             btn.addEventListener('click', function() {
+                // Auto-pause on first tag button click
+                if (!paused) togglePause();
                 var dim = this.dataset.dim;
                 var val = this.dataset.val;
                 // Toggle selection in same group
@@ -3263,10 +4511,13 @@ DASHBOARD_HTML = r"""
                 });
                 var data = await res.json();
                 if (data.status === 'tagged') {
-                    statusEl.textContent = 'Tagged #' + data.id + ' (' + data.frame + ')';
+                    tagCount++;
+                    statusEl.textContent = 'Tagged #' + tagCount + ' (' + data.frame + ')';
                     statusEl.style.color = '#27ae60';
-                    // Flash effect
-                    setTimeout(function() { statusEl.style.color = '#888'; }, 2000);
+                    // Auto-resume after successful tag
+                    setTimeout(function() {
+                        togglePause();
+                    }, 800);
                 } else {
                     statusEl.textContent = 'Error: ' + (data.error || 'unknown');
                     statusEl.style.color = '#e74c3c';
@@ -3293,28 +4544,42 @@ VALIDATION_HTML = r"""<!DOCTYPE html>
 body { background: #0a0a0f; color: #e0e0e0; font-family: 'JetBrains Mono', monospace; }
 .header { background: #12121a; padding: 12px 20px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #222; }
 .header h1 { font-size: 16px; color: #ff4444; }
+.header .nav { display: flex; gap: 6px; }
+.nav-link { padding: 5px 12px; border: 1px solid #333; background: #1a1a24; color: #888; text-decoration: none; font-size: 11px; border-radius: 4px; }
+.nav-link:hover { background: #252530; color: #ccc; }
+.nav-link.active { border-color: #ff4444; color: #ff4444; }
 .header .actions { display: flex; gap: 8px; }
 .btn { padding: 6px 14px; border: 1px solid #333; background: #1a1a24; color: #e0e0e0; cursor: pointer; font-size: 12px; font-family: inherit; border-radius: 4px; }
 .btn:hover { background: #252530; }
 .btn-retrain { border-color: #ff4444; color: #ff4444; }
 .btn-retrain:hover { background: #ff444420; }
-.filters { padding: 10px 20px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid #1a1a24; }
+.controls { padding: 10px 20px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid #1a1a24; }
 .filter-btn { padding: 4px 10px; border: 1px solid #333; background: transparent; color: #888; cursor: pointer; font-size: 11px; font-family: inherit; border-radius: 3px; }
 .filter-btn.active { border-color: #ff4444; color: #ff4444; background: #ff444410; }
+.filter-count { font-size: 9px; color: #555; margin-left: 2px; }
+.filter-btn.active .filter-count { color: #ff444488; }
+.sort-select, .source-select, .label-select { padding: 4px 8px; border: 1px solid #333; background: #12121a; color: #ccc; font-size: 11px; font-family: inherit; border-radius: 3px; }
+.ctrl-label { font-size: 10px; color: #555; text-transform: uppercase; letter-spacing: 1px; margin-right: 2px; }
+.ctrl-sep { width: 1px; height: 20px; background: #222; margin: 0 4px; }
 .pagination { display: flex; gap: 8px; align-items: center; margin-left: auto; font-size: 11px; color: #666; }
 .pagination .btn { padding: 3px 8px; font-size: 11px; }
-.stats-bar { padding: 8px 20px; background: #0d0d14; font-size: 11px; color: #666; display: flex; gap: 16px; border-bottom: 1px solid #1a1a24; }
+.stats-bar { padding: 8px 20px; background: #0d0d14; font-size: 11px; color: #666; display: flex; gap: 16px; border-bottom: 1px solid #1a1a24; flex-wrap: wrap; }
 .stats-bar span { color: #888; }
 table { width: 100%; border-collapse: collapse; }
-th { text-align: left; padding: 8px 12px; font-size: 11px; color: #666; background: #0d0d14; border-bottom: 1px solid #222; }
+th { text-align: left; padding: 8px 12px; font-size: 11px; color: #666; background: #0d0d14; border-bottom: 1px solid #222; cursor: pointer; }
+th:hover { color: #aaa; }
+th.sorted { color: #ff4444; }
 td { padding: 8px 12px; border-bottom: 1px solid #1a1a24; vertical-align: middle; font-size: 12px; }
 tr:hover { background: #12121a; }
-.patch-img { width: 96px; height: 96px; image-rendering: pixelated; border: 1px solid #333; border-radius: 2px; }
+.patch-img { width: 96px; height: 96px; image-rendering: pixelated; border: 1px solid #333; border-radius: 2px; cursor: pointer; }
+.patch-img:hover { border-color: #ff4444; }
 .label-pos { color: #4CAF50; font-weight: bold; }
 .label-neg { color: #ff5252; font-weight: bold; }
 .source { color: #888; font-size: 11px; }
 .source.claude { color: #7c4dff; }
+.source.ground-truth { color: #2ecc71; }
 .confusing-badge { color: #FF9800; font-size: 10px; margin-left: 4px; }
+.disagree-badge { color: #ff5252; font-size: 10px; margin-left: 4px; }
 .conf-bar { width: 60px; height: 6px; background: #1a1a24; border-radius: 3px; display: inline-block; vertical-align: middle; margin-right: 6px; }
 .conf-fill { height: 100%; border-radius: 3px; }
 .conf-high { background: #4CAF50; }
@@ -3325,26 +4590,137 @@ tr:hover { background: #12121a; }
 .btn-ok:hover { background: #4CAF5020; }
 .btn-wrong { border-color: #FF9800; color: #FF9800; }
 .btn-wrong:hover { background: #FF980020; }
+.btn-confuse { border-color: #9c27b0; color: #9c27b0; }
+.btn-confuse:hover { background: #9c27b020; }
 .btn-del { border-color: #ff5252; color: #ff5252; }
 .btn-del:hover { background: #ff525220; }
+.tag-cell { white-space: nowrap; }
+.tag-chip { display: inline-block; padding: 1px 5px; margin: 1px; border: 1px solid #444; border-radius: 8px; font-size: 0.6rem; cursor: pointer; color: #888; transition: all 0.15s; }
+.tag-chip:hover { color: #fff; background: #ffffff10; }
+.tag-chip.active { color: #fff; font-weight: bold; }
 .reviewed { opacity: 0.4; }
 .toast { position: fixed; bottom: 20px; right: 20px; padding: 10px 16px; background: #1a1a24; border: 1px solid #4CAF50; color: #4CAF50; border-radius: 4px; font-size: 12px; display: none; z-index: 100; }
+.preview-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.85); z-index: 200; justify-content: center; align-items: center; flex-direction: column; gap: 12px; }
+.preview-overlay.active { display: flex; }
+.preview-container { position: relative; }
+.preview-overlay img { width: 512px; height: 512px; image-rendering: pixelated; border: 2px solid #444; cursor: crosshair; }
+.tip-marker { position: absolute; width: 12px; height: 12px; border: 2px solid #ff0; border-radius: 50%; transform: translate(-50%, -50%); pointer-events: none; box-shadow: 0 0 8px #ff0; }
+.preview-info { color: #888; font-size: 12px; text-align: center; }
+.preview-info em { color: #ff0; font-style: normal; }
+.cursor-type { font-size: 11px; padding: 2px 6px; border-radius: 3px; }
+.cursor-type.arrow { color: #4CAF50; border: 1px solid #4CAF5040; }
+.cursor-type.hand { color: #2196F3; border: 1px solid #2196F340; }
+.cursor-type.ibeam { color: #FF9800; border: 1px solid #FF980040; }
+.cursor-type.unknown { color: #666; border: 1px solid #33333340; }
+.btn-confuse { border-color: #9C27B0; color: #9C27B0; }
+.btn-confuse:hover { background: #9C27B020; }
+.keyboard-hint { position: fixed; bottom: 20px; left: 20px; font-size: 10px; color: #444; }
+.info-bar { background: #0d0d16; border-bottom: 1px solid #1a1a24; overflow: hidden; transition: max-height 0.3s ease; }
+.info-bar.collapsed { max-height: 0; border: none; }
+.info-bar-inner { padding: 12px 20px; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; font-size: 11px; line-height: 1.6; color: #777; }
+.info-bar-inner h3 { font-size: 11px; color: #ff4444; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; font-weight: 600; }
+.info-bar-inner code { background: #1a1a24; padding: 1px 4px; border-radius: 2px; color: #aaa; font-size: 10px; }
+.info-bar-inner b { color: #ccc; font-weight: 500; }
+.info-toggle { font-size: 10px; color: #555; cursor: pointer; border: 1px solid #333; background: transparent; padding: 2px 8px; border-radius: 3px; font-family: inherit; }
+.info-toggle:hover { color: #aaa; border-color: #555; }
+.info-bar-inner .kv { display: flex; gap: 4px; }
+.info-bar-inner .kv dt { color: #555; min-width: 80px; }
+.info-bar-inner .kv dd { color: #aaa; }
+.info-bar-inner ul { padding-left: 14px; margin: 2px 0; }
+.info-bar-inner li { margin: 1px 0; }
 </style>
 </head>
 <body>
 <div class="header">
-  <h1>CURSOR SAMPLE VALIDATION</h1>
+  <div style="display:flex;align-items:center;gap:16px">
+    <h1>CURSOR SAMPLE VALIDATION</h1>
+    <div class="nav">
+      <a href="/" class="nav-link">Dashboard</a>
+      <a href="/profiler" class="nav-link">Profiler</a>
+      <a href="/validation" class="nav-link active">Validation</a>
+      <a href="/loss_events" class="nav-link">Loss Events</a>
+    </div>
+  </div>
   <div class="actions">
-    <button class="btn" onclick="loadStats()">Stats</button>
+    <button class="info-toggle" onclick="toggleInfo()">? Info</button>
     <button class="btn btn-retrain" onclick="retrain()">Retrain CNN</button>
-    <a href="/" class="btn" style="text-decoration:none">Dashboard</a>
   </div>
 </div>
-<div class="filters">
-  <button class="filter-btn active" data-filter="all" onclick="setFilter('all')">All</button>
-  <button class="filter-btn" data-filter="unreviewed" onclick="setFilter('unreviewed')">Unreviewed</button>
-  <button class="filter-btn" data-filter="confusing" onclick="setFilter('confusing')">Confusing</button>
-  <button class="filter-btn" data-filter="claude" onclick="setFilter('claude')">Claude Vision</button>
+
+<div class="info-bar" id="info-bar">
+<div class="info-bar-inner">
+  <div>
+    <h3>What is this page</h3>
+    These are 64x64 grayscale patches extracted around where the system thinks the cursor is.
+    Each patch is fed through <b>TinyCursorNet</b> (14K param CNN) to classify: <b>cursor</b> or <b>not cursor</b>.<br><br>
+    <b>Your job</b>: review samples the CNN gets wrong, tag features, and retrain.
+    The CNN improves only from data you label here.
+    <ul>
+      <li><b>OK</b> — CNN's label is correct for this patch</li>
+      <li><b>X</b> (Wrong) — CNN got it backwards (pos is actually neg, or vice versa)</li>
+      <li><b>Del</b> — bad sample, remove from training set</li>
+    </ul>
+  </div>
+  <div>
+    <h3>Columns &amp; Filters</h3>
+    <ul>
+      <li><b>Label</b>: <code>pos</code> = cursor was here, <code>neg</code> = no cursor at this position</li>
+      <li><b>Type</b>: cursor shape when captured (arrow, hand, I-beam) — only from Claude Vision samples</li>
+      <li><b>Source</b>: how the patch was collected:<br>
+        <code>motion_track</code> — from live tracking loop<br>
+        <code>claude_vision</code> — Vision-confirmed position<br>
+        <code>ground_truth</code> — manually verified</li>
+      <li><b>CNN Conf</b>: model's confidence this patch contains a cursor (0-1). Green &gt;0.7, yellow 0.3-0.7, red &lt;0.3</li>
+      <li><b>Priority</b>: review order — CNN Disagrees (0) &gt; confusing (1) &gt; uncertain (2) &gt; Vision (3) &gt; easy (4) &gt; reviewed (99)</li>
+    </ul>
+  </div>
+  <div>
+    <h3>Feature Tags (right columns)</h3>
+    Tags are <b>independent</b> — a sample can be "ok" AND "confusing" AND "partial" simultaneously.
+    Click a chip to set it, click again to clear. Saves instantly.
+    <ul>
+      <li><b>quality</b> — ok / wrong / unsure (your judgment of the label)</li>
+      <li><b>confusing</b> — yes / no (would a human struggle to identify the cursor here?)</li>
+      <li><b>cursor_type</b> — arrow / hand / ibeam / busy / crosshair / move</li>
+      <li><b>visibility</b> — full / partial / hidden / offscreen</li>
+      <li><b>background</b> — clean / noisy / animated / textured</li>
+    </ul>
+    New columns appear automatically when you tag with custom keys via the API.
+    <br><br>
+    <h3>Keyboard Shortcuts</h3>
+    <code>J/K</code> or arrows: navigate &nbsp; <code>1</code>: OK &nbsp; <code>2</code>: Wrong &nbsp; <code>3</code>: Confusing &nbsp; <code>4</code>: Del &nbsp; <code>Space</code>: open patch (click to annotate cursor tip)
+  </div>
+</div>
+</div>
+
+<div class="controls">
+  <span class="ctrl-label">Filter</span>
+  <button class="filter-btn active" data-filter="all" onclick="setFilter('all')" title="All samples in the training set">All <span class="filter-count" id="cnt-all"></span></button>
+  <button class="filter-btn" data-filter="unreviewed" onclick="setFilter('unreviewed')" title="Samples you haven't reviewed yet — start here">Unreviewed <span class="filter-count" id="cnt-unreviewed"></span></button>
+  <button class="filter-btn" data-filter="reviewed" onclick="setFilter('reviewed')" title="Samples you've already tagged (dimmed in table)">Reviewed <span class="filter-count" id="cnt-reviewed"></span></button>
+  <button class="filter-btn" data-filter="claude" onclick="setFilter('claude')" title="Patches from Claude Vision detections — higher quality ground truth positions">Claude Vision <span class="filter-count" id="cnt-claude"></span></button>
+  <button class="filter-btn" data-filter="disagreement" onclick="setFilter('disagreement')" title="CNN prediction differs from the assigned label — most valuable to review first">CNN Disagrees <span class="filter-count" id="cnt-disagreement"></span></button>
+  <div class="ctrl-sep"></div>
+  <span class="ctrl-label">Label</span>
+  <select class="label-select" onchange="setLabel(this.value)">
+    <option value="all">All</option>
+    <option value="pos">Positive</option>
+    <option value="neg">Negative</option>
+  </select>
+  <div class="ctrl-sep"></div>
+  <span class="ctrl-label">Source</span>
+  <select class="source-select" id="source-select" onchange="setSource(this.value)">
+    <option value="all">All Sources</option>
+  </select>
+  <div class="ctrl-sep"></div>
+  <span class="ctrl-label">Sort</span>
+  <select class="sort-select" onchange="setSort(this.value)">
+    <option value="priority">Priority (review first)</option>
+    <option value="confidence_asc">CNN Conf (low first)</option>
+    <option value="confidence_desc">CNN Conf (high first)</option>
+    <option value="source">Source</option>
+    <option value="recent">Recent</option>
+  </select>
   <div class="pagination">
     <button class="btn" onclick="prevPage()">&laquo;</button>
     <span id="page-info">Page 1</span>
@@ -3354,74 +4730,150 @@ tr:hover { background: #12121a; }
 <div class="stats-bar" id="stats-bar">
   <span>Loading stats...</span>
 </div>
-<table>
+<table id="samples-table">
   <thead>
-    <tr><th>Patch</th><th>Label</th><th>Source</th><th>CNN Conf</th><th>Priority</th><th>Actions</th></tr>
+    <tr>
+      <th>Patch</th>
+      <th onclick="setSort('source')">Label</th>
+      <th>Type</th>
+      <th onclick="setSort('source')">Source</th>
+      <th onclick="setSort(currentSort==='confidence_asc'?'confidence_desc':'confidence_asc')">CNN Conf</th>
+      <th onclick="setSort('priority')">Priority</th>
+      <th>Actions</th>
+    </tr>
   </thead>
   <tbody id="samples-body"></tbody>
 </table>
 <div class="toast" id="toast"></div>
+<div class="preview-overlay" id="preview-overlay">
+  <div class="preview-container" id="preview-container">
+    <img id="preview-img">
+    <div class="tip-marker" id="tip-marker" style="display:none"></div>
+  </div>
+  <div class="preview-info" id="preview-info">Click on the <em>cursor tip</em> to annotate (saves immediately). ESC to close.</div>
+</div>
+<div class="keyboard-hint">J/K: next/prev | 1: OK | 2: Wrong | 3: Confusing | 4: Del | Space: annotate tip</div>
 
 <script>
-let currentPage = 0;
-let currentFilter = 'all';
-let totalPages = 1;
-
-function escapeHtml(str) {
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.textContent;
+function toggleInfo() {
+  var bar = document.getElementById('info-bar');
+  bar.classList.toggle('collapsed');
+  localStorage.setItem('validation_info', bar.classList.contains('collapsed') ? '0' : '1');
+}
+// Restore info bar state
+if (localStorage.getItem('validation_info') === '0') {
+  document.getElementById('info-bar').classList.add('collapsed');
 }
 
+var currentPage = 0;
+var currentFilter = 'all';
+var currentSort = 'priority';
+var currentLabel = 'all';
+var currentSource = 'all';
+var totalPages = 1;
+var selectedRow = -1;
+var currentSamples = [];
+
 async function loadSamples() {
-  const res = await fetch('/api/validation/samples?page=' + currentPage + '&sort=priority');
-  const data = await res.json();
+  var url = '/api/validation/samples?page=' + currentPage +
+    '&sort=' + currentSort +
+    '&filter=' + currentFilter +
+    '&label=' + currentLabel +
+    '&source_filter=' + currentSource;
+  var res = await fetch(url);
+  var data = await res.json();
   totalPages = Math.ceil(data.total / data.page_size) || 1;
-  document.getElementById('page-info').textContent = 'Page ' + (currentPage + 1) + ' of ' + totalPages;
+  document.getElementById('page-info').textContent =
+    'Page ' + (currentPage + 1) + '/' + totalPages + ' (' + data.total + ' total)';
 
-  let samples = data.samples;
-  if (currentFilter === 'unreviewed') samples = samples.filter(function(s) { return !s.review; });
-  else if (currentFilter === 'confusing') samples = samples.filter(function(s) { return s.is_confusing; });
-  else if (currentFilter === 'claude') samples = samples.filter(function(s) { return s.source && s.source.indexOf('claude') >= 0; });
+  // Update filter counts in tabs
+  var fc = data.filter_counts || {};
+  ['all','unreviewed','reviewed','claude','disagreement'].forEach(function(k) {
+    var el = document.getElementById('cnt-' + k);
+    if (el) el.textContent = '(' + (fc[k] || 0) + ')';
+  });
 
-  const tbody = document.getElementById('samples-body');
+  // Populate source dropdown (once)
+  var srcSel = document.getElementById('source-select');
+  if (fc.sources && srcSel.options.length <= 1) {
+    Object.keys(fc.sources).sort().forEach(function(src) {
+      var opt = document.createElement('option');
+      opt.value = src;
+      opt.textContent = src + ' (' + fc.sources[src] + ')';
+      srcSel.appendChild(opt);
+    });
+  }
+
+  currentSamples = data.samples;
+  var tbody = document.getElementById('samples-body');
   tbody.replaceChildren();
+  selectedRow = -1;
 
-  samples.forEach(function(s) {
-    const tr = document.createElement('tr');
+  data.samples.forEach(function(s, idx) {
+    var tr = document.createElement('tr');
     if (s.review) tr.classList.add('reviewed');
     tr.id = 'row-' + s.filename;
+    tr.dataset.idx = idx;
 
     // Patch image
-    const tdImg = document.createElement('td');
-    const img = document.createElement('img');
+    var tdImg = document.createElement('td');
+    var img = document.createElement('img');
     img.className = 'patch-img';
     img.src = '/api/validation/patch/' + encodeURIComponent(s.filename);
+    img.onclick = function() { showPreview(s.filename); };
     tdImg.appendChild(img);
     tr.appendChild(tdImg);
 
     // Label
-    const tdLabel = document.createElement('td');
-    const labelSpan = document.createElement('span');
+    var tdLabel = document.createElement('td');
+    var labelSpan = document.createElement('span');
     labelSpan.className = s.label === 'pos' ? 'label-pos' : 'label-neg';
     labelSpan.textContent = s.label;
     tdLabel.appendChild(labelSpan);
     if (s.review) {
-      const reviewSpan = document.createElement('span');
+      var reviewSpan = document.createElement('span');
       reviewSpan.style.cssText = 'color:#4CAF50;font-size:10px;margin-left:4px';
-      reviewSpan.textContent = s.review.action;
+      reviewSpan.textContent = '[' + s.review.action + ']';
       tdLabel.appendChild(reviewSpan);
+    }
+    if (s.cnn_disagrees) {
+      var dBadge = document.createElement('span');
+      dBadge.className = 'disagree-badge';
+      dBadge.textContent = 'DISAGREE';
+      tdLabel.appendChild(dBadge);
     }
     tr.appendChild(tdLabel);
 
+    // Cursor type
+    var tdType = document.createElement('td');
+    var ctype = s.cursor_type || '';
+    if (ctype) {
+      var typeSpan = document.createElement('span');
+      var typeClass = 'cursor-type ';
+      if (ctype === 'arrow') typeClass += 'arrow';
+      else if (ctype === 'hand') typeClass += 'hand';
+      else if (ctype === 'ibeam' || ctype === 'I-beam') typeClass += 'ibeam';
+      else typeClass += 'unknown';
+      typeSpan.className = typeClass;
+      typeSpan.textContent = ctype;
+      tdType.appendChild(typeSpan);
+    } else {
+      tdType.style.color = '#333';
+      tdType.textContent = '-';
+    }
+    tr.appendChild(tdType);
+
     // Source
-    const tdSource = document.createElement('td');
-    const srcSpan = document.createElement('span');
-    srcSpan.className = (s.source && s.source.indexOf('claude') >= 0) ? 'source claude' : 'source';
+    var tdSource = document.createElement('td');
+    var srcSpan = document.createElement('span');
+    var srcClass = 'source';
+    if (s.source && s.source.indexOf('claude') >= 0) srcClass += ' claude';
+    else if (s.source && s.source.indexOf('ground_truth') >= 0) srcClass += ' ground-truth';
+    srcSpan.className = srcClass;
     srcSpan.textContent = s.source || '?';
     tdSource.appendChild(srcSpan);
     if (s.is_confusing) {
-      const badge = document.createElement('span');
+      var badge = document.createElement('span');
       badge.className = 'confusing-badge';
       badge.textContent = '\u26A0';
       tdSource.appendChild(badge);
@@ -3429,11 +4881,11 @@ async function loadSamples() {
     tr.appendChild(tdSource);
 
     // CNN Confidence
-    const tdConf = document.createElement('td');
-    const bar = document.createElement('div');
+    var tdConf = document.createElement('td');
+    var bar = document.createElement('div');
     bar.className = 'conf-bar';
-    const fill = document.createElement('div');
-    const confVal = s.cnn_confidence != null ? s.cnn_confidence : 0;
+    var fill = document.createElement('div');
+    var confVal = s.cnn_confidence != null ? s.cnn_confidence : 0;
     fill.className = 'conf-fill ' + (confVal > 0.7 ? 'conf-high' : confVal > 0.4 ? 'conf-mid' : 'conf-low');
     fill.style.width = Math.round(confVal * 100) + '%';
     bar.appendChild(fill);
@@ -3442,32 +4894,68 @@ async function loadSamples() {
     tr.appendChild(tdConf);
 
     // Priority
-    const tdPri = document.createElement('td');
+    var tdPri = document.createElement('td');
     tdPri.style.color = '#666';
     tdPri.textContent = s.priority.toFixed(1);
     tr.appendChild(tdPri);
 
-    // Actions
-    const tdAct = document.createElement('td');
+    // Quick actions (legacy)
+    var tdAct = document.createElement('td');
     tdAct.className = 'actions-cell';
-    ['OK:correct:btn-ok', 'Wrong:wrong:btn-wrong', 'Del:delete:btn-del'].forEach(function(spec) {
+    ['OK:correct:btn-ok', 'X:wrong:btn-wrong', 'Del:delete:btn-del'].forEach(function(spec) {
       var parts = spec.split(':');
       var btn = document.createElement('button');
       btn.className = 'btn ' + parts[2];
       btn.textContent = parts[0];
-      btn.addEventListener('click', function() { review(s.filename, parts[1]); });
+      btn.addEventListener('click', function() { reviewSample(s.filename, parts[1]); });
       tdAct.appendChild(btn);
     });
     tr.appendChild(tdAct);
+
+    // Feature tags — one cell per tag column
+    if (window.tagSchema) {
+      Object.keys(window.tagSchema).forEach(function(col) {
+        var tdTag = document.createElement('td');
+        tdTag.className = 'tag-cell';
+        var currentVal = (s.tags && s.tags[col]) || '';
+        var schema = window.tagSchema[col];
+        schema.values.forEach(function(val) {
+          var chip = document.createElement('span');
+          chip.className = 'tag-chip' + (currentVal === val ? ' active' : '');
+          chip.textContent = val;
+          chip.style.borderColor = schema.color;
+          if (currentVal === val) chip.style.background = schema.color + '30';
+          chip.addEventListener('click', function() {
+            // Toggle: click active chip to deselect, otherwise select
+            var newVal = currentVal === val ? '' : val;
+            setTag(s.filename, col, newVal);
+            // Update UI immediately
+            tdTag.querySelectorAll('.tag-chip').forEach(function(c) {
+              c.classList.remove('active');
+              c.style.background = '';
+            });
+            if (newVal) {
+              chip.classList.add('active');
+              chip.style.background = schema.color + '30';
+            }
+            // Update in-memory
+            if (!s.tags) s.tags = {};
+            s.tags[col] = newVal;
+          });
+          tdTag.appendChild(chip);
+        });
+        tr.appendChild(tdTag);
+      });
+    }
 
     tbody.appendChild(tr);
   });
 }
 
 async function loadStats() {
-  const res = await fetch('/api/validation/stats');
-  const data = await res.json();
-  const bar = document.getElementById('stats-bar');
+  var res = await fetch('/api/validation/stats');
+  var data = await res.json();
+  var bar = document.getElementById('stats-bar');
   bar.replaceChildren();
   var items = [
     data.pos_count + ' pos', data.neg_count + ' neg',
@@ -3482,8 +4970,38 @@ async function loadStats() {
   });
 }
 
-async function review(filename, action) {
-  const res = await fetch('/api/validation/review', {
+async function setTag(filename, column, value) {
+  var tags = {};
+  tags[column] = value;
+  var res = await fetch('/api/validation/tag', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({filename: filename, tags: tags})
+  });
+  if (res.ok) {
+    showToast(column + '=' + (value || '(cleared)') + ' → ' + filename);
+  }
+}
+
+async function loadTagSchema() {
+  var res = await fetch('/api/validation/tag_schema');
+  var data = await res.json();
+  window.tagSchema = data.schema;
+  // Add column headers to the table
+  var thead = document.querySelector('#samples-table thead tr');
+  if (thead) {
+    Object.keys(data.schema).forEach(function(col) {
+      var th = document.createElement('th');
+      th.textContent = col;
+      th.style.color = data.schema[col].color;
+      th.style.fontSize = '0.65rem';
+      th.style.textTransform = 'uppercase';
+      thead.appendChild(th);
+    });
+  }
+}
+
+async function reviewSample(filename, action) {
+  var res = await fetch('/api/validation/review', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({filename: filename, action: action})
   });
@@ -3496,8 +5014,8 @@ async function review(filename, action) {
 
 async function retrain() {
   if (!confirm('Start retraining TinyCursorNet?')) return;
-  const res = await fetch('/api/validation/retrain', {method: 'POST'});
-  const data = await res.json();
+  var res = await fetch('/api/validation/retrain', {method: 'POST'});
+  var data = await res.json();
   showToast('Training started (PID: ' + data.pid + ')');
 }
 
@@ -3510,8 +5028,63 @@ function setFilter(f) {
   loadSamples();
 }
 
+function setSort(s) {
+  currentSort = s;
+  document.querySelector('.sort-select').value = s;
+  currentPage = 0;
+  loadSamples();
+}
+
+function setLabel(l) { currentLabel = l; currentPage = 0; loadSamples(); }
+function setSource(s) { currentSource = s; currentPage = 0; loadSamples(); }
+
 function nextPage() { if (currentPage < totalPages - 1) { currentPage++; loadSamples(); } }
 function prevPage() { if (currentPage > 0) { currentPage--; loadSamples(); } }
+
+var previewFilename = null;
+
+function showPreview(filename) {
+  previewFilename = filename;
+  var marker = document.getElementById('tip-marker');
+  marker.style.display = 'none';
+  document.getElementById('preview-img').src = '/api/validation/patch/' + encodeURIComponent(filename);
+  document.getElementById('preview-overlay').classList.add('active');
+  document.getElementById('preview-info').textContent = 'Click on the cursor tip to annotate. ESC to close.';
+}
+
+// Click-to-annotate: click on enlarged patch to mark cursor tip position
+document.getElementById('preview-img').addEventListener('click', async function(e) {
+  if (!previewFilename) return;
+  var img = e.target;
+  var rect = img.getBoundingClientRect();
+  // Click position relative to rendered image (512x512)
+  var renderX = e.clientX - rect.left;
+  var renderY = e.clientY - rect.top;
+  // Scale to actual 64x64 patch coordinates
+  var scaleX = 64 / rect.width;
+  var scaleY = 64 / rect.height;
+  var tipX = Math.round(renderX * scaleX);
+  var tipY = Math.round(renderY * scaleY);
+  tipX = Math.max(0, Math.min(63, tipX));
+  tipY = Math.max(0, Math.min(63, tipY));
+
+  // Show yellow marker at click position
+  var marker = document.getElementById('tip-marker');
+  marker.style.left = renderX + 'px';
+  marker.style.top = renderY + 'px';
+  marker.style.display = 'block';
+
+  // Save annotation
+  var res = await fetch('/api/validation/review', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({filename: previewFilename, action: 'annotate_tip', tip_x: tipX, tip_y: tipY})
+  });
+  if (res.ok) {
+    document.getElementById('preview-info').textContent =
+      'Tip annotated at (' + tipX + ', ' + tipY + ') — saved. Click again to adjust, ESC to close.';
+    showToast('Tip: (' + tipX + ',' + tipY + ') → ' + previewFilename);
+  }
+});
 
 function showToast(msg) {
   var t = document.getElementById('toast');
@@ -3520,7 +5093,39 @@ function showToast(msg) {
   setTimeout(function() { t.style.display = 'none'; }, 2000);
 }
 
-loadSamples();
+// Keyboard shortcuts for fast tagging
+document.addEventListener('keydown', function(e) {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  var rows = document.querySelectorAll('#samples-body tr');
+  if (e.key === 'j' || e.key === 'ArrowDown') {
+    e.preventDefault();
+    if (selectedRow < rows.length - 1) {
+      if (selectedRow >= 0) rows[selectedRow].style.outline = '';
+      selectedRow++;
+      rows[selectedRow].style.outline = '1px solid #ff4444';
+      rows[selectedRow].scrollIntoView({block: 'nearest'});
+    }
+  } else if (e.key === 'k' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (selectedRow > 0) {
+      rows[selectedRow].style.outline = '';
+      selectedRow--;
+      rows[selectedRow].style.outline = '1px solid #ff4444';
+      rows[selectedRow].scrollIntoView({block: 'nearest'});
+    }
+  } else if (selectedRow >= 0 && selectedRow < currentSamples.length) {
+    var fn = currentSamples[selectedRow].filename;
+    if (e.key === '1') reviewSample(fn, 'correct');
+    else if (e.key === '2') reviewSample(fn, 'wrong');
+    else if (e.key === '3') reviewSample(fn, 'confusing');
+    else if (e.key === '4') reviewSample(fn, 'delete');
+    else if (e.key === ' ') { e.preventDefault(); showPreview(fn); }
+  }
+  if (e.key === 'Escape') document.getElementById('preview-overlay').classList.remove('active');
+});
+
+// Load tag schema first, then samples (schema needed to render tag columns)
+loadTagSchema().then(function() { loadSamples(); });
 loadStats();
 </script>
 </body>

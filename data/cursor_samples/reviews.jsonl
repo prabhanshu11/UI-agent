@@ -1,0 +1,20 @@
+{"filename": "pos_000001.png", "action": "annotate_tip", "timestamp": 1771544536.1944275, "tip_x": 32, "tip_y": 10}
+{"filename": "pos_000119.png", "action": "confusing", "timestamp": 1771545225.4262526, "is_confusing_to_human": true}
+{"filename": "pos_000119.png", "action": "confusing", "timestamp": 1771545227.2728744, "is_confusing_to_human": true}
+{"filename": "pos_000119.png", "action": "confusing", "timestamp": 1771545228.2073462, "is_confusing_to_human": true}
+{"filename": "pos_000119.png", "action": "correct", "timestamp": 1771545231.795446}
+{"filename": "pos_000739.png", "action": "correct", "timestamp": 1771545330.725946}
+{"filename": "neg_000337.png", "action": "wrong", "timestamp": 1771545336.2983477, "corrected_label": "pos"}
+{"filename": "neg_001086.png", "action": "wrong", "timestamp": 1771545341.8957806, "corrected_label": "pos"}
+{"filename": "neg_000700.png", "action": "wrong", "timestamp": 1771545344.9388688, "corrected_label": "pos"}
+{"filename": "pos_000319.png", "action": "wrong", "timestamp": 1771545363.8438854, "corrected_label": "neg"}
+{"filename": "neg_001217.png", "action": "wrong", "timestamp": 1771545364.5800967, "corrected_label": "pos"}
+{"filename": "neg_000365.png", "action": "wrong", "timestamp": 1771545367.0498102, "corrected_label": "pos"}
+{"filename": "pos_001164.png", "action": "correct", "timestamp": 1771545368.9080148}
+{"filename": "pos_000399.png", "action": "correct", "timestamp": 1771545373.7084806}
+{"filename": "pos_001193.png", "action": "correct", "timestamp": 1771545375.7031515}
+{"filename": "pos_001194.png", "action": "correct", "timestamp": 1771545377.2494295}
+{"filename": "pos_000976.png", "action": "correct", "timestamp": 1771545379.38865}
+{"filename": "neg_001018.png", "action": "wrong", "timestamp": 1771545383.9144034, "corrected_label": "pos"}
+{"filename": "neg_000503.png", "action": "wrong", "timestamp": 1771545390.082203, "corrected_label": "pos"}
+{"filename": "pos_000001.png", "action": "tag", "tags": {"quality": "ok", "confusing": "yes", "cursor_type": "arrow"}, "timestamp": 1771545607.7881675}
