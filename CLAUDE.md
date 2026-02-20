@@ -97,13 +97,17 @@ Check the "Proven vs Untested" table in the research doc (§11) before choosing 
 | Source | Location | Rate | Cleanup |
 |--------|----------|------|---------|
 | KVM recordings | `data/recordings/kvm_*.mkv` | 3-20 GB/day | **None** |
+| Blob logs (planned) | `data/blob_log/blobs_*.jsonl` | 0.1-1 GB/day | **None** |
 | Loss events | `data/loss_events/*/` | 0-9 GB/day | **None** |
 
 - **Free space (2026-02-20):** 247 GB of 446 GB
 - **Estimated disk full:** ~March 12, 2026 (~20 days at current idle-screen rate)
 - **Heavy use could accelerate to ~8 days**
 
-**Plan:** `docs/RECORDING_LIFECYCLE_PLAN.md` — datalake sync, retention engine, dashboard storage tab, archive to external drive. Not yet implemented.
+**Plans:**
+- `docs/RECORDING_LIFECYCLE_PLAN.md` — datalake sync, retention engine, dashboard storage tab, archive to external drive. Not yet implemented.
+- `docs/BLOB_DATASET_PLAN.md` — Per-frame blob JSONL logging in cursor-daemon (C-side, background thread, lock-free ring buffer). Not yet implemented.
+- `docs/DASHBOARD_SUBPANELS_PLAN.md` — 3 sub-panels below HDMI feed: motion blob map, model inference status with live staleness counters, mouse trail visualization (ESP32 + detected + passthrough). Not yet implemented.
 
 **Stopgap if urgent:**
 ```bash
