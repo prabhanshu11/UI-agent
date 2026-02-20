@@ -3325,6 +3325,21 @@ async def yolo_detect_now():
 
 # ── Passthrough Experience Helpers ────────────────────────────────
 
+def _passthrough_read_frame() -> tuple[bytes | None, np.ndarray | None]:
+    """Read JPEG bytes from daemon, optionally decode to numpy for CNN."""
+    if not daemon_client or not daemon_client.is_running():
+        return None, None
+    try:
+        jpeg = daemon_client.read_jpeg()
+    except Exception:
+        return None, None
+    if jpeg is None:
+        return None, None
+    # Decode for CNN sample collection
+    arr = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+    return jpeg, arr
+
+
 def _passthrough_screenshot_loop():
     """Background thread: periodic screenshots + CNN samples during passthrough."""
     import os
@@ -3334,27 +3349,22 @@ def _passthrough_screenshot_loop():
         if not _passthrough_active or not _passthrough_session:
             break
         sess = _passthrough_session
-        # Capture frame from daemon
-        frame = None
-        if daemon_client and daemon_client.is_running():
-            try:
-                frame = daemon_client.get_frame()
-            except Exception:
-                pass
-        if frame is None:
+        jpeg, frame = _passthrough_read_frame()
+        if jpeg is None:
             continue
-        # Save screenshot as JPEG
+        # Save raw JPEG bytes directly (no re-encode)
         ts = datetime.now().strftime("%H%M%S_%f")[:-3]
         shot_path = os.path.join(sess["screenshots_dir"], f"pt_{ts}.jpg")
         try:
-            cv2.imwrite(shot_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            with open(shot_path, "wb") as f:
+                f.write(jpeg)
             sess["screenshot_count"] += 1
             sess["logger"].log("screenshot", details={"path": shot_path})
         except Exception:
             pass
         # CNN gold sample every _PT_CNN_SAMPLE_INTERVAL_S
         now = time.monotonic()
-        if collector and mouse and (now - last_cnn_time) >= _PT_CNN_SAMPLE_INTERVAL_S:
+        if collector and mouse and frame is not None and (now - last_cnn_time) >= _PT_CNN_SAMPLE_INTERVAL_S:
             try:
                 collector.collect_from_locate(
                     frame, mouse.estimated_x, mouse.estimated_y,
@@ -3371,25 +3381,21 @@ def _passthrough_capture_click(pos: tuple[int, int]):
         return
     import os
     sess = _passthrough_session
-    frame = None
-    if daemon_client and daemon_client.is_running():
-        try:
-            frame = daemon_client.get_frame()
-        except Exception:
-            pass
-    if frame is None:
+    jpeg, frame = _passthrough_read_frame()
+    if jpeg is None:
         return
-    # Screenshot
+    # Save raw JPEG bytes directly
     ts = datetime.now().strftime("%H%M%S_%f")[:-3]
     shot_path = os.path.join(sess["screenshots_dir"], f"click_{ts}.jpg")
     try:
-        cv2.imwrite(shot_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        with open(shot_path, "wb") as f:
+            f.write(jpeg)
         sess["screenshot_count"] += 1
         sess["logger"].log("click_screenshot", position=pos, details={"path": shot_path})
     except Exception:
         pass
     # CNN sample — user clicked exactly where cursor is
-    if collector:
+    if collector and frame is not None:
         try:
             collector.collect_from_locate(
                 frame, pos[0], pos[1],
@@ -3606,9 +3612,7 @@ async def passthrough_toggle(request: Request):
                 "screenshot_count": sess["screenshot_count"],
                 "cnn_sample_count": sess["cnn_sample_count"],
             })
-            sess["storyline"].save_narrative(
-                sess["storyline"].experience_dir / "narrative.md"
-            )
+            sess["storyline"].save_narrative()
             sess["logger"].close()
             print(f"[passthrough] Session saved: {sess['event_count']} events, "
                   f"{sess['screenshot_count']} screenshots, "
