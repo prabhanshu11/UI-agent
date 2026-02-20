@@ -101,3 +101,21 @@ tr:hover { background: #12121a; }
 .info-bar-inner li { margin: 1px 0; }
 .info-toggle { font-size: 10px; color: #555; cursor: pointer; border: 1px solid #333; background: transparent; padding: 2px 8px; border-radius: 3px; font-family: inherit; }
 .info-toggle:hover { color: #aaa; border-color: #555; }
+/* Model comparison bar */
+.model-bar { padding: 8px 20px; background: #0d0d14; border-bottom: 1px solid #1a1a24; display: flex; align-items: center; gap: 12px; font-size: 11px; }
+.model-slot { display: flex; align-items: center; gap: 6px; }
+.model-slot.runtime { color: #4CAF50; }
+.model-slot.comparison { color: #FF9800; }
+.model-label { font-size: 9px; text-transform: uppercase; letter-spacing: 1px; color: #555; }
+.model-version { font-weight: bold; font-size: 12px; }
+.model-acc { font-size: 10px; color: #666; }
+.model-vs { color: #333; font-size: 10px; font-weight: bold; }
+#comparison-select { padding: 3px 6px; border: 1px solid #333; background: #12121a; color: #FF9800; font-size: 11px; font-family: inherit; border-radius: 3px; }
+/* Dual confidence display */
+.dual-conf { display: flex; flex-direction: column; gap: 2px; }
+.conf-row { display: flex; align-items: center; gap: 4px; font-size: 10px; }
+.conf-row .conf-label { color: #555; min-width: 14px; font-size: 9px; }
+.conf-row.runtime .conf-label { color: #4CAF5080; }
+.conf-row.comparison .conf-label { color: #FF980080; }
+.conf-row .conf-val { min-width: 36px; }
+.models-disagree-badge { color: #ff5252; font-size: 8px; font-weight: bold; margin-left: 2px; }

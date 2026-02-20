@@ -2765,6 +2765,10 @@ async def log_experience_snapshot(request: Request):
 
 _VALIDATION_SAMPLES_DIR = Path(__file__).parent.parent.parent / "data" / "cursor_samples"
 _VALIDATION_REVIEWS_PATH = _VALIDATION_SAMPLES_DIR / "reviews.jsonl"
+_CURSOR_MODELS_DIR = Path(__file__).parent.parent.parent / "data" / "cursor_models"
+
+# Secondary model for A/B comparison in validation UI
+_comparison_model: dict = {"version": None, "model": None}
 
 
 @app.get("/validation")
@@ -2832,7 +2836,9 @@ async def get_validation_samples(page: int = 0, page_size: int = 20,
         is_reviewed = review is not None
 
         cnn_conf = None
-        if model is not None:
+        comp_conf = None
+        comp_model = _comparison_model["model"]
+        if model is not None or comp_model is not None:
             patch_path = _VALIDATION_SAMPLES_DIR / filename
             if patch_path.exists():
                 patch = cv2.imread(str(patch_path), cv2.IMREAD_GRAYSCALE)
@@ -2840,7 +2846,10 @@ async def get_validation_samples(page: int = 0, page_size: int = 20,
                     tensor = torch.from_numpy(
                         patch.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0)
                     with torch.no_grad():
-                        cnn_conf = model(tensor).item()
+                        if model is not None:
+                            cnn_conf = model(tensor).item()
+                        if comp_model is not None:
+                            comp_conf = comp_model(tensor).item()
 
         priority = 5.0
         entry_label = entry.get("label", "")
@@ -2882,10 +2891,15 @@ async def get_validation_samples(page: int = 0, page_size: int = 20,
         elif "live_tag" in entry_source:
             origin_type = "sensor"
 
-        # CNN prediction label
+        # CNN prediction labels
         cnn_predicted = None
         if cnn_conf is not None:
             cnn_predicted = "pos" if cnn_conf > 0.5 else "neg"
+        comp_predicted = None
+        if comp_conf is not None:
+            comp_predicted = "pos" if comp_conf > 0.5 else "neg"
+        models_disagree = (cnn_predicted is not None and comp_predicted is not None
+                           and cnn_predicted != comp_predicted)
 
         has_context = (_VALIDATION_SAMPLES_DIR / f"ctx_{filename}").exists()
         scored_entries.append({
@@ -2893,6 +2907,9 @@ async def get_validation_samples(page: int = 0, page_size: int = 20,
             "label": entry_label,  # normalized
             "cnn_confidence": round(cnn_conf, 3) if cnn_conf is not None else None,
             "cnn_predicted": cnn_predicted,
+            "comparison_confidence": round(comp_conf, 3) if comp_conf is not None else None,
+            "comp_predicted": comp_predicted,
+            "models_disagree": models_disagree,
             "origin_type": origin_type,
             "priority": round(priority, 3),
             "review": review,
@@ -2970,6 +2987,8 @@ async def get_validation_samples(page: int = 0, page_size: int = 20,
         "page": page,
         "page_size": page_size,
         "filter_counts": filter_counts,
+        "runtime_model": recognizer.model_version if recognizer else "none",
+        "comparison_model": _comparison_model["version"],
     }
 
 
@@ -3211,6 +3230,72 @@ async def trigger_retrain():
         "pid": proc.pid,
         "command": f"python scripts/train_cursor_model.py --epochs 30 --patience 5",
     }
+
+
+@app.get("/api/validation/models")
+async def get_validation_models():
+    """List available CNN model versions with metadata from training_log.jsonl."""
+    models = []
+    log_path = _CURSOR_MODELS_DIR / "training_log.jsonl"
+    if log_path.exists():
+        for line in log_path.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                models.append({
+                    "version": entry["model_file"].replace(".pt", ""),
+                    "file": entry["model_file"],
+                    "val_acc": entry.get("val_acc"),
+                    "val_loss": entry.get("best_val_loss"),
+                    "train_samples": entry.get("train_samples"),
+                    "epochs": entry.get("epochs_trained"),
+                    "major": entry.get("major"),
+                    "notes": entry.get("notes"),
+                    "timestamp": entry.get("timestamp"),
+                })
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+    runtime_version = recognizer.model_version if recognizer else "none"
+    comp_version = _comparison_model["version"]
+
+    return {
+        "models": models,
+        "runtime": runtime_version,
+        "comparison": comp_version,
+    }
+
+
+@app.post("/api/validation/set_comparison")
+async def set_comparison_model(request: Request):
+    """Load a secondary CNN model for A/B comparison.
+
+    Body: {"version": "v003_20260220"} or {"version": null} to clear.
+    """
+    global _comparison_model
+    data = await request.json()
+    version = data.get("version")
+
+    if not version:
+        _comparison_model = {"version": None, "model": None}
+        return {"ok": True, "version": None}
+
+    model_file = _CURSOR_MODELS_DIR / f"{version}.pt"
+    if not model_file.exists():
+        return {"error": f"Model file not found: {version}.pt"}
+
+    try:
+        from src.hardware.cursor_cnn import TinyCursorNet
+        import torch
+        model = TinyCursorNet()
+        model.load_state_dict(torch.load(str(model_file), map_location="cpu", weights_only=True))
+        model.eval()
+        _comparison_model = {"version": version, "model": model}
+        return {"ok": True, "version": version}
+    except Exception as e:
+        return {"error": f"Failed to load model: {e}"}
 
 
 @app.get("/api/validation/stats")

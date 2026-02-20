@@ -8,6 +8,9 @@ var currentSource = 'all';
 var totalPages = 1;
 var selectedRow = -1;
 var currentSamples = [];
+var comparisonActive = false;
+var runtimeModelVersion = '';
+var comparisonModelVersion = '';
 
 function toggleInfo() {
     var bar = document.getElementById('info-bar');
@@ -18,6 +21,98 @@ function toggleInfo() {
 if (localStorage.getItem('validation_info') === '0') {
     document.getElementById('info-bar').classList.add('collapsed');
 }
+
+// ── Model comparison ──────────────────────────────────────────────
+
+async function loadModels() {
+    var res = await fetch('/api/validation/models');
+    var data = await res.json();
+    runtimeModelVersion = data.runtime || '--';
+    comparisonModelVersion = data.comparison || '';
+
+    // Update runtime display
+    document.getElementById('runtime-version').textContent = runtimeModelVersion;
+    var rtModel = data.models.find(function(m) {
+        return runtimeModelVersion.indexOf(m.version) >= 0;
+    });
+    if (rtModel && rtModel.val_acc != null) {
+        document.getElementById('runtime-acc').textContent =
+            (rtModel.val_acc * 100).toFixed(1) + '% acc' +
+            (rtModel.major ? ' (' + rtModel.major + ')' : '');
+    }
+
+    // Populate comparison dropdown
+    var sel = document.getElementById('comparison-select');
+    // Keep first option, remove rest
+    while (sel.options.length > 1) sel.remove(1);
+    data.models.forEach(function(m) {
+        var opt = document.createElement('option');
+        opt.value = m.version;
+        var label = m.version;
+        if (m.val_acc != null) label += ' (' + (m.val_acc * 100).toFixed(1) + '%)';
+        if (m.major) label += ' [' + m.major + ']';
+        opt.textContent = label;
+        if (m.version === data.comparison) opt.selected = true;
+        sel.appendChild(opt);
+    });
+
+    comparisonActive = !!data.comparison;
+    updateComparisonAcc(data.models, data.comparison);
+}
+
+function updateComparisonAcc(models, version) {
+    var el = document.getElementById('comparison-acc');
+    if (!version) { el.textContent = ''; return; }
+    var m = models.find(function(x) { return x.version === version; });
+    if (m && m.val_acc != null) {
+        el.textContent = (m.val_acc * 100).toFixed(1) + '% acc' +
+            (m.major ? ' (' + m.major + ')' : '');
+    }
+}
+
+async function setComparisonModel(version) {
+    var res = await fetch('/api/validation/set_comparison', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({version: version || null})
+    });
+    var data = await res.json();
+    if (data.ok) {
+        comparisonActive = !!data.version;
+        comparisonModelVersion = data.version || '';
+        showToast(data.version ? 'Comparison: ' + data.version : 'Comparison cleared');
+        loadModels();
+        loadSamples();
+    }
+}
+
+// ── Confidence bar helper ─────────────────────────────────────────
+
+function makeConfBar(confVal, label) {
+    var row = document.createElement('div');
+    row.className = 'conf-row ' + (label || '');
+    if (label) {
+        var lbl = document.createElement('span');
+        lbl.className = 'conf-label';
+        lbl.textContent = label === 'runtime' ? 'R' : 'C';
+        lbl.title = label === 'runtime' ? 'Runtime model' : 'Comparison model';
+        row.appendChild(lbl);
+    }
+    var bar = document.createElement('div');
+    bar.className = 'conf-bar';
+    var fill = document.createElement('div');
+    var v = confVal != null ? confVal : 0;
+    fill.className = 'conf-fill ' + (v > 0.7 ? 'conf-high' : v > 0.4 ? 'conf-mid' : 'conf-low');
+    fill.style.width = Math.round(v * 100) + '%';
+    bar.appendChild(fill);
+    row.appendChild(bar);
+    var txt = document.createElement('span');
+    txt.className = 'conf-val';
+    txt.textContent = confVal != null ? confVal.toFixed(3) : '?';
+    row.appendChild(txt);
+    return row;
+}
+
+// ── Samples table ─────────────────────────────────────────────────
 
 async function loadSamples() {
     var url = '/api/validation/samples?page=' + currentPage +
@@ -131,13 +226,11 @@ async function loadSamples() {
 
         // Source + origin badge
         var tdSource = document.createElement('td');
-        // Origin type badge
         var originBadge = document.createElement('span');
         originBadge.className = 'origin-badge ' + (s.origin_type || 'sensor');
         var originLabels = {ground_truth: 'GROUND TRUTH', sensor: 'SENSOR', prediction: 'PREDICTION'};
         originBadge.textContent = originLabels[s.origin_type] || 'SENSOR';
         tdSource.appendChild(originBadge);
-        // Source name
         var srcSpan = document.createElement('span');
         var srcClass = 'source';
         if (s.source && s.source.indexOf('claude') >= 0) srcClass += ' claude';
@@ -153,17 +246,27 @@ async function loadSamples() {
         }
         tr.appendChild(tdSource);
 
-        // CNN Confidence
+        // CNN Confidence — dual bar when comparison active
         var tdConf = document.createElement('td');
-        var bar = document.createElement('div');
-        bar.className = 'conf-bar';
-        var fill = document.createElement('div');
-        var confVal = s.cnn_confidence != null ? s.cnn_confidence : 0;
-        fill.className = 'conf-fill ' + (confVal > 0.7 ? 'conf-high' : confVal > 0.4 ? 'conf-mid' : 'conf-low');
-        fill.style.width = Math.round(confVal * 100) + '%';
-        bar.appendChild(fill);
-        tdConf.appendChild(bar);
-        tdConf.appendChild(document.createTextNode(s.cnn_confidence != null ? s.cnn_confidence.toFixed(3) : '?'));
+        if (comparisonActive && s.comparison_confidence != null) {
+            var dual = document.createElement('div');
+            dual.className = 'dual-conf';
+            dual.appendChild(makeConfBar(s.cnn_confidence, 'runtime'));
+            var compRow = makeConfBar(s.comparison_confidence, 'comparison');
+            if (s.models_disagree) {
+                var dis = document.createElement('span');
+                dis.className = 'models-disagree-badge';
+                dis.textContent = '\u2716';
+                dis.title = 'Models disagree: runtime=' + (s.cnn_predicted || '?') +
+                    ' vs comparison=' + (s.comp_predicted || '?');
+                compRow.appendChild(dis);
+            }
+            dual.appendChild(compRow);
+            tdConf.appendChild(dual);
+        } else {
+            // Single bar (original behavior)
+            tdConf.appendChild(makeConfBar(s.cnn_confidence));
+        }
         tr.appendChild(tdConf);
 
         // Priority
@@ -266,11 +369,9 @@ async function loadTagSchema() {
             th.style.color = data.schema[col].color;
             th.style.fontSize = '0.65rem';
             th.style.textTransform = 'uppercase';
-            // Column name
             var nameSpan = document.createElement('span');
             nameSpan.textContent = col;
             th.appendChild(nameSpan);
-            // "+" button to add value to this column
             var addBtn = document.createElement('button');
             addBtn.className = 'schema-add-btn';
             addBtn.textContent = '+';
@@ -282,7 +383,6 @@ async function loadTagSchema() {
             th.appendChild(addBtn);
             thead.appendChild(th);
         });
-        // "Add Column" header
         var addColTh = document.createElement('th');
         addColTh.className = 'tag-th';
         var addColBtn = document.createElement('button');
@@ -304,7 +404,6 @@ function promptAddValue(column, color) {
     }).then(function(r) { return r.json(); }).then(function(d) {
         if (d.ok) {
             showToast('Added "' + val.trim() + '" to ' + column);
-            // Reload schema + samples to show new value
             loadTagSchema().then(function() { loadSamples(); });
         }
     });
@@ -371,6 +470,8 @@ function setSource(s) { currentSource = s; currentPage = 0; loadSamples(); }
 function nextPage() { if (currentPage < totalPages - 1) { currentPage++; loadSamples(); } }
 function prevPage() { if (currentPage > 0) { currentPage--; loadSamples(); } }
 
+// ── Preview overlay ───────────────────────────────────────────────
+
 var previewFilename = null;
 
 function showPreview(filename) {
@@ -379,12 +480,12 @@ function showPreview(filename) {
     marker.style.display = 'none';
     document.getElementById('preview-img').src = '/api/validation/patch/' + encodeURIComponent(filename);
     document.getElementById('preview-overlay').classList.add('active');
-    document.getElementById('preview-info').textContent = 'Click on the cursor tip to annotate. ESC to close.';
 
     // Show context crop if available
     var ctxImg = document.getElementById('context-img');
     var ctxLabel = document.getElementById('context-label');
     var sample = currentSamples.find(function(s) { return s.filename === filename; });
+
     if (sample && sample.has_context) {
         ctxImg.src = '/api/validation/context/' + encodeURIComponent(filename);
         ctxImg.style.display = 'block';
@@ -393,6 +494,23 @@ function showPreview(filename) {
         ctxImg.style.display = 'none';
         ctxLabel.style.display = 'none';
     }
+
+    // Build info text with model confidence
+    var info = 'Click on the cursor tip to annotate. ESC to close.';
+    if (sample) {
+        var parts = [];
+        if (sample.cnn_confidence != null) {
+            parts.push('Runtime: ' + sample.cnn_confidence.toFixed(3) +
+                ' \u2192 ' + (sample.cnn_predicted || '?'));
+        }
+        if (comparisonActive && sample.comparison_confidence != null) {
+            parts.push('Compare: ' + sample.comparison_confidence.toFixed(3) +
+                ' \u2192 ' + (sample.comp_predicted || '?'));
+            if (sample.models_disagree) parts.push('\u26A0 MODELS DISAGREE');
+        }
+        if (parts.length) info = parts.join(' | ') + '\n' + info;
+    }
+    document.getElementById('preview-info').textContent = info;
 }
 
 // Click-to-annotate cursor tip
@@ -463,6 +581,7 @@ document.addEventListener('keydown', function(e) {
     if (e.key === 'Escape') document.getElementById('preview-overlay').classList.remove('active');
 });
 
-// Load tag schema first, then samples (schema needed to render tag columns)
+// ── Init ──────────────────────────────────────────────────────────
+loadModels();
 loadTagSchema().then(function() { loadSamples(); });
 loadStats();

@@ -183,3 +183,243 @@
 {"filename": "pos_000071.png", "action": "correct", "timestamp": 1771557192.8815973}
 {"filename": "pos_000071.png", "action": "tag", "tags": {"cursor_type": "crosshair"}, "timestamp": 1771557203.390466}
 {"filename": "pos_000071.png", "action": "tag", "tags": {"cursor_type": "crosshair"}, "timestamp": 1771557225.8148813}
+{"filename": "pos_000903.png", "action": "correct", "timestamp": 1771558054.0299063}
+{"filename": "pos_000997.png", "action": "correct", "timestamp": 1771558055.184552}
+{"filename": "pos_000969.png", "action": "correct", "timestamp": 1771558059.150822}
+{"filename": "pos_000970.png", "action": "correct", "timestamp": 1771558059.6548758}
+{"filename": "pos_001006.png", "action": "correct", "timestamp": 1771558060.585181}
+{"filename": "pos_000992.png", "action": "correct", "timestamp": 1771558061.1402307}
+{"filename": "neg_000883.png", "action": "correct", "timestamp": 1771558065.04054}
+{"filename": "pos_000985.png", "action": "wrong", "timestamp": 1771558066.8100553, "corrected_label": "neg"}
+{"filename": "neg_000950.png", "action": "correct", "timestamp": 1771558068.1225796}
+{"filename": "neg_000948.png", "action": "correct", "timestamp": 1771558068.939312}
+{"filename": "neg_001031.png", "action": "correct", "timestamp": 1771558069.7714946}
+{"filename": "neg_001042.png", "action": "correct", "timestamp": 1771558075.6009746}
+{"filename": "neg_000945.png", "action": "correct", "timestamp": 1771558078.270078}
+{"filename": "neg_000981.png", "action": "correct", "timestamp": 1771558092.7303634}
+{"filename": "neg_001004.png", "action": "correct", "timestamp": 1771558094.4998205}
+{"filename": "neg_000884.png", "action": "correct", "timestamp": 1771558095.4600108}
+{"filename": "neg_001038.png", "action": "correct", "timestamp": 1771558096.583394}
+{"filename": "neg_001034.png", "action": "correct", "timestamp": 1771558097.5241556}
+{"filename": "neg_001029.png", "action": "correct", "timestamp": 1771558098.1818812}
+{"filename": "neg_000980.png", "action": "correct", "timestamp": 1771558100.370885}
+{"filename": "neg_001037.png", "action": "correct", "timestamp": 1771558101.7591722}
+{"filename": "neg_000985.png", "action": "correct", "timestamp": 1771558104.1904013}
+{"filename": "neg_001026.png", "action": "correct", "timestamp": 1771558104.8484235}
+{"filename": "neg_000882.png", "action": "correct", "timestamp": 1771558105.2990193}
+{"filename": "neg_000905.png", "action": "correct", "timestamp": 1771558105.815278}
+{"filename": "neg_000906.png", "action": "correct", "timestamp": 1771558106.5208166}
+{"filename": "neg_000907.png", "action": "correct", "timestamp": 1771558107.1446326}
+{"filename": "neg_000943.png", "action": "correct", "timestamp": 1771558108.8161345}
+{"filename": "neg_000944.png", "action": "correct", "timestamp": 1771558109.9416807}
+{"filename": "neg_001486.png", "action": "wrong", "timestamp": 1771558131.2793455, "corrected_label": "pos"}
+{"filename": "pos_001487.png", "action": "wrong", "timestamp": 1771558139.9941082, "corrected_label": "neg"}
+{"filename": "pos_001485.png", "action": "wrong", "timestamp": 1771558140.458642, "corrected_label": "neg"}
+{"filename": "pos_001488.png", "action": "wrong", "timestamp": 1771558141.434032, "corrected_label": "neg"}
+{"filename": "pos_001489.png", "action": "wrong", "timestamp": 1771558142.070884, "corrected_label": "neg"}
+{"filename": "neg_000963.png", "action": "correct", "timestamp": 1771558206.7988007}
+{"filename": "neg_001499.png", "action": "correct", "timestamp": 1771558207.7654111}
+{"filename": "neg_001045.png", "action": "correct", "timestamp": 1771558208.5461779}
+{"filename": "neg_001421.png", "action": "correct", "timestamp": 1771558209.0842655}
+{"filename": "neg_000986.png", "action": "correct", "timestamp": 1771558210.8318734}
+{"filename": "neg_000491.png", "action": "correct", "timestamp": 1771558211.6198857}
+{"filename": "neg_000490.png", "action": "correct", "timestamp": 1771558212.9314954}
+{"filename": "neg_000451.png", "action": "correct", "timestamp": 1771558213.5313625}
+{"filename": "neg_000571.png", "action": "correct", "timestamp": 1771558214.1771572}
+{"filename": "neg_000401.png", "action": "correct", "timestamp": 1771558215.9256222}
+{"filename": "neg_000158.png", "action": "correct", "timestamp": 1771558216.5921862}
+{"filename": "neg_000706.png", "action": "correct", "timestamp": 1771558218.3337355}
+{"filename": "neg_000681.png", "action": "correct", "timestamp": 1771558218.7147117}
+{"filename": "neg_001635.png", "action": "correct", "timestamp": 1771558219.4124684}
+{"filename": "pos_000396.png", "action": "wrong", "timestamp": 1771558279.0759113, "corrected_label": "neg"}
+{"filename": "pos_001070.png", "action": "correct", "timestamp": 1771558304.13535}
+{"filename": "pos_000256.png", "action": "wrong", "timestamp": 1771558306.539433, "corrected_label": "neg"}
+{"filename": "pos_000064.png", "action": "wrong", "timestamp": 1771558307.524039, "corrected_label": "neg"}
+{"filename": "pos_000389.png", "action": "wrong", "timestamp": 1771558308.9719877, "corrected_label": "neg"}
+{"filename": "pos_000213.png", "action": "wrong", "timestamp": 1771558310.985732, "corrected_label": "neg"}
+{"filename": "pos_001032.png", "action": "wrong", "timestamp": 1771558312.1366158, "corrected_label": "neg"}
+{"filename": "pos_000039.png", "action": "wrong", "timestamp": 1771558313.1333525, "corrected_label": "neg"}
+{"filename": "pos_000060.png", "action": "wrong", "timestamp": 1771558313.9663045, "corrected_label": "neg"}
+{"filename": "pos_000247.png", "action": "correct", "timestamp": 1771558314.7315092}
+{"filename": "pos_000046.png", "action": "correct", "timestamp": 1771558316.5552707}
+{"filename": "pos_000046.png", "action": "tag", "tags": {"cursor_type": "ibeam"}, "timestamp": 1771558318.579641}
+{"filename": "pos_000247.png", "action": "tag", "tags": {"cursor_type": "arrow"}, "timestamp": 1771558319.643106}
+{"filename": "pos_000314.png", "action": "wrong", "timestamp": 1771558321.7812498, "corrected_label": "neg"}
+{"filename": "pos_000467.png", "action": "wrong", "timestamp": 1771558322.5380108, "corrected_label": "neg"}
+{"filename": "pos_000241.png", "action": "wrong", "timestamp": 1771558323.5210595, "corrected_label": "neg"}
+{"filename": "pos_000426.png", "action": "wrong", "timestamp": 1771558324.2928402, "corrected_label": "neg"}
+{"filename": "pos_000016.png", "action": "wrong", "timestamp": 1771558325.8322272, "corrected_label": "neg"}
+{"filename": "pos_000305.png", "action": "wrong", "timestamp": 1771558326.4681685, "corrected_label": "neg"}
+{"filename": "pos_000238.png", "action": "wrong", "timestamp": 1771558327.11306, "corrected_label": "neg"}
+{"filename": "pos_000375.png", "action": "wrong", "timestamp": 1771558327.6680377, "corrected_label": "neg"}
+{"filename": "pos_000367.png", "action": "wrong", "timestamp": 1771558341.4159136, "corrected_label": "neg"}
+{"filename": "pos_000244.png", "action": "wrong", "timestamp": 1771558342.33331, "corrected_label": "neg"}
+{"filename": "pos_000295.png", "action": "wrong", "timestamp": 1771558342.9601977, "corrected_label": "neg"}
+{"filename": "pos_000313.png", "action": "wrong", "timestamp": 1771558343.9284906, "corrected_label": "neg"}
+{"filename": "pos_000397.png", "action": "wrong", "timestamp": 1771558344.633467, "corrected_label": "neg"}
+{"filename": "pos_000145.png", "action": "wrong", "timestamp": 1771558345.3687444, "corrected_label": "neg"}
+{"filename": "pos_000509.png", "action": "wrong", "timestamp": 1771558347.6256435, "corrected_label": "neg"}
+{"filename": "pos_000036.png", "action": "wrong", "timestamp": 1771558348.2935948, "corrected_label": "neg"}
+{"filename": "pos_000008.png", "action": "wrong", "timestamp": 1771558349.2520509, "corrected_label": "neg"}
+{"filename": "pos_000418.png", "action": "wrong", "timestamp": 1771558350.1917167, "corrected_label": "neg"}
+{"filename": "pos_000315.png", "action": "wrong", "timestamp": 1771558351.1214902, "corrected_label": "neg"}
+{"filename": "pos_000121.png", "action": "wrong", "timestamp": 1771558352.224869, "corrected_label": "neg"}
+{"filename": "pos_000275.png", "action": "wrong", "timestamp": 1771558353.124354, "corrected_label": "neg"}
+{"filename": "pos_000276.png", "action": "wrong", "timestamp": 1771558354.422806, "corrected_label": "neg"}
+{"filename": "pos_000068.png", "action": "wrong", "timestamp": 1771558356.0478113, "corrected_label": "neg"}
+{"filename": "pos_000125.png", "action": "correct", "timestamp": 1771558356.820506}
+{"filename": "pos_000386.png", "action": "wrong", "timestamp": 1771558357.871491, "corrected_label": "neg"}
+{"filename": "pos_000190.png", "action": "correct", "timestamp": 1771558358.7715116}
+{"filename": "pos_000082.png", "action": "tag", "tags": {"cursor_type": "crosshair"}, "timestamp": 1771558363.781934}
+{"filename": "pos_000082.png", "action": "correct", "timestamp": 1771558366.29491}
+{"filename": "pos_000083.png", "action": "tag", "tags": {"cursor_type": "crosshair"}, "timestamp": 1771558367.530558}
+{"filename": "pos_000083.png", "action": "correct", "timestamp": 1771558369.128549}
+{"filename": "pos_000261.png", "action": "correct", "timestamp": 1771558377.8364606}
+{"filename": "pos_000261.png", "action": "tag", "tags": {"cursor_type": "hand"}, "timestamp": 1771558379.9075065}
+{"filename": "pos_000752.png", "action": "wrong", "timestamp": 1771558381.4505112, "corrected_label": "neg"}
+{"filename": "pos_000320.png", "action": "wrong", "timestamp": 1771558382.6768541, "corrected_label": "neg"}
+{"filename": "pos_000095.png", "action": "wrong", "timestamp": 1771558383.6033685, "corrected_label": "neg"}
+{"filename": "pos_000061.png", "action": "wrong", "timestamp": 1771558384.1354642, "corrected_label": "neg"}
+{"filename": "pos_000062.png", "action": "wrong", "timestamp": 1771558385.0817204, "corrected_label": "neg"}
+{"filename": "pos_000222.png", "action": "wrong", "timestamp": 1771558388.6065514, "corrected_label": "neg"}
+{"filename": "pos_000223.png", "action": "wrong", "timestamp": 1771558389.3105083, "corrected_label": "neg"}
+{"filename": "pos_000094.png", "action": "wrong", "timestamp": 1771558390.3198984, "corrected_label": "neg"}
+{"filename": "pos_000114.png", "action": "wrong", "timestamp": 1771558391.1638236, "corrected_label": "neg"}
+{"filename": "pos_000115.png", "action": "wrong", "timestamp": 1771558391.9892557, "corrected_label": "neg"}
+{"filename": "pos_000380.png", "action": "wrong", "timestamp": 1771558393.0019705, "corrected_label": "neg"}
+{"filename": "pos_000385.png", "action": "correct", "timestamp": 1771558393.6908371}
+{"filename": "pos_000385.png", "action": "tag", "tags": {"cursor_type": "ibeam"}, "timestamp": 1771558397.703728}
+{"filename": "pos_000047.png", "action": "delete", "timestamp": 1771558403.172232}
+{"filename": "pos_000277.png", "action": "wrong", "timestamp": 1771558405.691118, "corrected_label": "neg"}
+{"filename": "pos_000059.png", "action": "wrong", "timestamp": 1771558406.486786, "corrected_label": "neg"}
+{"filename": "pos_000498.png", "action": "wrong", "timestamp": 1771558407.5216093, "corrected_label": "neg"}
+{"filename": "pos_000093.png", "action": "wrong", "timestamp": 1771558410.0276015, "corrected_label": "neg"}
+{"filename": "pos_000262.png", "action": "correct", "timestamp": 1771558410.8213763}
+{"filename": "pos_000262.png", "action": "tag", "tags": {"cursor_type": "hand"}, "timestamp": 1771558413.2304373}
+{"filename": "pos_000575.png", "action": "wrong", "timestamp": 1771558414.4436135, "corrected_label": "neg"}
+{"filename": "pos_000085.png", "action": "wrong", "timestamp": 1771558423.3023088, "corrected_label": "neg"}
+{"filename": "pos_000089.png", "action": "correct", "timestamp": 1771558423.980174}
+{"filename": "pos_000089.png", "action": "tag", "tags": {"cursor_type": "ibeam"}, "timestamp": 1771558426.5882137}
+{"filename": "pos_000063.png", "action": "correct", "timestamp": 1771558428.2971377}
+{"filename": "pos_000099.png", "action": "correct", "timestamp": 1771558429.211543}
+{"filename": "pos_000099.png", "action": "wrong", "timestamp": 1771558431.3274832, "corrected_label": "neg"}
+{"filename": "pos_000063.png", "action": "wrong", "timestamp": 1771558432.3728583, "corrected_label": "neg"}
+{"filename": "pos_000368.png", "action": "wrong", "timestamp": 1771558436.419709, "corrected_label": "neg"}
+{"filename": "pos_000011.png", "action": "wrong", "timestamp": 1771558437.5075505, "corrected_label": "neg"}
+{"filename": "pos_000316.png", "action": "correct", "timestamp": 1771558440.8749957}
+{"filename": "pos_000365.png", "action": "correct", "timestamp": 1771558441.752094}
+{"filename": "pos_000316.png", "action": "wrong", "timestamp": 1771558444.242251, "corrected_label": "neg"}
+{"filename": "pos_000365.png", "action": "wrong", "timestamp": 1771558444.9540985, "corrected_label": "neg"}
+{"filename": "pos_000011.png", "action": "wrong", "timestamp": 1771558445.8094664, "corrected_label": "neg"}
+{"filename": "pos_001075.png", "action": "wrong", "timestamp": 1771558446.6338835, "corrected_label": "neg"}
+{"filename": "pos_001096.png", "action": "correct", "timestamp": 1771558448.58522}
+{"filename": "pos_001096.png", "action": "tag", "tags": {"visibility": "partial"}, "timestamp": 1771558449.673485}
+{"filename": "pos_001096.png", "action": "tag", "tags": {"cursor_type": "arrow"}, "timestamp": 1771558452.7481234}
+{"filename": "pos_001414.png", "action": "wrong", "timestamp": 1771558456.040663, "corrected_label": "neg"}
+{"filename": "pos_000025.png", "action": "wrong", "timestamp": 1771558456.6312523, "corrected_label": "neg"}
+{"filename": "pos_000026.png", "action": "wrong", "timestamp": 1771558457.46439, "corrected_label": "neg"}
+{"filename": "pos_000339.png", "action": "wrong", "timestamp": 1771558458.1552162, "corrected_label": "neg"}
+{"filename": "pos_001417.png", "action": "wrong", "timestamp": 1771558458.7854147, "corrected_label": "neg"}
+{"filename": "pos_000317.png", "action": "wrong", "timestamp": 1771558459.4296808, "corrected_label": "neg"}
+{"filename": "pos_000318.png", "action": "wrong", "timestamp": 1771558460.0593462, "corrected_label": "neg"}
+{"filename": "pos_000096.png", "action": "wrong", "timestamp": 1771558461.657916, "corrected_label": "neg"}
+{"filename": "pos_000105.png", "action": "wrong", "timestamp": 1771558462.3419943, "corrected_label": "neg"}
+{"filename": "pos_000257.png", "action": "wrong", "timestamp": 1771558476.9421072, "corrected_label": "neg"}
+{"filename": "pos_001387.png", "action": "wrong", "timestamp": 1771558478.2325072, "corrected_label": "neg"}
+{"filename": "pos_001418.png", "action": "correct", "timestamp": 1771558480.1079743}
+{"filename": "pos_001418.png", "action": "tag", "tags": {"visibility": "partial"}, "timestamp": 1771558481.415654}
+{"filename": "pos_001418.png", "action": "tag", "tags": {"cursor_type": "arrow"}, "timestamp": 1771558482.5373616}
+{"filename": "pos_000354.png", "action": "wrong", "timestamp": 1771558484.0529351, "corrected_label": "neg"}
+{"filename": "pos_000335.png", "action": "wrong", "timestamp": 1771558484.759114, "corrected_label": "neg"}
+{"filename": "pos_000331.png", "action": "wrong", "timestamp": 1771558485.5671258, "corrected_label": "neg"}
+{"filename": "pos_000782.png", "action": "wrong", "timestamp": 1771558486.5959477, "corrected_label": "neg"}
+{"filename": "pos_000057.png", "action": "wrong", "timestamp": 1771558487.44313, "corrected_label": "neg"}
+{"filename": "pos_000052.png", "action": "wrong", "timestamp": 1771558489.0332167, "corrected_label": "neg"}
+{"filename": "pos_000086.png", "action": "wrong", "timestamp": 1771558489.7299232, "corrected_label": "neg"}
+{"filename": "pos_000087.png", "action": "wrong", "timestamp": 1771558490.4901774, "corrected_label": "neg"}
+{"filename": "pos_000254.png", "action": "wrong", "timestamp": 1771558491.2382157, "corrected_label": "neg"}
+{"filename": "pos_000053.png", "action": "wrong", "timestamp": 1771558491.799454, "corrected_label": "neg"}
+{"filename": "pos_000968.png", "action": "wrong", "timestamp": 1771558494.6128943, "corrected_label": "neg"}
+{"filename": "pos_001001.png", "action": "wrong", "timestamp": 1771558495.243554, "corrected_label": "neg"}
+{"filename": "pos_001003.png", "action": "wrong", "timestamp": 1771558495.8730054, "corrected_label": "neg"}
+{"filename": "pos_001004.png", "action": "wrong", "timestamp": 1771558497.1170473, "corrected_label": "neg"}
+{"filename": "pos_001027.png", "action": "wrong", "timestamp": 1771558497.9349666, "corrected_label": "neg"}
+{"filename": "pos_000286.png", "action": "correct", "timestamp": 1771558511.3072557}
+{"filename": "pos_000286.png", "action": "tag", "tags": {"cursor_type": "ibeam"}, "timestamp": 1771558513.5655403}
+{"filename": "pos_000310.png", "action": "wrong", "timestamp": 1771558515.8600032, "corrected_label": "neg"}
+{"filename": "pos_000362.png", "action": "wrong", "timestamp": 1771558516.4817002, "corrected_label": "neg"}
+{"filename": "pos_000342.png", "action": "wrong", "timestamp": 1771558517.0813096, "corrected_label": "neg"}
+{"filename": "pos_000363.png", "action": "correct", "timestamp": 1771558517.5323064}
+{"filename": "pos_000363.png", "action": "wrong", "timestamp": 1771558518.1108217, "corrected_label": "neg"}
+{"filename": "pos_000103.png", "action": "wrong", "timestamp": 1771558519.2804556, "corrected_label": "neg"}
+{"filename": "pos_000102.png", "action": "wrong", "timestamp": 1771558520.300894, "corrected_label": "neg"}
+{"filename": "pos_000054.png", "action": "correct", "timestamp": 1771558521.1251667}
+{"filename": "pos_000054.png", "action": "tag", "tags": {"cursor_type": "hand"}, "timestamp": 1771558522.387896}
+{"filename": "pos_000056.png", "action": "correct", "timestamp": 1771558523.832204}
+{"filename": "pos_000056.png", "action": "tag", "tags": {"cursor_type": "ibeam"}, "timestamp": 1771558525.8650787}
+{"filename": "pos_000123.png", "action": "wrong", "timestamp": 1771558529.1058366, "corrected_label": "neg"}
+{"filename": "pos_000379.png", "action": "wrong", "timestamp": 1771558530.1190655, "corrected_label": "neg"}
+{"filename": "pos_000091.png", "action": "correct", "timestamp": 1771558531.4460237}
+{"filename": "pos_000091.png", "action": "tag", "tags": {"cursor_type": "ibeam"}, "timestamp": 1771558532.4944165}
+{"filename": "pos_000404.png", "action": "wrong", "timestamp": 1771558533.9207137, "corrected_label": "neg"}
+{"filename": "pos_000327.png", "action": "wrong", "timestamp": 1771558535.9902804, "corrected_label": "neg"}
+{"filename": "pos_000126.png", "action": "correct", "timestamp": 1771558536.995527}
+{"filename": "pos_000126.png", "action": "correct", "timestamp": 1771558541.442769}
+{"filename": "pos_000409.png", "action": "wrong", "timestamp": 1771558543.8881886, "corrected_label": "neg"}
+{"filename": "pos_000090.png", "action": "wrong", "timestamp": 1771558544.638936, "corrected_label": "neg"}
+{"filename": "pos_000189.png", "action": "correct", "timestamp": 1771558545.4109406}
+{"filename": "pos_000124.png", "action": "wrong", "timestamp": 1771558547.1347215, "corrected_label": "neg"}
+{"filename": "pos_000092.png", "action": "wrong", "timestamp": 1771558547.9812007, "corrected_label": "neg"}
+{"filename": "pos_000189.png", "action": "tag", "tags": {"cursor_type": "ibeam"}, "timestamp": 1771558552.010166}
+{"filename": "pos_000126.png", "action": "tag", "tags": {"cursor_type": "ibeam"}, "timestamp": 1771558554.1559854}
+{"filename": "pos_000373.png", "action": "wrong", "timestamp": 1771558567.1834953, "corrected_label": "neg"}
+{"filename": "pos_000484.png", "action": "wrong", "timestamp": 1771558568.282786, "corrected_label": "neg"}
+{"filename": "pos_000378.png", "action": "wrong", "timestamp": 1771558569.313196, "corrected_label": "neg"}
+{"filename": "pos_000345.png", "action": "wrong", "timestamp": 1771558570.5278952, "corrected_label": "neg"}
+{"filename": "pos_000406.png", "action": "wrong", "timestamp": 1771558571.0679872, "corrected_label": "neg"}
+{"filename": "pos_000361.png", "action": "wrong", "timestamp": 1771558571.961496, "corrected_label": "neg"}
+{"filename": "pos_000334.png", "action": "wrong", "timestamp": 1771558573.9188204, "corrected_label": "neg"}
+{"filename": "pos_000401.png", "action": "wrong", "timestamp": 1771558574.9080465, "corrected_label": "neg"}
+{"filename": "pos_000356.png", "action": "correct", "timestamp": 1771558575.68149}
+{"filename": "pos_000356.png", "action": "tag", "tags": {"cursor_type": "ibeam"}, "timestamp": 1771558576.5584435}
+{"filename": "pos_000042.png", "action": "wrong", "timestamp": 1771558577.7507486, "corrected_label": "neg"}
+{"filename": "pos_000258.png", "action": "wrong", "timestamp": 1771558578.530808, "corrected_label": "neg"}
+{"filename": "pos_000843.png", "action": "correct", "timestamp": 1771558580.384819}
+{"filename": "pos_000843.png", "action": "tag", "tags": {"cursor_type": "ibeam"}, "timestamp": 1771558584.6358192}
+{"filename": "pos_000427.png", "action": "wrong", "timestamp": 1771558585.8202248, "corrected_label": "neg"}
+{"filename": "pos_000429.png", "action": "wrong", "timestamp": 1771558586.7273908, "corrected_label": "neg"}
+{"filename": "pos_000360.png", "action": "wrong", "timestamp": 1771558587.5291061, "corrected_label": "neg"}
+{"filename": "pos_000422.png", "action": "wrong", "timestamp": 1771558588.4003153, "corrected_label": "neg"}
+{"filename": "pos_000390.png", "action": "wrong", "timestamp": 1771558589.142319, "corrected_label": "neg"}
+{"filename": "pos_000351.png", "action": "wrong", "timestamp": 1771558591.8056, "corrected_label": "neg"}
+{"filename": "pos_000272.png", "action": "wrong", "timestamp": 1771558592.7131438, "corrected_label": "neg"}
+{"filename": "pos_000576.png", "action": "wrong", "timestamp": 1771558593.3815901, "corrected_label": "neg"}
+{"filename": "pos_000746.png", "action": "wrong", "timestamp": 1771558748.3026068, "corrected_label": "neg"}
+{"filename": "pos_000416.png", "action": "wrong", "timestamp": 1771558749.1862879, "corrected_label": "neg"}
+{"filename": "pos_000030.png", "action": "wrong", "timestamp": 1771558750.5215154, "corrected_label": "neg"}
+{"filename": "pos_001068.png", "action": "correct", "timestamp": 1771558753.146987}
+{"filename": "pos_000294.png", "action": "correct", "timestamp": 1771558755.187759}
+{"filename": "pos_000294.png", "action": "tag", "tags": {"cursor_type": "ibeam"}, "timestamp": 1771558756.259379}
+{"filename": "pos_000010.png", "action": "wrong", "timestamp": 1771558759.0221393, "corrected_label": "neg"}
+{"filename": "pos_000278.png", "action": "wrong", "timestamp": 1771558759.6422033, "corrected_label": "neg"}
+{"filename": "pos_000255.png", "action": "correct", "timestamp": 1771558761.269747}
+{"filename": "pos_000255.png", "action": "tag", "tags": {"cursor_type": "ibeam"}, "timestamp": 1771558762.498831}
+{"filename": "pos_000005.png", "action": "wrong", "timestamp": 1771558764.4944062, "corrected_label": "neg"}
+{"filename": "pos_000415.png", "action": "correct", "timestamp": 1771558766.0324438}
+{"filename": "pos_000101.png", "action": "wrong", "timestamp": 1771558767.0080729, "corrected_label": "neg"}
+{"filename": "pos_001131.png", "action": "correct", "timestamp": 1771558768.5434694}
+{"filename": "pos_001131.png", "action": "tag", "tags": {"cursor_type": "hand"}, "timestamp": 1771558769.8574324}
+{"filename": "pos_001131.png", "action": "tag", "tags": {"visibility": "partial"}, "timestamp": 1771558770.7949033}
+{"filename": "pos_001135.png", "action": "correct", "timestamp": 1771558772.3106163}
+{"filename": "pos_001135.png", "action": "tag", "tags": {"cursor_type": "hand"}, "timestamp": 1771558774.9949667}
+{"filename": "pos_001135.png", "action": "tag", "tags": {"visibility": "partial"}, "timestamp": 1771558776.4045105}
+{"filename": "pos_000439.png", "action": "wrong", "timestamp": 1771558779.3447666, "corrected_label": "neg"}
+{"filename": "pos_000017.png", "action": "wrong", "timestamp": 1771558780.9650416, "corrected_label": "neg"}
+{"filename": "pos_001119.png", "action": "correct", "timestamp": 1771558781.8261333}
+{"filename": "pos_001119.png", "action": "tag", "tags": {"cursor_type": "hand"}, "timestamp": 1771558784.260274}
+{"filename": "pos_001119.png", "action": "tag", "tags": {"visibility": "partial"}, "timestamp": 1771558786.4615781}
+{"filename": "pos_000097.png", "action": "wrong", "timestamp": 1771558788.2163723, "corrected_label": "neg"}
+{"filename": "pos_000742.png", "action": "correct", "timestamp": 1771558789.11688}
+{"filename": "pos_000742.png", "action": "tag", "tags": {"cursor_type": "ibeam"}, "timestamp": 1771558793.3545482}
+{"filename": "pos_000340.png", "action": "wrong", "timestamp": 1771558795.6783826, "corrected_label": "neg"}
+{"filename": "pos_000341.png", "action": "wrong", "timestamp": 1771558796.3473623, "corrected_label": "neg"}

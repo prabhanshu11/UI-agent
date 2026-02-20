@@ -71,6 +71,22 @@
 </div>
 </div>
 
+<div class="model-bar" id="model-bar">
+  <div class="model-slot runtime">
+    <span class="model-label">Runtime</span>
+    <span class="model-version" id="runtime-version">--</span>
+    <span class="model-acc" id="runtime-acc"></span>
+  </div>
+  <span class="model-vs">vs</span>
+  <div class="model-slot comparison">
+    <span class="model-label">Compare</span>
+    <select id="comparison-select" onchange="setComparisonModel(this.value)">
+      <option value="">None (single model)</option>
+    </select>
+    <span class="model-acc" id="comparison-acc"></span>
+  </div>
+</div>
+
 <div class="controls">
   <span class="ctrl-label">Filter</span>
   <button class="filter-btn active" data-filter="all" onclick="setFilter('all')" title="All samples in the training set">All <span class="filter-count" id="cnt-all"></span></button>

@@ -1,0 +1,31 @@
+============================= test session starts ==============================
+platform linux -- Python 3.13.12, pytest-9.0.2, pluggy-1.6.0 -- /home/prabhanshu/Programs/UI-agent/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: /home/prabhanshu/Programs/UI-agent
+configfile: pyproject.toml
+plugins: anyio-4.12.1
+collecting ... collected 21 items
+
+tests/test_validation_models.py::TestTinyCursorNet::test_model_output_shape PASSED [  4%]
+tests/test_validation_models.py::TestTinyCursorNet::test_model_output_range PASSED [  9%]
+tests/test_validation_models.py::TestTinyCursorNet::test_model_batch_inference PASSED [ 14%]
+tests/test_validation_models.py::TestTinyCursorNet::test_model_save_load_roundtrip PASSED [ 19%]
+tests/test_validation_models.py::TestTinyCursorNet::test_two_models_produce_valid_outputs PASSED [ 23%]
+tests/test_validation_models.py::TestModelListing::test_parse_training_log PASSED [ 28%]
+tests/test_validation_models.py::TestModelListing::test_model_files_exist PASSED [ 33%]
+tests/test_validation_models.py::TestComparisonModel::test_load_comparison_model PASSED [ 38%]
+tests/test_validation_models.py::TestComparisonModel::test_load_nonexistent_model_fails PASSED [ 42%]
+tests/test_validation_models.py::TestComparisonModel::test_comparison_state_management PASSED [ 47%]
+tests/test_validation_models.py::TestDualInference::test_dual_inference_same_patch PASSED [ 52%]
+tests/test_validation_models.py::TestDualInference::test_models_disagree_flag PASSED [ 57%]
+tests/test_validation_models.py::TestDualInference::test_cnn_predicted_from_confidence PASSED [ 61%]
+tests/test_validation_models.py::TestDualInference::test_sample_response_fields PASSED [ 66%]
+tests/test_validation_models.py::TestContextCrop::test_context_crop_detection PASSED [ 71%]
+tests/test_validation_models.py::TestContextCrop::test_extract_gray_patch_context_size PASSED [ 76%]
+tests/test_validation_models.py::TestContextCrop::test_extract_gray_patch_near_edge_returns_none PASSED [ 80%]
+tests/test_validation_models.py::TestContextCrop::test_save_context_crop PASSED [ 85%]
+tests/test_validation_models.py::TestContextCrop::test_save_context_crop_near_edge PASSED [ 90%]
+tests/test_validation_models.py::TestContextCrop::test_collect_from_locate_saves_context_for_claude_vision PASSED [ 95%]
+tests/test_validation_models.py::TestContextCrop::test_collect_from_tracking_no_context PASSED [100%]
+
+============================== 21 passed in 2.13s ==============================
