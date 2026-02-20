@@ -21,6 +21,7 @@
   </div>
   <div class="actions">
     <button class="info-toggle" onclick="toggleInfo()">? Info</button>
+    <button class="btn btn-yolo-enrich" onclick="triggerYoloEnrich()">Enrich with YOLO</button>
     <button class="btn btn-retrain" onclick="retrain()">Retrain CNN</button>
   </div>
 </div>
@@ -49,6 +50,7 @@
         <code>claude_vision</code> — Vision-confirmed position<br>
         <code>ground_truth</code> — manually verified</li>
       <li><b>CNN Conf</b>: model's confidence this patch contains a cursor (0-1). Green &gt;0.7, yellow 0.3-0.7, red &lt;0.3</li>
+      <li><b>YOLO</b>: YOLO detection confidence (blue bar). Enriched from context crops or loss event frames</li>
       <li><b>Priority</b>: review order — Needs Review (-1) &gt; CNN Disagrees (0) &gt; confusing (1) &gt; uncertain (2) &gt; Vision (3) &gt; easy (4) &gt; reviewed (99)</li>
     </ul>
   </div>
@@ -66,7 +68,8 @@
     New columns appear automatically when you tag with custom keys via the API.
     <br><br>
     <h3>Keyboard Shortcuts</h3>
-    <code>J/K</code> or arrows: navigate &nbsp; <code>1</code>: OK &nbsp; <code>2</code>: Wrong &nbsp; <code>3</code>: Confusing &nbsp; <code>4</code>: Del &nbsp; <code>Space</code>: open patch (click to annotate cursor tip)
+    <code>J/K</code> or arrows: navigate &nbsp; <code>1</code>: OK &nbsp; <code>2</code>: Wrong &nbsp; <code>3</code>: Confusing &nbsp; <code>4</code>: Del &nbsp; <code>Space</code>: open patch<br>
+    <b>Batch:</b> <code>X</code>: toggle select &nbsp; <code>Shift+A</code>: select all &nbsp; <code>Shift+1</code>: OK all selected &nbsp; <code>Shift+2</code>: Wrong all selected
   </div>
 </div>
 </div>
@@ -85,6 +88,12 @@
     </select>
     <span class="model-acc" id="comparison-acc"></span>
   </div>
+  <div class="ctrl-sep"></div>
+  <div class="model-slot yolo" id="yolo-model-slot">
+    <span class="model-label">YOLO</span>
+    <span class="model-version" id="yolo-model-version">--</span>
+    <span class="model-acc" id="yolo-enrich-status"></span>
+  </div>
 </div>
 
 <div class="controls">
@@ -95,6 +104,8 @@
   <button class="filter-btn" data-filter="claude" onclick="setFilter('claude')" title="Patches from Claude Vision detections">Claude Vision <span class="filter-count" id="cnt-claude"></span></button>
   <button class="filter-btn" data-filter="disagreement" onclick="setFilter('disagreement')" title="CNN prediction differs from assigned label">CNN Disagrees <span class="filter-count" id="cnt-disagreement"></span></button>
   <button class="filter-btn" data-filter="needs_review" onclick="setFilter('needs_review')" title="Human-captured samples awaiting ground truth tagging" style="border-color:#FF5722">Needs Review <span class="filter-count" id="cnt-needs_review" style="color:#FF5722"></span></button>
+  <button class="filter-btn" data-filter="yolo_detected" onclick="setFilter('yolo_detected')" title="Samples where YOLO detected a cursor" style="border-color:#2196F3">YOLO Detected <span class="filter-count" id="cnt-yolo_detected" style="color:#2196F3"></span></button>
+  <button class="filter-btn" data-filter="yolo_disagrees" onclick="setFilter('yolo_disagrees')" title="YOLO detection disagrees with sample label" style="border-color:#FF9800">YOLO Disagrees <span class="filter-count" id="cnt-yolo_disagrees" style="color:#FF9800"></span></button>
   <div class="ctrl-sep"></div>
   <span class="ctrl-label">Label</span>
   <select class="label-select" onchange="setLabel(this.value)">
@@ -113,6 +124,8 @@
     <option value="priority">Priority (review first)</option>
     <option value="confidence_asc">CNN Conf (low first)</option>
     <option value="confidence_desc">CNN Conf (high first)</option>
+    <option value="yolo_conf_asc">YOLO Conf (low first)</option>
+    <option value="yolo_conf_desc">YOLO Conf (high first)</option>
     <option value="source">Source</option>
     <option value="recent">Recent</option>
   </select>
@@ -125,14 +138,27 @@
 <div class="stats-bar" id="stats-bar">
   <span>Loading stats...</span>
 </div>
+
+<!-- Batch action bar (hidden until selection) -->
+<div class="batch-bar" id="batch-bar" style="display:none">
+  <span class="batch-count" id="batch-count">0 selected</span>
+  <button class="btn btn-ok" onclick="batchReview('correct')">OK All</button>
+  <button class="btn btn-wrong" onclick="batchReview('wrong')">Wrong All</button>
+  <button class="btn btn-del" onclick="batchReview('delete')">Del All</button>
+  <button class="btn" onclick="batchTagPrompt()">Tag All...</button>
+  <button class="btn" onclick="clearSelection()">Clear</button>
+</div>
+
 <table id="samples-table">
   <thead>
     <tr>
+      <th class="batch-th"><input type="checkbox" id="select-all" onchange="toggleSelectAll(this.checked)" title="Select all on page"></th>
       <th>Patch</th>
       <th onclick="setSort('source')">Label</th>
       <th>Type</th>
       <th onclick="setSort('source')">Source</th>
       <th onclick="setSort(currentSort==='confidence_asc'?'confidence_desc':'confidence_asc')">CNN Conf</th>
+      <th onclick="setSort(currentSort==='yolo_conf_asc'?'yolo_conf_desc':'yolo_conf_asc')" style="color:#2196F3">YOLO</th>
       <th onclick="setSort('priority')">Priority</th>
       <th>Actions</th>
     </tr>
@@ -140,6 +166,15 @@
   <tbody id="samples-body"></tbody>
 </table>
 <div class="toast" id="toast"></div>
+
+<!-- Notification bar for auto-refresh -->
+<div class="refresh-bar" id="refresh-bar" style="display:none">
+  <span id="refresh-msg">Model updated</span>
+  <button class="btn" onclick="dismissRefresh()">Dismiss</button>
+  <button class="btn btn-ok" onclick="doRefresh()">Refresh Now</button>
+  <span class="refresh-countdown" id="refresh-countdown"></span>
+</div>
+
 <div class="preview-overlay" id="preview-overlay">
   <div class="preview-panels">
     <div class="preview-panel">
@@ -154,9 +189,15 @@
       <img id="context-img" class="context-img" style="display:none">
     </div>
   </div>
+  <!-- Suggestion bar below preview -->
+  <div class="suggestion-bar" id="suggestion-bar" style="display:none">
+    <span class="suggestion-info" id="suggestion-info"></span>
+    <div class="suggestion-tags" id="suggestion-tags"></div>
+    <button class="btn btn-ok" id="accept-suggestions-btn" onclick="acceptSuggestions()" style="display:none">Accept Suggestions</button>
+  </div>
   <div class="preview-info" id="preview-info">Click on the <em>cursor tip</em> to annotate (saves immediately). ESC to close.</div>
 </div>
-<div class="keyboard-hint">J/K: next/prev | 1: OK | 2: Wrong | 3: Confusing | 4: Del | Space: annotate tip</div>
+<div class="keyboard-hint">J/K: nav | 1: OK | 2: Wrong | 3: Confusing | 4: Del | Space: preview | X: select | Shift+A: select all</div>
 
 <script src="/static/js/validation.js"></script>
 </body>

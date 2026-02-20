@@ -2769,6 +2769,25 @@ _CURSOR_MODELS_DIR = Path(__file__).parent.parent.parent / "data" / "cursor_mode
 
 # Secondary model for A/B comparison in validation UI
 _comparison_model: dict = {"version": None, "model": None}
+_YOLO_CACHE_PATH = _VALIDATION_SAMPLES_DIR / "yolo_cache.jsonl"
+_YOLO_MODELS_DIR = Path(__file__).parent.parent.parent / "data" / "yolo_models"
+
+
+def _load_yolo_cache() -> dict:
+    """Load YOLO enrichment cache, keyed by filename."""
+    cache = {}
+    if not _YOLO_CACHE_PATH.exists():
+        return cache
+    with open(_YOLO_CACHE_PATH) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    entry = json.loads(line)
+                    cache[entry["filename"]] = entry
+                except (json.JSONDecodeError, KeyError):
+                    continue
+    return cache
 
 
 @app.get("/validation")
@@ -2824,6 +2843,9 @@ async def get_validation_samples(page: int = 0, page_size: int = 20,
                             reviewed[fn] = review
                     except (json.JSONDecodeError, KeyError):
                         continue
+
+    # Load YOLO cache
+    yolo_cache = _load_yolo_cache()
 
     # Score all entries (CNN inference for priority)
     model = recognizer._cnn_model if recognizer else None
@@ -2902,6 +2924,18 @@ async def get_validation_samples(page: int = 0, page_size: int = 20,
                            and cnn_predicted != comp_predicted)
 
         has_context = (_VALIDATION_SAMPLES_DIR / f"ctx_{filename}").exists()
+
+        # YOLO enrichment data
+        yolo_entry = yolo_cache.get(filename, {})
+        yolo_detected = yolo_entry.get("yolo_detected", False) if yolo_entry else False
+        yolo_conf = yolo_entry.get("yolo_conf")
+        yolo_disagrees = False
+        if yolo_entry:
+            yolo_says_cursor = yolo_detected
+            label_says_cursor = entry_label == "pos"
+            if yolo_entry.get("enrichment_source"):  # only if enriched
+                yolo_disagrees = yolo_says_cursor != label_says_cursor
+
         scored_entries.append({
             **entry,
             "label": entry_label,  # normalized
@@ -2917,6 +2951,11 @@ async def get_validation_samples(page: int = 0, page_size: int = 20,
             "needs_review": needs_review,
             "tags": file_tags.get(filename, {}),
             "has_context": has_context,
+            "yolo_detected": yolo_detected,
+            "yolo_conf": yolo_conf,
+            "yolo_disagrees": yolo_disagrees,
+            "yolo_enriched": bool(yolo_entry.get("enrichment_source")),
+            "yolo_source": yolo_entry.get("enrichment_source"),
         })
 
     # Compute filter counts BEFORE filtering (so tabs show totals)
@@ -2931,6 +2970,8 @@ async def get_validation_samples(page: int = 0, page_size: int = 20,
         "needs_review": sum(1 for e in scored_entries if e.get("needs_review")),
         "pos": sum(1 for e in scored_entries if e["label"] == "pos"),
         "neg": sum(1 for e in scored_entries if e["label"] == "neg"),
+        "yolo_detected": sum(1 for e in scored_entries if e.get("yolo_detected")),
+        "yolo_disagrees": sum(1 for e in scored_entries if e.get("yolo_disagrees")),
     }
     # Source breakdown
     source_counts = {}
@@ -2956,6 +2997,10 @@ async def get_validation_samples(page: int = 0, page_size: int = 20,
         filtered = [e for e in filtered if e.get("cnn_disagrees")]
     elif filter == "needs_review":
         filtered = [e for e in filtered if e.get("needs_review")]
+    elif filter == "yolo_detected":
+        filtered = [e for e in filtered if e.get("yolo_detected")]
+    elif filter == "yolo_disagrees":
+        filtered = [e for e in filtered if e.get("yolo_disagrees")]
 
     if label != "all":
         filtered = [e for e in filtered if e["label"] == label]
@@ -2974,6 +3019,10 @@ async def get_validation_samples(page: int = 0, page_size: int = 20,
         filtered.sort(key=lambda e: e.get("cnn_confidence") or 0, reverse=True)
     elif sort == "source":
         filtered.sort(key=lambda e: e.get("source", ""))
+    elif sort == "yolo_conf_asc":
+        filtered.sort(key=lambda e: e.get("yolo_conf") or 0)
+    elif sort == "yolo_conf_desc":
+        filtered.sort(key=lambda e: e.get("yolo_conf") or 0, reverse=True)
 
     # Paginate
     total = len(filtered)
@@ -3329,6 +3378,241 @@ async def get_validation_stats():
         "review_count": review_count,
         "model_version": recognizer.model_version if recognizer else "none",
         "source_distribution": source_counts,
+    }
+
+
+# ── YOLO Enrichment + Batch Operations ───────────────────────────────
+
+_yolo_enrich_proc = None  # Track running enrichment subprocess
+
+
+@app.post("/api/validation/yolo_enrich")
+async def trigger_yolo_enrichment():
+    """Trigger YOLO batch enrichment as background subprocess."""
+    global _yolo_enrich_proc
+    import subprocess
+
+    if _yolo_enrich_proc and _yolo_enrich_proc.poll() is None:
+        return {"status": "already_running", "pid": _yolo_enrich_proc.pid}
+
+    project_root = Path(__file__).parent.parent.parent
+    script = project_root / "scripts" / "yolo_enrich_samples.py"
+    venv_python = project_root / ".venv" / "bin" / "python"
+
+    _yolo_enrich_proc = subprocess.Popen(
+        [str(venv_python), str(script)],
+        cwd=str(project_root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+    return {"status": "started", "pid": _yolo_enrich_proc.pid}
+
+
+@app.get("/api/validation/yolo_status")
+async def get_yolo_status():
+    """Return YOLO model version, cache stats."""
+    # Find current YOLO model
+    yolo_model_name = None
+    yolo_models = sorted(_YOLO_MODELS_DIR.glob("cursor_*.pt"), reverse=True)
+    if yolo_models:
+        yolo_model_name = yolo_models[0].stem
+
+    # Cache stats
+    cache = _load_yolo_cache()
+    total_cached = len(cache)
+    detected_count = sum(1 for v in cache.values() if v.get("yolo_detected"))
+    enrichment_sources = {}
+    for v in cache.values():
+        src = v.get("enrichment_source", "none")
+        enrichment_sources[src] = enrichment_sources.get(src, 0) + 1
+
+    # Count total samples
+    total_samples = 0
+    index_path = _VALIDATION_SAMPLES_DIR / "index.jsonl"
+    if index_path.exists():
+        with open(index_path) as f:
+            total_samples = sum(1 for line in f if line.strip())
+
+    enrichment_running = (_yolo_enrich_proc is not None and
+                          _yolo_enrich_proc.poll() is None)
+
+    return {
+        "yolo_model": yolo_model_name,
+        "total_cached": total_cached,
+        "total_samples": total_samples,
+        "detected_count": detected_count,
+        "enrichment_sources": enrichment_sources,
+        "enrichment_running": enrichment_running,
+        "pct_enriched": round(total_cached / total_samples * 100, 1)
+                        if total_samples > 0 else 0,
+    }
+
+
+@app.post("/api/validation/batch_review")
+async def batch_review(request: Request):
+    """Batch review multiple samples at once.
+
+    Body: {"filenames": ["pos_001.png", "neg_002.png"], "action": "correct"}
+    """
+    data = await request.json()
+    filenames = data.get("filenames", [])
+    action = data.get("action")
+
+    valid_actions = ("correct", "wrong", "confusing", "delete")
+    if not filenames or action not in valid_actions:
+        return {"error": f"Need filenames list and action ({'/'.join(valid_actions)})"}
+
+    count = 0
+    with open(_VALIDATION_REVIEWS_PATH, "a") as f:
+        for fn in filenames:
+            review = {
+                "filename": fn,
+                "action": action,
+                "timestamp": time.time(),
+            }
+            if action == "wrong":
+                current_label = "pos" if fn.startswith("pos_") else "neg"
+                review["corrected_label"] = "neg" if current_label == "pos" else "pos"
+            if action == "confusing":
+                review["is_confusing_to_human"] = True
+            f.write(json.dumps(review) + "\n")
+            count += 1
+
+    return {"ok": True, "count": count, "action": action}
+
+
+@app.post("/api/validation/batch_tag")
+async def batch_tag(request: Request):
+    """Batch tag multiple samples at once.
+
+    Body: {"filenames": ["pos_001.png", "neg_002.png"], "tags": {"cursor_type": "arrow"}}
+    """
+    data = await request.json()
+    filenames = data.get("filenames", [])
+    tags = data.get("tags", {})
+
+    if not filenames or not tags:
+        return {"error": "Need filenames list and tags dict"}
+
+    count = 0
+    with open(_VALIDATION_REVIEWS_PATH, "a") as f:
+        for fn in filenames:
+            record = {
+                "filename": fn,
+                "action": "tag",
+                "tags": tags,
+                "timestamp": time.time(),
+            }
+            f.write(json.dumps(record) + "\n")
+            count += 1
+
+    return {"ok": True, "count": count}
+
+
+@app.get("/api/validation/suggest/{filename}")
+async def suggest_tags(filename: str):
+    """Return YOLO + CNN analysis and suggested tags for a sample."""
+    if "/" in filename or ".." in filename:
+        return {"error": "Invalid filename"}
+
+    # Load YOLO cache
+    yolo_cache = _load_yolo_cache()
+    yolo_data = yolo_cache.get(filename, {})
+
+    # Get CNN confidence
+    cnn_conf = None
+    cnn_predicted = None
+    model = recognizer._cnn_model if recognizer else None
+    if model is not None:
+        import torch
+        patch_path = _VALIDATION_SAMPLES_DIR / filename
+        if patch_path.exists():
+            patch = cv2.imread(str(patch_path), cv2.IMREAD_GRAYSCALE)
+            if patch is not None and patch.shape == (64, 64):
+                tensor = torch.from_numpy(
+                    patch.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0)
+                with torch.no_grad():
+                    cnn_conf = model(tensor).item()
+                    cnn_predicted = "pos" if cnn_conf > 0.5 else "neg"
+
+    # Build suggestions based on available data
+    suggestions = {}
+    yolo_conf = yolo_data.get("yolo_conf")
+
+    if yolo_data.get("yolo_detected"):
+        # Suggest cursor_type based on bbox aspect ratio
+        bbox = yolo_data.get("yolo_bbox")
+        if bbox:
+            w = bbox[2] - bbox[0]
+            h = bbox[3] - bbox[1]
+            aspect = w / h if h > 0 else 1.0
+            if aspect > 1.3:
+                suggestions["cursor_type"] = "hand"
+            elif aspect < 0.7:
+                suggestions["cursor_type"] = "ibeam"
+            else:
+                suggestions["cursor_type"] = "arrow"
+
+        # Suggest visibility based on confidence
+        if yolo_conf and yolo_conf > 0.7:
+            suggestions["visibility"] = "full"
+        elif yolo_conf and yolo_conf > 0.4:
+            suggestions["visibility"] = "partial"
+
+    return {
+        "yolo": {
+            "detected": yolo_data.get("yolo_detected", False),
+            "conf": yolo_conf,
+            "bbox": yolo_data.get("yolo_bbox"),
+            "source": yolo_data.get("enrichment_source"),
+            "model": yolo_data.get("yolo_model"),
+        },
+        "cnn": {
+            "conf": round(cnn_conf, 4) if cnn_conf is not None else None,
+            "predicted": cnn_predicted,
+        },
+        "suggestions": suggestions,
+    }
+
+
+@app.get("/api/validation/heartbeat")
+async def validation_heartbeat():
+    """Lightweight heartbeat for auto-refresh polling.
+
+    Returns model version, sample count, YOLO stats for change detection.
+    """
+    # Model version
+    model_version = recognizer.model_version if recognizer else "none"
+
+    # Quick sample count
+    sample_count = 0
+    index_path = _VALIDATION_SAMPLES_DIR / "index.jsonl"
+    if index_path.exists():
+        with open(index_path) as f:
+            sample_count = sum(1 for line in f if line.strip())
+
+    # YOLO cache count
+    yolo_cache_count = 0
+    if _YOLO_CACHE_PATH.exists():
+        with open(_YOLO_CACHE_PATH) as f:
+            yolo_cache_count = sum(1 for line in f if line.strip())
+
+    # YOLO model name
+    yolo_model = None
+    yolo_models = sorted(_YOLO_MODELS_DIR.glob("cursor_*.pt"), reverse=True)
+    if yolo_models:
+        yolo_model = yolo_models[0].stem
+
+    enrichment_running = (_yolo_enrich_proc is not None and
+                          _yolo_enrich_proc.poll() is None)
+
+    return {
+        "model_version": model_version,
+        "sample_count": sample_count,
+        "yolo_model": yolo_model,
+        "yolo_cache_count": yolo_cache_count,
+        "enrichment_running": enrichment_running,
     }
 
 

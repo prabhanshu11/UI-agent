@@ -12,6 +12,17 @@ var comparisonActive = false;
 var runtimeModelVersion = '';
 var comparisonModelVersion = '';
 
+// Batch selection state
+var selectedFiles = new Set();
+
+// Auto-refresh state
+var heartbeatInterval = null;
+var lastHeartbeat = {};
+var refreshTimer = null;
+
+// Preview suggestion state
+var pendingSuggestions = {};
+
 function toggleInfo() {
     var bar = document.getElementById('info-bar');
     bar.classList.toggle('collapsed');
@@ -85,6 +96,39 @@ async function setComparisonModel(version) {
     }
 }
 
+// ── YOLO status ──────────────────────────────────────────────────
+
+async function loadYoloStatus() {
+    try {
+        var res = await fetch('/api/validation/yolo_status');
+        var data = await res.json();
+        var versionEl = document.getElementById('yolo-model-version');
+        var statusEl = document.getElementById('yolo-enrich-status');
+        if (versionEl) versionEl.textContent = data.yolo_model || 'none';
+        if (statusEl) {
+            var parts = [];
+            if (data.total_cached > 0) {
+                parts.push(data.pct_enriched + '% enriched');
+                parts.push(data.detected_count + ' detected');
+            }
+            if (data.enrichment_running) parts.push('RUNNING...');
+            statusEl.textContent = parts.join(' | ');
+        }
+    } catch(e) { /* ignore */ }
+}
+
+async function triggerYoloEnrich() {
+    if (!confirm('Run YOLO batch enrichment on all samples?')) return;
+    var res = await fetch('/api/validation/yolo_enrich', {method: 'POST'});
+    var data = await res.json();
+    if (data.status === 'already_running') {
+        showToast('YOLO enrichment already running (PID: ' + data.pid + ')');
+    } else {
+        showToast('YOLO enrichment started (PID: ' + data.pid + ')');
+    }
+    loadYoloStatus();
+}
+
 // ── Confidence bar helper ─────────────────────────────────────────
 
 function makeConfBar(confVal, label) {
@@ -112,6 +156,61 @@ function makeConfBar(confVal, label) {
     return row;
 }
 
+function makeYoloBar(sample) {
+    var td = document.createElement('td');
+    td.className = 'yolo-cell';
+
+    if (!sample.yolo_enriched) {
+        var dash = document.createElement('span');
+        dash.className = 'yolo-badge yolo-none';
+        dash.textContent = '\u2014';
+        dash.title = 'Not yet enriched with YOLO';
+        td.appendChild(dash);
+        return td;
+    }
+
+    // Detection badge
+    var badge = document.createElement('span');
+    if (sample.yolo_detected) {
+        badge.className = 'yolo-badge yolo-yes';
+        badge.textContent = '\u2713';
+        badge.title = 'YOLO detected cursor';
+    } else {
+        badge.className = 'yolo-badge yolo-no';
+        badge.textContent = '\u2717';
+        badge.title = 'YOLO: no cursor detected';
+    }
+    td.appendChild(badge);
+
+    // Confidence bar (blue tint)
+    if (sample.yolo_conf != null) {
+        var bar = document.createElement('div');
+        bar.className = 'conf-bar yolo-bar';
+        var fill = document.createElement('div');
+        var v = sample.yolo_conf;
+        fill.className = 'conf-fill yolo-fill';
+        fill.style.width = Math.round(v * 100) + '%';
+        bar.appendChild(fill);
+        td.appendChild(bar);
+
+        var txt = document.createElement('span');
+        txt.className = 'conf-val';
+        txt.textContent = v.toFixed(3);
+        td.appendChild(txt);
+    }
+
+    // Disagree indicator
+    if (sample.yolo_disagrees) {
+        var dis = document.createElement('span');
+        dis.className = 'yolo-disagree-badge';
+        dis.textContent = '!';
+        dis.title = 'YOLO disagrees with label';
+        td.appendChild(dis);
+    }
+
+    return td;
+}
+
 // ── Samples table ─────────────────────────────────────────────────
 
 async function loadSamples() {
@@ -128,7 +227,7 @@ async function loadSamples() {
 
     // Update filter counts in tabs
     var fc = data.filter_counts || {};
-    ['all','unreviewed','reviewed','claude','disagreement','needs_review'].forEach(function(k) {
+    ['all','unreviewed','reviewed','claude','disagreement','needs_review','yolo_detected','yolo_disagrees'].forEach(function(k) {
         var el = document.getElementById('cnt-' + k);
         if (el) el.textContent = '(' + (fc[k] || 0) + ')';
     });
@@ -154,6 +253,19 @@ async function loadSamples() {
         if (s.review) tr.classList.add('reviewed');
         tr.id = 'row-' + s.filename;
         tr.dataset.idx = idx;
+
+        // Batch checkbox
+        var tdCheck = document.createElement('td');
+        tdCheck.className = 'batch-td';
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.className = 'batch-cb';
+        cb.checked = selectedFiles.has(s.filename);
+        cb.addEventListener('change', function() {
+            toggleSelection(s.filename, cb.checked);
+        });
+        tdCheck.appendChild(cb);
+        tr.appendChild(tdCheck);
 
         // Patch image — show context crop as thumbnail if available, 64x64 otherwise
         var tdImg = document.createElement('td');
@@ -269,6 +381,9 @@ async function loadSamples() {
         }
         tr.appendChild(tdConf);
 
+        // YOLO column
+        tr.appendChild(makeYoloBar(s));
+
         // Priority
         var tdPri = document.createElement('td');
         tdPri.style.color = '#666';
@@ -323,6 +438,8 @@ async function loadSamples() {
 
         tbody.appendChild(tr);
     });
+
+    updateBatchBar();
 }
 
 async function loadStats() {
@@ -470,6 +587,91 @@ function setSource(s) { currentSource = s; currentPage = 0; loadSamples(); }
 function nextPage() { if (currentPage < totalPages - 1) { currentPage++; loadSamples(); } }
 function prevPage() { if (currentPage > 0) { currentPage--; loadSamples(); } }
 
+// ── Batch selection ───────────────────────────────────────────────
+
+function toggleSelection(filename, checked) {
+    if (checked) {
+        selectedFiles.add(filename);
+    } else {
+        selectedFiles.delete(filename);
+    }
+    updateBatchBar();
+}
+
+function toggleSelectAll(checked) {
+    currentSamples.forEach(function(s) {
+        if (checked) selectedFiles.add(s.filename);
+        else selectedFiles.delete(s.filename);
+    });
+    // Update checkboxes in DOM
+    document.querySelectorAll('.batch-cb').forEach(function(cb) {
+        cb.checked = checked;
+    });
+    updateBatchBar();
+}
+
+function clearSelection() {
+    selectedFiles.clear();
+    document.querySelectorAll('.batch-cb').forEach(function(cb) {
+        cb.checked = false;
+    });
+    document.getElementById('select-all').checked = false;
+    updateBatchBar();
+}
+
+function updateBatchBar() {
+    var bar = document.getElementById('batch-bar');
+    var count = selectedFiles.size;
+    if (count > 0) {
+        bar.style.display = 'flex';
+        document.getElementById('batch-count').textContent = count + ' selected';
+    } else {
+        bar.style.display = 'none';
+    }
+}
+
+async function batchReview(action) {
+    if (selectedFiles.size === 0) return;
+    var filenames = Array.from(selectedFiles);
+    if (!confirm(action.toUpperCase() + ' ' + filenames.length + ' samples?')) return;
+    var res = await fetch('/api/validation/batch_review', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({filenames: filenames, action: action})
+    });
+    var data = await res.json();
+    if (data.ok) {
+        showToast('Batch ' + action + ': ' + data.count + ' samples');
+        clearSelection();
+        loadSamples();
+    }
+}
+
+function batchTagPrompt() {
+    if (selectedFiles.size === 0) return;
+    var schema = window.tagSchema || {};
+    var cols = Object.keys(schema);
+    if (cols.length === 0) { showToast('No tag schema loaded'); return; }
+    var col = prompt('Tag column (' + cols.join(', ') + '):');
+    if (!col || !schema[col]) { showToast('Invalid column'); return; }
+    var vals = schema[col].values;
+    var val = prompt('Value (' + vals.join(', ') + '):');
+    if (!val) return;
+
+    var filenames = Array.from(selectedFiles);
+    var tags = {};
+    tags[col] = val;
+    fetch('/api/validation/batch_tag', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({filenames: filenames, tags: tags})
+    }).then(function(r) { return r.json(); }).then(function(d) {
+        if (d.ok) {
+            showToast('Batch tagged ' + d.count + ' samples: ' + col + '=' + val);
+            clearSelection();
+            loadSamples();
+        }
+    });
+}
+
 // ── Preview overlay ───────────────────────────────────────────────
 
 var previewFilename = null;
@@ -511,6 +713,75 @@ function showPreview(filename) {
         if (parts.length) info = parts.join(' | ') + '\n' + info;
     }
     document.getElementById('preview-info').textContent = info;
+
+    // Fetch YOLO suggestions
+    loadSuggestions(filename);
+}
+
+async function loadSuggestions(filename) {
+    var sugBar = document.getElementById('suggestion-bar');
+    var sugInfo = document.getElementById('suggestion-info');
+    var sugTags = document.getElementById('suggestion-tags');
+    var acceptBtn = document.getElementById('accept-suggestions-btn');
+
+    sugBar.style.display = 'none';
+    sugTags.replaceChildren();
+    acceptBtn.style.display = 'none';
+    pendingSuggestions = {};
+
+    try {
+        var res = await fetch('/api/validation/suggest/' + encodeURIComponent(filename));
+        var data = await res.json();
+
+        var parts = [];
+        if (data.yolo && data.yolo.detected) {
+            parts.push('YOLO: cursor detected (' + (data.yolo.conf ? (data.yolo.conf * 100).toFixed(0) + '%' : '?') + ' conf)');
+        } else if (data.yolo && data.yolo.source) {
+            parts.push('YOLO: no cursor detected');
+        }
+        if (data.cnn && data.cnn.conf != null) {
+            parts.push('CNN: ' + data.cnn.predicted + ' (' + (data.cnn.conf * 100).toFixed(0) + '% conf)');
+        }
+
+        if (parts.length === 0) return;
+
+        sugInfo.textContent = parts.join(' | ');
+        sugBar.style.display = 'flex';
+
+        // Show suggested tags
+        var suggestions = data.suggestions || {};
+        var sugKeys = Object.keys(suggestions);
+        if (sugKeys.length > 0) {
+            pendingSuggestions = suggestions;
+            var label = document.createElement('span');
+            label.className = 'suggestion-label';
+            label.textContent = 'Suggested: ';
+            sugTags.appendChild(label);
+            sugKeys.forEach(function(k) {
+                var chip = document.createElement('span');
+                chip.className = 'tag-chip suggestion-chip';
+                chip.textContent = k + '=' + suggestions[k];
+                sugTags.appendChild(chip);
+            });
+            acceptBtn.style.display = 'inline-block';
+        }
+    } catch(e) { /* ignore fetch errors */ }
+}
+
+async function acceptSuggestions() {
+    if (!previewFilename || Object.keys(pendingSuggestions).length === 0) return;
+    var res = await fetch('/api/validation/tag', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({filename: previewFilename, tags: pendingSuggestions})
+    });
+    if (res.ok) {
+        showToast('Applied suggestions to ' + previewFilename);
+        document.getElementById('accept-suggestions-btn').style.display = 'none';
+        // Update suggestion chips to show applied
+        document.querySelectorAll('.suggestion-chip').forEach(function(c) {
+            c.classList.add('active');
+        });
+    }
 }
 
 // Click-to-annotate cursor tip
@@ -543,6 +814,75 @@ document.getElementById('preview-img').addEventListener('click', async function(
     }
 });
 
+// ── Auto-refresh polling ──────────────────────────────────────────
+
+function startHeartbeat() {
+    if (heartbeatInterval) return;
+    heartbeatInterval = setInterval(checkHeartbeat, 30000);
+}
+
+async function checkHeartbeat() {
+    try {
+        var res = await fetch('/api/validation/heartbeat');
+        var data = await res.json();
+
+        if (lastHeartbeat.model_version &&
+            (data.model_version !== lastHeartbeat.model_version ||
+             data.sample_count !== lastHeartbeat.sample_count)) {
+            showRefreshBar('Data changed: model=' + data.model_version +
+                ', samples=' + data.sample_count);
+        }
+
+        // Update YOLO enrichment running status
+        if (data.enrichment_running) {
+            var el = document.getElementById('yolo-enrich-status');
+            if (el) {
+                el.textContent = 'ENRICHING... (' + data.yolo_cache_count + ' cached)';
+                el.style.color = '#FF9800';
+            }
+        } else if (lastHeartbeat.enrichment_running && !data.enrichment_running) {
+            // Enrichment just finished
+            loadYoloStatus();
+            showToast('YOLO enrichment complete');
+        }
+
+        lastHeartbeat = data;
+    } catch(e) { /* ignore */ }
+}
+
+function showRefreshBar(msg) {
+    var bar = document.getElementById('refresh-bar');
+    document.getElementById('refresh-msg').textContent = msg;
+    bar.style.display = 'flex';
+    // Auto-refresh after 5s
+    var countdown = 5;
+    var cdEl = document.getElementById('refresh-countdown');
+    cdEl.textContent = '(' + countdown + 's)';
+    refreshTimer = setInterval(function() {
+        countdown--;
+        cdEl.textContent = '(' + countdown + 's)';
+        if (countdown <= 0) {
+            doRefresh();
+        }
+    }, 1000);
+}
+
+function dismissRefresh() {
+    document.getElementById('refresh-bar').style.display = 'none';
+    if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
+}
+
+function doRefresh() {
+    dismissRefresh();
+    loadModels();
+    loadSamples();
+    loadStats();
+    loadYoloStatus();
+    showToast('Refreshed');
+}
+
+// ── Toast ─────────────────────────────────────────────────────────
+
 function showToast(msg) {
     var t = document.getElementById('toast');
     t.textContent = msg;
@@ -550,10 +890,33 @@ function showToast(msg) {
     setTimeout(function() { t.style.display = 'none'; }, 2000);
 }
 
-// Keyboard shortcuts for fast tagging
+// ── Keyboard shortcuts ────────────────────────────────────────────
+
 document.addEventListener('keydown', function(e) {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
     var rows = document.querySelectorAll('#samples-body tr');
+
+    // Batch shortcuts with Shift
+    if (e.shiftKey) {
+        if (e.key === 'A' || e.key === 'a') {
+            e.preventDefault();
+            var allSelected = selectedFiles.size === currentSamples.length;
+            toggleSelectAll(!allSelected);
+            document.getElementById('select-all').checked = !allSelected;
+            return;
+        }
+        if (e.key === '!') { // Shift+1
+            e.preventDefault();
+            batchReview('correct');
+            return;
+        }
+        if (e.key === '@') { // Shift+2
+            e.preventDefault();
+            batchReview('wrong');
+            return;
+        }
+    }
+
     if (e.key === 'j' || e.key === 'ArrowDown') {
         e.preventDefault();
         if (selectedRow < rows.length - 1) {
@@ -570,6 +933,13 @@ document.addEventListener('keydown', function(e) {
             rows[selectedRow].style.outline = '1px solid #ff4444';
             rows[selectedRow].scrollIntoView({block: 'nearest'});
         }
+    } else if (e.key === 'x' && selectedRow >= 0 && selectedRow < currentSamples.length) {
+        // Toggle selection of current row
+        var fn = currentSamples[selectedRow].filename;
+        var isSelected = selectedFiles.has(fn);
+        toggleSelection(fn, !isSelected);
+        var cb = rows[selectedRow].querySelector('.batch-cb');
+        if (cb) cb.checked = !isSelected;
     } else if (selectedRow >= 0 && selectedRow < currentSamples.length) {
         var fn = currentSamples[selectedRow].filename;
         if (e.key === '1') reviewSample(fn, 'correct');
@@ -583,5 +953,7 @@ document.addEventListener('keydown', function(e) {
 
 // ── Init ──────────────────────────────────────────────────────────
 loadModels();
+loadYoloStatus();
 loadTagSchema().then(function() { loadSamples(); });
 loadStats();
+startHeartbeat();
