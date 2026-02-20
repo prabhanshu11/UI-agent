@@ -3363,7 +3363,7 @@ def _build_profiler_state() -> dict:
         "avg_serial_ms": round(sum(serial_vals) / len(serial_vals), 1) if serial_vals else None,
         "avg_visual_drift_px": round(sum(drift_vals) / len(drift_vals), 1) if drift_vals else None,
         "clock_calibration": sess.get("clock_calibration"),
-        "last_clock_read": sess.get("clock_reads", [None])[-1],
+        "last_clock_read": (sess.get("clock_reads") or [None])[-1],
     }
 
 
