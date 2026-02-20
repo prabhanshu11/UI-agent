@@ -3370,26 +3370,38 @@ def _build_profiler_state() -> dict:
 def _ocr_windows_clock(frame: np.ndarray) -> Optional[str]:
     """Read the Windows taskbar clock from bottom-right of HDMI frame.
 
-    Returns time string like '15:30' or '15:30:45', or None if OCR fails.
-    Works on Windows 11 taskbar layout at 1920x1080.
+    Returns time string like '4:44 PM' or '16:44', or None if OCR fails.
+    Tuned for Windows 11 taskbar at 1920x1080 (light text on dark bg).
     """
     try:
         import pytesseract
     except ImportError:
         return None
     h, w = frame.shape[:2]
-    # Windows 11 clock region — bottom-right corner
-    clock_roi = frame[h - 35:h - 5, w - 130:w - 5]
-    # Upscale 3x for better OCR on small text
-    clock_big = cv2.resize(clock_roi, None, fx=3, fy=3,
+    # Tight crop: just the time+date text, excluding system tray icons.
+    # Windows 11 clock is ~80px wide in the bottom-right corner.
+    clock_roi = frame[h - 35:h - 5, w - 80:w - 5]
+    # Upscale 4x for small text
+    clock_big = cv2.resize(clock_roi, None, fx=4, fy=4,
                            interpolation=cv2.INTER_CUBIC)
     gray = cv2.cvtColor(clock_big, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+    _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+    # Pad with black border — tesseract needs margin around text
+    padded = cv2.copyMakeBorder(thresh, 20, 20, 20, 20,
+                                cv2.BORDER_CONSTANT, value=0)
+    # Whitelist constrains to clock characters — prevents colon→period misread
     text = pytesseract.image_to_string(
-        thresh,
-        config='--psm 7 -c tessedit_char_whitelist=0123456789:APMapm ')
-    match = _re.search(r'(\d{1,2}:\d{2}(?::\d{2})?)', text.strip())
-    return match.group(1) if match else None
+        padded,
+        config='--psm 6 -c tessedit_char_whitelist=0123456789:/APMapm ')
+    # Flexible regex: allow . or : as separator, or no separator (e.g. "446")
+    match = _re.search(r'(\d{1,2})[.:]\s*(\d{2})\s*(AM|PM|am|pm)?', text.strip())
+    if not match:
+        return None
+    hour, minute, ampm = match.group(1), match.group(2), match.group(3)
+    result = f"{hour}:{minute}"
+    if ampm:
+        result += f" {ampm.upper()}"
+    return result
 
 
 def _record_frame_correlation(sess: dict):
