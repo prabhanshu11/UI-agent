@@ -360,6 +360,10 @@ _PT_SCREENSHOT_INTERVAL_S = 5.0
 _PT_CNN_SAMPLE_INTERVAL_S = 10.0
 _PT_CLOCK_OCR_INTERVAL_S = 30.0  # OCR Windows clock every 30s for drift detection
 
+# Browser recording (MediaRecorder chunks uploaded to server)
+_BROWSER_REC_DIR = Path("data/recordings")
+_active_recordings: dict[str, dict] = {}  # recording_id -> {file, path, start_time, ...}
+
 # Noise grid: shared between daemon loop (writer) and probe (reader)
 _NOISE_GRID_W, _NOISE_GRID_H = 48, 27
 _NOISE_CELL_PX = 40
@@ -2865,6 +2869,10 @@ async def get_state():
             } if _passthrough_session else None,
             "profiler": _build_profiler_state() if _passthrough_session else None,
         },
+        "esp32": {
+            "x": mouse.estimated_x if mouse else 0,
+            "y": mouse.estimated_y if mouse else 0,
+        },
         "fps": round(state.fps, 1),
         "frame_count": state.frame_count,
         "claude_detector": claude_detector.to_dict() if claude_detector else None,
@@ -4423,6 +4431,84 @@ async def passthrough_clock_sync_status():
         "transitions": len(_clock_sync_results),
         "results": _clock_sync_results[-5:] if _clock_sync_results else [],
     }
+
+
+# ── Browser Recording (server-side) ──────────────────────────
+
+
+@app.post("/api/recording/start")
+async def recording_start(request: Request):
+    """Start a server-side browser recording. Returns recording_id."""
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    recording_id = f"browser_{ts}"
+    filename = f"{recording_id}.webm"
+    filepath = _BROWSER_REC_DIR / filename
+    _BROWSER_REC_DIR.mkdir(parents=True, exist_ok=True)
+
+    fh = open(filepath, "wb")
+    _active_recordings[recording_id] = {
+        "file": fh,
+        "path": filepath,
+        "start_time": time.time(),
+        "start_utc": utc_now_ms(),
+        "bytes_written": 0,
+        "chunk_count": 0,
+        "codec": data.get("codec", "vp9"),
+        "resolution": data.get("resolution", "1920x1080"),
+        "fps": data.get("fps", 5),
+        "overlays_enabled": data.get("overlays", {}),
+    }
+    print(f"[recording] Started: {filename}")
+    return {"recording_id": recording_id, "filename": filename}
+
+
+@app.post("/api/recording/chunk")
+async def recording_chunk(request: Request, id: str = ""):
+    """Append a binary WebM chunk to an active recording."""
+    if id not in _active_recordings:
+        return {"error": "Unknown recording_id"}
+    body = await request.body()
+    rec = _active_recordings[id]
+    rec["file"].write(body)
+    rec["bytes_written"] += len(body)
+    rec["chunk_count"] += 1
+    return {"ok": True, "bytes": rec["bytes_written"]}
+
+
+@app.post("/api/recording/stop")
+async def recording_stop(request: Request, id: str = ""):
+    """Finalize a recording: close file, write sidecar JSON metadata."""
+    if id not in _active_recordings:
+        return {"error": "Unknown recording_id"}
+    rec = _active_recordings.pop(id)
+    rec["file"].close()
+    duration_s = round(time.time() - rec["start_time"], 1)
+    sidecar = {
+        "recording_id": id,
+        "filename": rec["path"].name,
+        "start_utc": rec["start_utc"],
+        "stop_utc": utc_now_ms(),
+        "duration_s": duration_s,
+        "bytes": rec["bytes_written"],
+        "chunks": rec["chunk_count"],
+        "codec": rec["codec"],
+        "resolution": rec["resolution"],
+        "fps": rec["fps"],
+        "overlays_enabled": rec["overlays_enabled"],
+        "source": "browser_mediarecorder",
+    }
+    sidecar_path = rec["path"].with_suffix(".json")
+    sidecar_path.write_text(json.dumps(sidecar, indent=2))
+    print(f"[recording] Stopped: {rec['path'].name} "
+          f"({rec['bytes_written'] / 1024 / 1024:.1f}MB, {duration_s}s, "
+          f"{rec['chunk_count']} chunks)")
+    return {"ok": True, "filename": rec["path"].name,
+            "duration_s": duration_s, "bytes": rec["bytes_written"]}
 
 
 @app.get("/api/config")

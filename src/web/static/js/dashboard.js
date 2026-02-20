@@ -5,11 +5,16 @@ var frozenState = null;
 var tagCount = 0;
 var lastState = null;
 var tagState = {};
+var _blobRows = [];       // Pre-allocated 8 <tr> elements
+var _blobRowsBuilt = false;
 
 // ── Initialize ───────────────────────────────────────────────
 function initDashboard() {
     // Init canvas feed
     CanvasFeed.init('canvas-container');
+
+    // Init sub-panels (mouse trails + model inference)
+    if (typeof SubPanels !== 'undefined') SubPanels.init();
 
     // Build overlay toggle panel
     buildOverlayToggles();
@@ -38,7 +43,6 @@ function buildOverlayToggles() {
     if (!panel) return;
     var names = {
         motionBlobs: 'Motion Blobs',
-        yoloBbox: 'YOLO Box',
         silhouetteRoi: 'Sil. ROI',
         cursorCrosshair: 'Crosshair',
         trackingHud: 'HUD Text',
@@ -73,6 +77,9 @@ async function updateState() {
 
         // Feed the canvas overlay system
         CanvasFeed.updateState(s);
+
+        // Update sub-panels (mouse trails + model inference)
+        if (typeof SubPanels !== 'undefined') SubPanels.update(s);
 
         document.getElementById('fps-display').textContent = s.fps + ' FPS';
 
@@ -158,26 +165,42 @@ async function updateState() {
         document.getElementById('tier-3').classList.toggle('active', m === 'lissajous');
 
         document.getElementById('blob-count').textContent = s.blob_count;
+        // Stable blob table: 8 pre-allocated rows, update in-place (no DOM rebuild)
         var tbody = document.getElementById('blob-list');
-        while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
-        if (s.blobs.length > 0) {
-            s.blobs.slice(0, 8).forEach(function(b, i) {
+        if (!_blobRowsBuilt) {
+            while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+            for (var ri = 0; ri < 8; ri++) {
                 var tr = document.createElement('tr');
-                if (i === 0) tr.style.color = '#2ecc71';
+                tr.className = 'blob-empty';
                 var td1 = document.createElement('td');
-                td1.textContent = '(' + b.centroid[0] + ', ' + b.centroid[1] + ')';
+                td1.textContent = '\u2014';
                 var td2 = document.createElement('td');
-                td2.textContent = b.pixel_count + 'px';
+                td2.textContent = '\u2014';
                 var td3 = document.createElement('td');
-                td3.textContent = Math.round(b.angle * 180 / Math.PI) + '\u00B0';
+                td3.textContent = '\u2014';
                 tr.appendChild(td1); tr.appendChild(td2); tr.appendChild(td3);
                 tbody.appendChild(tr);
-            });
-        } else {
-            var tr = document.createElement('tr');
-            var td = document.createElement('td');
-            td.colSpan = 3; td.style.color = '#444'; td.textContent = 'No motion';
-            tr.appendChild(td); tbody.appendChild(tr);
+                _blobRows.push({tr: tr, td1: td1, td2: td2, td3: td3});
+            }
+            _blobRowsBuilt = true;
+        }
+        var blobs = s.blobs ? s.blobs.slice(0, 8) : [];
+        for (var bi = 0; bi < 8; bi++) {
+            var row = _blobRows[bi];
+            if (bi < blobs.length) {
+                var b = blobs[bi];
+                row.td1.textContent = '(' + b.centroid[0] + ', ' + b.centroid[1] + ')';
+                row.td2.textContent = b.pixel_count + 'px';
+                row.td3.textContent = Math.round(b.angle * 180 / Math.PI) + '\u00B0';
+                row.tr.className = '';
+                row.tr.style.color = bi === 0 ? '#2ecc71' : '';
+            } else {
+                row.td1.textContent = '\u2014';
+                row.td2.textContent = '\u2014';
+                row.td3.textContent = '\u2014';
+                row.tr.className = 'blob-empty';
+                row.tr.style.color = '';
+            }
         }
 
         // Jitter panel
@@ -672,6 +695,8 @@ function flushPassthroughBatch() {
     var dy = ptBatchDy;
     ptBatchDx = 0;
     ptBatchDy = 0;
+    // Record delta for passthrough trail visualization
+    if (typeof SubPanels !== 'undefined') SubPanels.recordPassthroughDelta(dx, dy);
     fetch('/api/passthrough/move', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},

@@ -49,7 +49,7 @@ var CanvasOverlays = (function() {
     function draw(ctx, state, w, h) {
         if (overlays.silhouetteRoi) drawSilhouetteRoi(ctx, state);
         if (overlays.motionBlobs)   drawMotionBlobs(ctx, state);
-        if (overlays.yoloBbox)      drawYoloBbox(ctx, state);
+        // YOLO bbox moved to model inference sub-panel (sub-panels.js)
         if (overlays.cursorCrosshair) drawCursorCrosshair(ctx, state, w, h);
         if (overlays.trackingHud)   drawTrackingHud(ctx, state, w, h);
         if (overlays.visionDot)     drawVisionDot(ctx, state);

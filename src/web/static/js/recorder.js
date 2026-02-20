@@ -1,18 +1,19 @@
 /* recorder.js — MediaRecorder wrapper for canvas stream recording.
  *
  * Records the composite view (frame + overlays) as WebM VP9 at 5fps.
+ * Chunks are uploaded to the server via /api/recording/chunk (no browser download).
  * The recording captures exactly what the user sees, including active overlay toggles.
  */
 
 var Recorder = (function() {
     var mediaRecorder = null;
-    var chunks = [];
     var recording = false;
     var startTime = 0;
     var timerInterval = null;
     var compositeCanvas = null;
     var compositeCtx = null;
     var drawInterval = null;
+    var recordingId = null;
 
     function toggle() {
         if (recording) {
@@ -48,18 +49,18 @@ var Recorder = (function() {
 
         // Capture stream from composite canvas
         var stream = compositeCanvas.captureStream(5);
-        chunks = [];
 
+        var codec = 'video/webm;codecs=vp9';
         try {
             mediaRecorder = new MediaRecorder(stream, {
-                mimeType: 'video/webm;codecs=vp9',
+                mimeType: codec,
                 videoBitsPerSecond: 2000000,
             });
         } catch (e) {
-            // Fallback to default codec
+            codec = 'video/webm';
             try {
                 mediaRecorder = new MediaRecorder(stream, {
-                    mimeType: 'video/webm',
+                    mimeType: codec,
                     videoBitsPerSecond: 2000000,
                 });
             } catch (e2) {
@@ -68,29 +69,77 @@ var Recorder = (function() {
             }
         }
 
-        mediaRecorder.ondataavailable = function(e) {
-            if (e.data.size > 0) chunks.push(e.data);
-        };
+        updateStatus('Starting server recording...');
 
-        mediaRecorder.onstop = function() {
-            var blob = new Blob(chunks, { type: 'video/webm' });
-            downloadBlob(blob);
+        // Start server-side recording, then hook up MediaRecorder
+        fetch('/api/recording/start', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                codec: codec,
+                resolution: size.w + 'x' + size.h,
+                fps: 5,
+                overlays: typeof CanvasOverlays !== 'undefined' ?
+                    CanvasOverlays.getAll() : {},
+            })
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            recordingId = d.recording_id;
+
+            // Stream each chunk to server
+            mediaRecorder.ondataavailable = function(e) {
+                if (e.data.size > 0 && recordingId) {
+                    fetch('/api/recording/chunk?id=' +
+                        encodeURIComponent(recordingId), {
+                        method: 'POST',
+                        body: e.data,
+                    });
+                }
+            };
+
+            // On stop, finalize server-side
+            mediaRecorder.onstop = function() {
+                if (recordingId) {
+                    fetch('/api/recording/stop?id=' +
+                        encodeURIComponent(recordingId), {
+                        method: 'POST',
+                    })
+                    .then(function(r) { return r.json(); })
+                    .then(function(d) {
+                        if (d.ok) {
+                            updateStatus('Saved: ' + d.filename +
+                                ' (' + (d.bytes / 1024 / 1024).toFixed(1) + 'MB)');
+                        } else {
+                            updateStatus('Error: ' + (d.error || 'unknown'));
+                        }
+                        setTimeout(function() { updateStatus(''); }, 5000);
+                    })
+                    .catch(function() {
+                        updateStatus('Upload error');
+                        setTimeout(function() { updateStatus(''); }, 3000);
+                    });
+                }
+                recordingId = null;
+                cleanup();
+            };
+
+            mediaRecorder.start(1000);
+            recording = true;
+            startTime = Date.now();
+
+            var btn = document.getElementById('rec-btn');
+            if (btn) {
+                btn.textContent = 'STOP';
+                btn.classList.add('recording');
+            }
+            updateStatus('Recording (server)...');
+            timerInterval = setInterval(updateTimer, 100);
+        })
+        .catch(function(err) {
+            updateStatus('Server error: ' + err.message);
             cleanup();
-        };
-
-        mediaRecorder.start(1000); // Collect data every second
-        recording = true;
-        startTime = Date.now();
-
-        // UI
-        var btn = document.getElementById('rec-btn');
-        if (btn) {
-            btn.textContent = 'STOP';
-            btn.classList.add('recording');
-        }
-        updateStatus('Recording...');
-
-        timerInterval = setInterval(updateTimer, 100);
+        });
     }
 
     function stop() {
@@ -111,7 +160,6 @@ var Recorder = (function() {
         if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
         compositeCanvas = null;
         compositeCtx = null;
-        updateStatus('');
         var dur = document.getElementById('rec-duration');
         if (dur) dur.textContent = '';
     }
@@ -128,20 +176,6 @@ var Recorder = (function() {
     function updateStatus(msg) {
         var el = document.getElementById('rec-status');
         if (el) el.textContent = msg;
-    }
-
-    function downloadBlob(blob) {
-        var url = URL.createObjectURL(blob);
-        var a = document.createElement('a');
-        var ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-        a.href = url;
-        a.download = 'kvm-recording-' + ts + '.webm';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-        updateStatus('Downloaded');
-        setTimeout(function() { updateStatus(''); }, 3000);
     }
 
     return {

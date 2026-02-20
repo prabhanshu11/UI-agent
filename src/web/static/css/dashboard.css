@@ -9,10 +9,19 @@
     height: calc(100vh - 50px);
 }
 
+/* ── Feed column (main feed + sub-panels) ─────────────────── */
+.feed-column {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
 /* ── Feed area (canvas container) ──────────────────────────── */
 .feed {
     background: #000; overflow: hidden;
     display: flex; justify-content: center; align-items: center;
+    flex: 1;
+    min-height: 0;
 }
 .canvas-wrapper {
     position: relative; width: 100%; height: 100%;
@@ -23,14 +32,46 @@
     width: 100%;
     height: 100%;
     max-width: 100%;
-    max-height: calc(100vh - 50px);
+    max-height: calc(100vh - 50px - 200px);
     overflow: hidden;
 }
 #canvas-container canvas {
     display: block;
     max-width: 100%;
-    max-height: calc(100vh - 50px);
+    max-height: calc(100vh - 50px - 200px);
     object-fit: contain;
+}
+
+/* ── Sub-panels row ───────────────────────────────────────── */
+.sub-panels {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 1px;
+    height: 200px;
+    min-height: 200px;
+    background: #0a0a0f;
+    border-top: 1px solid #1a1a25;
+}
+.sub-panel {
+    background: #101018;
+    position: relative;
+    overflow: hidden;
+}
+.sub-panel-title {
+    position: absolute;
+    top: 4px;
+    left: 8px;
+    font-size: 0.55rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #444;
+    z-index: 1;
+    pointer-events: none;
+}
+.sub-panel canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
 }
 #pause-overlay {
     display: none; position: absolute; top: 0; left: 0; right: 0; bottom: 0;
@@ -81,6 +122,8 @@
     padding: 2px 6px; border-bottom: 1px solid #1a1a25;
 }
 .blob-table td { padding: 2px 6px; font-variant-numeric: tabular-nums; }
+.blob-table tr.blob-empty td { color: #222; }
+.blob-table tr.blob-fade td { transition: color 0.3s; color: #333; }
 
 /* ── Jitter bar ────────────────────────────────────────────── */
 .jitter-bar {

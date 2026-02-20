@@ -26,12 +26,28 @@
         </div>
     </div>
     <div class="main">
-        <div class="feed">
-            <div class="canvas-wrapper">
-                <div id="canvas-container">
-                    <!-- canvas-feed.js creates frame-canvas + overlay-canvas here -->
+        <div class="feed-column">
+            <div class="feed">
+                <div class="canvas-wrapper">
+                    <div id="canvas-container">
+                        <!-- canvas-feed.js creates frame-canvas + overlay-canvas here -->
+                    </div>
+                    <div id="pause-overlay">PAUSED &mdash; TAG &amp; RESUME</div>
                 </div>
-                <div id="pause-overlay">PAUSED &mdash; TAG &amp; RESUME</div>
+            </div>
+            <div class="sub-panels">
+                <div class="sub-panel" id="panel-blob-map">
+                    <div class="sub-panel-title">Motion Blobs</div>
+                    <canvas id="blob-map-canvas"></canvas>
+                </div>
+                <div class="sub-panel" id="panel-model-inference">
+                    <div class="sub-panel-title">Model Inference</div>
+                    <canvas id="inference-canvas"></canvas>
+                </div>
+                <div class="sub-panel" id="panel-mouse-trails">
+                    <div class="sub-panel-title">Mouse Trails</div>
+                    <canvas id="trails-canvas"></canvas>
+                </div>
             </div>
         </div>
         <div class="sidebar">
@@ -274,6 +290,7 @@
     <script src="/static/js/canvas-overlays.js"></script>
     <script src="/static/js/canvas-feed.js"></script>
     <script src="/static/js/recorder.js"></script>
+    <script src="/static/js/sub-panels.js"></script>
     <script src="/static/js/dashboard.js"></script>
 </body>
 </html>
