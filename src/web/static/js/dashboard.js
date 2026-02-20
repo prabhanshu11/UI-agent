@@ -167,6 +167,95 @@ async function updateState() {
             ptStats.style.display = 'none';
         }
 
+        // Profiler panel
+        var profPanel = document.getElementById('profiler-panel');
+        if (s.passthrough && s.passthrough.profiler) {
+            profPanel.style.display = 'block';
+            var prof = s.passthrough.profiler;
+            // Avg serial latency
+            var avgMs = document.getElementById('prof-avg-ms');
+            if (prof.avg_serial_ms !== null) {
+                avgMs.textContent = prof.avg_serial_ms;
+                avgMs.style.color = prof.avg_serial_ms < 20 ? '#2ecc71' :
+                    prof.avg_serial_ms < 50 ? '#f1c40f' : '#e74c3c';
+            } else {
+                avgMs.textContent = '--';
+            }
+            // Avg visual drift
+            var avgDrift = document.getElementById('prof-avg-drift');
+            if (prof.avg_visual_drift_px !== null) {
+                avgDrift.textContent = prof.avg_visual_drift_px;
+                avgDrift.style.color = prof.avg_visual_drift_px < 5 ? '#2ecc71' :
+                    prof.avg_visual_drift_px < 15 ? '#f1c40f' : '#e74c3c';
+            } else {
+                avgDrift.textContent = '--';
+            }
+            // Clock calibration status
+            var clockStatus = document.getElementById('prof-clock-status');
+            if (prof.last_clock_read) {
+                clockStatus.textContent = 'Win ' + prof.last_clock_read.windows_time;
+                clockStatus.style.color = '#2ecc71';
+            } else if (prof.clock_calibration) {
+                clockStatus.textContent = 'Cal ' + prof.clock_calibration.windows_time;
+                clockStatus.style.color = '#f1c40f';
+            } else {
+                clockStatus.textContent = 'Not calibrated';
+                clockStatus.style.color = '#555';
+            }
+            // Last actions table
+            var actionsEl = document.getElementById('prof-actions');
+            while (actionsEl.firstChild) actionsEl.removeChild(actionsEl.firstChild);
+            if (prof.last_actions && prof.last_actions.length > 0) {
+                prof.last_actions.forEach(function(a) {
+                    var row = document.createElement('div');
+                    row.style.display = 'flex';
+                    row.style.justifyContent = 'space-between';
+                    row.style.padding = '1px 0';
+                    row.style.borderBottom = '1px solid #222';
+                    var left = document.createElement('span');
+                    left.textContent = a.action;
+                    left.style.color = '#888';
+                    var mid = document.createElement('span');
+                    var msColor = a.serial_ms < 20 ? '#2ecc71' :
+                        a.serial_ms < 50 ? '#f1c40f' : '#e74c3c';
+                    mid.textContent = a.serial_ms + 'ms';
+                    mid.style.color = msColor;
+                    if (a.chunks) mid.textContent += ' (' + a.chunks + ' chunks)';
+                    var right = document.createElement('span');
+                    if (a.visual_drift_px !== undefined) {
+                        var driftColor = a.visual_drift_px < 0 ? '#555' :
+                            a.visual_drift_px < 5 ? '#2ecc71' :
+                            a.visual_drift_px < 15 ? '#f1c40f' : '#e74c3c';
+                        right.textContent = a.visual_drift_px < 0 ? 'no motion' :
+                            a.visual_drift_px + 'px drift';
+                        right.style.color = driftColor;
+                    }
+                    row.appendChild(left);
+                    row.appendChild(mid);
+                    row.appendChild(right);
+                    actionsEl.appendChild(row);
+                });
+            }
+            // Timing bars
+            var barsEl = document.getElementById('prof-timing-bars');
+            while (barsEl.firstChild) barsEl.removeChild(barsEl.firstChild);
+            if (prof.last_actions && prof.last_actions.length > 0) {
+                prof.last_actions.forEach(function(a) {
+                    var bar = document.createElement('div');
+                    bar.style.height = '3px';
+                    bar.style.marginBottom = '1px';
+                    bar.style.borderRadius = '1px';
+                    var w = Math.min(100, (a.serial_ms / 100) * 100);
+                    bar.style.width = w + '%';
+                    bar.style.background = a.serial_ms < 20 ? '#2ecc71' :
+                        a.serial_ms < 50 ? '#f1c40f' : '#e74c3c';
+                    barsEl.appendChild(bar);
+                });
+            }
+        } else if (profPanel) {
+            profPanel.style.display = s.passthrough && s.passthrough.active ? 'block' : 'none';
+        }
+
         // YOLO panel
         if (s.yolo) {
             var yoloStatus = document.getElementById('yolo-status');
@@ -529,6 +618,27 @@ function flushPassthroughBatch() {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({dx: dx, dy: dy})
     });
+}
+
+function calibrateClock() {
+    var btn = event.target;
+    btn.textContent = '...';
+    btn.disabled = true;
+    fetch('/api/passthrough/calibrate_clock', {method: 'POST'})
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            if (d.windows_time) {
+                btn.textContent = 'Win: ' + d.windows_time;
+                setTimeout(function() { btn.textContent = 'Calibrate'; btn.disabled = false; }, 3000);
+            } else {
+                btn.textContent = d.error || 'Failed';
+                setTimeout(function() { btn.textContent = 'Calibrate'; btn.disabled = false; }, 2000);
+            }
+        })
+        .catch(function() {
+            btn.textContent = 'Calibrate';
+            btn.disabled = false;
+        });
 }
 
 function updatePassthroughUI() {

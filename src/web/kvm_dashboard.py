@@ -27,6 +27,7 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse, FileRes
 from fastapi.staticfiles import StaticFiles
 
 import httpx
+import re as _re
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -355,6 +356,7 @@ _passthrough_lock = threading.Lock()
 _passthrough_session: Optional[dict] = None  # Active recording session
 _PT_SCREENSHOT_INTERVAL_S = 5.0
 _PT_CNN_SAMPLE_INTERVAL_S = 10.0
+_PT_CLOCK_OCR_INTERVAL_S = 30.0  # OCR Windows clock every 30s for drift detection
 
 # Noise grid: shared between daemon loop (writer) and probe (reader)
 _NOISE_GRID_W, _NOISE_GRID_H = 48, 27
@@ -2884,6 +2886,7 @@ async def get_state():
                 "screenshots": _passthrough_session["screenshot_count"],
                 "cnn_samples": _passthrough_session["cnn_sample_count"],
             } if _passthrough_session else None,
+            "profiler": _build_profiler_state() if _passthrough_session else None,
         },
         "fps": round(state.fps, 1),
         "frame_count": state.frame_count,
@@ -3340,10 +3343,77 @@ def _passthrough_read_frame() -> tuple[bytes | None, np.ndarray | None]:
     return jpeg, arr
 
 
+def _build_profiler_state() -> dict:
+    """Build profiler summary for state API response."""
+    sess = _passthrough_session
+    if not sess:
+        return {}
+    timings = sess.get("timings", [])
+    last_10 = timings[-10:]
+    # Compute averages
+    serial_vals = [t["serial_ms"] for t in timings if "serial_ms" in t]
+    drift_vals = [t["visual_drift_px"] for t in timings
+                  if "visual_drift_px" in t and t["visual_drift_px"] >= 0]
+    return {
+        "last_actions": [
+            {k: v for k, v in t.items() if k not in ("t_receive", "t_serial_done")}
+            for t in last_10
+        ],
+        "total_actions": len(timings),
+        "avg_serial_ms": round(sum(serial_vals) / len(serial_vals), 1) if serial_vals else None,
+        "avg_visual_drift_px": round(sum(drift_vals) / len(drift_vals), 1) if drift_vals else None,
+        "clock_calibration": sess.get("clock_calibration"),
+        "last_clock_read": sess.get("clock_reads", [None])[-1],
+    }
+
+
+def _ocr_windows_clock(frame: np.ndarray) -> Optional[str]:
+    """Read the Windows taskbar clock from bottom-right of HDMI frame.
+
+    Returns time string like '15:30' or '15:30:45', or None if OCR fails.
+    Works on Windows 11 taskbar layout at 1920x1080.
+    """
+    try:
+        import pytesseract
+    except ImportError:
+        return None
+    h, w = frame.shape[:2]
+    # Windows 11 clock region — bottom-right corner
+    clock_roi = frame[h - 35:h - 5, w - 130:w - 5]
+    # Upscale 3x for better OCR on small text
+    clock_big = cv2.resize(clock_roi, None, fx=3, fy=3,
+                           interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(clock_big, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+    text = pytesseract.image_to_string(
+        thresh,
+        config='--psm 7 -c tessedit_char_whitelist=0123456789:APMapm ')
+    match = _re.search(r'(\d{1,2}:\d{2}(?::\d{2})?)', text.strip())
+    return match.group(1) if match else None
+
+
+def _record_frame_correlation(sess: dict):
+    """Record current daemon frame timestamp for action-frame correlation."""
+    if not daemon_client:
+        return
+    try:
+        ds = daemon_client.read_state()
+        if ds:
+            sess.setdefault("frame_at_action", []).append({
+                "monotonic": time.monotonic(),
+                "daemon_ns": ds.timestamp_ns,
+                "frame_count": ds.frame_count,
+            })
+    except Exception:
+        pass
+
+
 def _passthrough_screenshot_loop():
-    """Background thread: periodic screenshots + CNN samples during passthrough."""
+    """Background thread: periodic screenshots + CNN samples + clock OCR + visual verification."""
     import os
     last_cnn_time = time.monotonic()
+    last_clock_time = 0.0  # Force first OCR immediately
+    prev_frame = None  # For motion blob visual verification
     while _passthrough_active and _passthrough_session:
         time.sleep(_PT_SCREENSHOT_INTERVAL_S)
         if not _passthrough_active or not _passthrough_session:
@@ -3352,6 +3422,8 @@ def _passthrough_screenshot_loop():
         jpeg, frame = _passthrough_read_frame()
         if jpeg is None:
             continue
+        now = time.monotonic()
+
         # Save raw JPEG bytes directly (no re-encode)
         ts = datetime.now().strftime("%H%M%S_%f")[:-3]
         shot_path = os.path.join(sess["screenshots_dir"], f"pt_{ts}.jpg")
@@ -3362,8 +3434,54 @@ def _passthrough_screenshot_loop():
             sess["logger"].log("screenshot", details={"path": shot_path})
         except Exception:
             pass
-        # CNN gold sample every _PT_CNN_SAMPLE_INTERVAL_S
-        now = time.monotonic()
+
+        # ── Visual verification: diff against previous frame ──
+        # If an action happened since last screenshot, check if motion blob
+        # appears near the expected cursor position (dead-reckoning).
+        if prev_frame is not None and frame is not None:
+            timings = sess.get("timings", [])
+            # Check if any action happened since last screenshot
+            recent_actions = [t for t in timings
+                              if t.get("t_receive", 0) > (now - _PT_SCREENSHOT_INTERVAL_S)]
+            if recent_actions:
+                try:
+                    blobs = extract_motion_blobs(prev_frame, frame,
+                                                threshold=25, min_pixels=4)
+                    expected_x = mouse.estimated_x if mouse else 0
+                    expected_y = mouse.estimated_y if mouse else 0
+                    if blobs:
+                        # Find closest blob to expected position
+                        closest = min(blobs, key=lambda b: (
+                            (b.cx - expected_x) ** 2 + (b.cy - expected_y) ** 2))
+                        drift = ((closest.cx - expected_x) ** 2 +
+                                 (closest.cy - expected_y) ** 2) ** 0.5
+                    else:
+                        drift = -1.0  # No motion detected
+                    # Record drift in timings for the most recent action
+                    recent_actions[-1]["visual_drift_px"] = round(drift, 1)
+                    sess["logger"].log("visual_verify", details={
+                        "drift_px": round(drift, 1),
+                        "blob_count": len(blobs),
+                        "expected": (expected_x, expected_y),
+                    })
+                except Exception:
+                    pass
+        prev_frame = frame
+
+        # ── Clock OCR every _PT_CLOCK_OCR_INTERVAL_S ──
+        if frame is not None and (now - last_clock_time) >= _PT_CLOCK_OCR_INTERVAL_S:
+            clock_text = _ocr_windows_clock(frame)
+            if clock_text:
+                clock_record = {
+                    "monotonic": now,
+                    "windows_time": clock_text,
+                    "iso": datetime.now().isoformat(timespec="milliseconds"),
+                }
+                sess.setdefault("clock_reads", []).append(clock_record)
+                sess["logger"].log("clock_ocr", details=clock_record)
+            last_clock_time = now
+
+        # ── CNN gold sample every _PT_CNN_SAMPLE_INTERVAL_S ──
         if collector and mouse and frame is not None and (now - last_cnn_time) >= _PT_CNN_SAMPLE_INTERVAL_S:
             try:
                 collector.collect_from_locate(
@@ -3416,12 +3534,15 @@ async def passthrough_move(request: Request):
         return {"error": "passthrough not active"}
     if not mouse:
         return {"error": "mouse not connected"}
+    t_receive = time.monotonic()
     data = await request.json()
-    dx = int(data.get("dx", 0))
-    dy = int(data.get("dy", 0))
+    orig_dx = int(data.get("dx", 0))
+    orig_dy = int(data.get("dy", 0))
+    dx, dy = orig_dx, orig_dy
     if dx == 0 and dy == 0:
         return {"ok": True}
     # Send directly — ESP32 HID_MAX is 127, chunk if larger
+    chunk_count = 0
     try:
         while abs(dx) > 0 or abs(dy) > 0:
             chunk_x = max(-127, min(127, dx))
@@ -3429,8 +3550,10 @@ async def passthrough_move(request: Request):
             mouse._send_raw(chunk_x, chunk_y)
             dx -= chunk_x
             dy -= chunk_y
+            chunk_count += 1
     except Exception as e:
         return {"error": str(e)}
+    t_serial = time.monotonic()
     # Sync dashboard state from ESP32 dead-reckoning
     with state.lock:
         state.cursor_x = mouse.estimated_x
@@ -3440,10 +3563,22 @@ async def passthrough_move(request: Request):
     if sil_tracker:
         sil_tracker.reset()
     if _passthrough_session:
-        _passthrough_session["logger"].log("mouse_move",
+        sess = _passthrough_session
+        sess["logger"].log("mouse_move",
             position=(mouse.estimated_x, mouse.estimated_y),
-            details={"dx": int(data.get("dx", 0)), "dy": int(data.get("dy", 0))})
-        _passthrough_session["event_count"] += 1
+            details={"dx": orig_dx, "dy": orig_dy})
+        sess["event_count"] += 1
+        # Per-action timing record
+        timing = {
+            "action": "move",
+            "t_receive": t_receive,
+            "t_serial_done": t_serial,
+            "serial_ms": round((t_serial - t_receive) * 1000, 1),
+            "chunks": chunk_count,
+            "dx": orig_dx, "dy": orig_dy,
+        }
+        sess.setdefault("timings", []).append(timing)
+        _record_frame_correlation(sess)
     return {"ok": True}
 
 
@@ -3454,6 +3589,7 @@ async def passthrough_click(request: Request):
         return {"error": "passthrough not active"}
     if not mouse:
         return {"error": "mouse not connected"}
+    t_receive = time.monotonic()
     data = await request.json()
     button = data.get("button", "left")
     if button not in ("left", "right", "middle"):
@@ -3462,14 +3598,26 @@ async def passthrough_click(request: Request):
         mouse.click(button)
     except Exception as e:
         return {"error": str(e)}
+    t_done = time.monotonic()
     # Refresh cursor age on click
     with state.lock:
         state.cursor_age_s = 0.0
     if _passthrough_session:
+        sess = _passthrough_session
         pos = (mouse.estimated_x, mouse.estimated_y)
-        _passthrough_session["logger"].log("click",
+        sess["logger"].log("click",
             position=pos, details={"button": button})
-        _passthrough_session["event_count"] += 1
+        sess["event_count"] += 1
+        # Per-action timing
+        timing = {
+            "action": "click",
+            "t_receive": t_receive,
+            "t_serial_done": t_done,
+            "serial_ms": round((t_done - t_receive) * 1000, 1),
+            "button": button,
+        }
+        sess.setdefault("timings", []).append(timing)
+        _record_frame_correlation(sess)
         # Click = highest-value moment — trigger immediate screenshot + CNN sample
         threading.Thread(
             target=_passthrough_capture_click,
@@ -3486,6 +3634,7 @@ async def passthrough_scroll(request: Request):
         return {"error": "passthrough not active"}
     if not mouse:
         return {"error": "mouse not connected"}
+    t_receive = time.monotonic()
     data = await request.json()
     clicks = int(data.get("clicks", 0))
     if clicks == 0:
@@ -3494,11 +3643,22 @@ async def passthrough_scroll(request: Request):
         mouse.scroll(clicks)
     except Exception as e:
         return {"error": str(e)}
+    t_done = time.monotonic()
     if _passthrough_session:
-        _passthrough_session["logger"].log("scroll",
+        sess = _passthrough_session
+        sess["logger"].log("scroll",
             position=(mouse.estimated_x, mouse.estimated_y),
             details={"clicks": clicks})
-        _passthrough_session["event_count"] += 1
+        sess["event_count"] += 1
+        timing = {
+            "action": "scroll",
+            "t_receive": t_receive,
+            "t_serial_done": t_done,
+            "serial_ms": round((t_done - t_receive) * 1000, 1),
+            "clicks": clicks,
+        }
+        sess.setdefault("timings", []).append(timing)
+        _record_frame_correlation(sess)
     return {"ok": True}
 
 
@@ -3512,6 +3672,7 @@ async def passthrough_key(request: Request):
     global _pi_http_client
     if not _passthrough_active:
         return {"error": "passthrough not active"}
+    t_receive = time.monotonic()
     data = await request.json()
     text = data.get("text", "")
     if not text:
@@ -3526,11 +3687,21 @@ async def passthrough_key(request: Request):
         resp.raise_for_status()
     except Exception as e:
         return {"error": f"Pi keyboard: {e}"}
+    t_done = time.monotonic()
     if _passthrough_session:
-        _passthrough_session["logger"].log("key",
+        sess = _passthrough_session
+        sess["logger"].log("key",
             position=(mouse.estimated_x if mouse else 0, mouse.estimated_y if mouse else 0),
             details={"text": text})
-        _passthrough_session["event_count"] += 1
+        sess["event_count"] += 1
+        timing = {
+            "action": "key",
+            "t_receive": t_receive,
+            "t_serial_done": t_done,
+            "serial_ms": round((t_done - t_receive) * 1000, 1),
+            "text": text,
+        }
+        sess.setdefault("timings", []).append(timing)
     return {"ok": True}
 
 
@@ -3585,6 +3756,11 @@ async def passthrough_toggle(request: Request):
             "screenshot_count": 0,
             "cnn_sample_count": 0,
             "screenshots_dir": str(screenshots_dir),
+            # Profiler data
+            "timings": [],           # Per-action timing records
+            "frame_at_action": [],   # Daemon frame correlation
+            "clock_reads": [],       # Periodic Windows clock OCR
+            "clock_calibration": None,  # From calibrate_clock endpoint
         }
         # Start screenshot capture thread
         threading.Thread(
@@ -3628,6 +3804,36 @@ async def passthrough_toggle(request: Request):
 async def passthrough_status():
     """Get passthrough state."""
     return {"active": _passthrough_active}
+
+
+@app.post("/api/passthrough/calibrate_clock")
+async def passthrough_calibrate_clock():
+    """Capture frame, OCR Windows clock, establish time mapping.
+
+    Returns the calibration record: our monotonic time, daemon timestamp,
+    and the Windows clock string. Call once at session start.
+    """
+    if not daemon_client or not daemon_client.is_running():
+        return {"error": "daemon not running"}
+    _, frame = _passthrough_read_frame()
+    if frame is None:
+        return {"error": "no frame available"}
+    mono = time.monotonic()
+    ds = daemon_client.read_state()
+    daemon_ns = ds.timestamp_ns if ds else 0
+    clock_text = _ocr_windows_clock(frame)
+    if not clock_text:
+        return {"error": "OCR failed — could not read Windows clock"}
+    calibration = {
+        "monotonic": mono,
+        "daemon_ns": daemon_ns,
+        "windows_time": clock_text,
+        "iso": datetime.now().isoformat(timespec="milliseconds"),
+    }
+    if _passthrough_session:
+        _passthrough_session["clock_calibration"] = calibration
+        _passthrough_session["logger"].log("clock_calibration", details=calibration)
+    return calibration
 
 
 @app.get("/api/config")

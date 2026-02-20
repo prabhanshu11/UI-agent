@@ -133,6 +133,18 @@
                 <div id="pt-stats" style="font-size:0.55rem; color:#666; margin-top:3px; display:none;"></div>
                 <div id="passthrough-status" style="font-size:0.6rem; color:#555; margin-top:3px;"></div>
             </div>
+            <!-- Passthrough Profiler -->
+            <div class="panel" id="profiler-panel" style="border-color:#f39c12; display:none;">
+                <div class="panel-title" style="color:#f39c12">Action Profiler</div>
+                <div style="display:flex; gap:8px; margin-bottom:4px; font-size:0.55rem; color:#888;">
+                    <span>Avg: <span id="prof-avg-ms" style="color:#2ecc71">--</span>ms</span>
+                    <span>Drift: <span id="prof-avg-drift" style="color:#888">--</span>px</span>
+                    <span>Clock: <span id="prof-clock-status" style="color:#555">--</span></span>
+                    <button onclick="calibrateClock()" style="background:#f39c12; color:#000; border:none; padding:1px 6px; border-radius:3px; font-size:0.55rem; cursor:pointer;">Calibrate</button>
+                </div>
+                <div id="prof-actions" style="font-size:0.55rem; font-family:monospace; max-height:140px; overflow-y:auto;"></div>
+                <div id="prof-timing-bars" style="margin-top:4px;"></div>
+            </div>
             <!-- CNN -->
             <div class="panel">
                 <div class="panel-title">CNN Cursor Recognition</div>
