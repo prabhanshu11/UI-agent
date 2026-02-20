@@ -2875,15 +2875,31 @@ async def get_validation_samples(page: int = 0, page_size: int = 20,
             else:
                 priority = 4.0
 
+        # Derive origin type from source
+        origin_type = "sensor"
+        if "ground_truth" in entry_source or "claude" in entry_source:
+            origin_type = "ground_truth"
+        elif "live_tag" in entry_source:
+            origin_type = "sensor"
+
+        # CNN prediction label
+        cnn_predicted = None
+        if cnn_conf is not None:
+            cnn_predicted = "pos" if cnn_conf > 0.5 else "neg"
+
+        has_context = (_VALIDATION_SAMPLES_DIR / f"ctx_{filename}").exists()
         scored_entries.append({
             **entry,
             "label": entry_label,  # normalized
             "cnn_confidence": round(cnn_conf, 3) if cnn_conf is not None else None,
+            "cnn_predicted": cnn_predicted,
+            "origin_type": origin_type,
             "priority": round(priority, 3),
             "review": review,
             "cnn_disagrees": cnn_disagrees,
             "needs_review": needs_review,
             "tags": file_tags.get(filename, {}),
+            "has_context": has_context,
         })
 
     # Compute filter counts BEFORE filtering (so tabs show totals)
@@ -2972,6 +2988,24 @@ async def get_validation_patch(filename: str):
     )
 
 
+@app.get("/api/validation/context/{filename}")
+async def get_validation_context(filename: str):
+    """Serve a 256x256 context crop for the validation UI.
+
+    Context crops are saved as ctx_<filename> alongside the 64x64 patches
+    for high-value sources (claude_vision, ground_truth, lissajous).
+    """
+    if "/" in filename or ".." in filename:
+        return {"error": "Invalid filename"}
+    ctx_path = _VALIDATION_SAMPLES_DIR / f"ctx_{filename}"
+    if not ctx_path.exists():
+        return Response(status_code=404)
+    return Response(
+        content=ctx_path.read_bytes(),
+        media_type="image/png",
+    )
+
+
 @app.post("/api/validation/review")
 async def submit_review(request: Request):
     """Submit a review for a sample.
@@ -3039,21 +3073,46 @@ async def submit_tags(request: Request):
     return {"ok": True, "record": record}
 
 
-@app.get("/api/validation/tag_schema")
-async def get_tag_schema():
-    """Return the current tag columns and their possible values.
+_CUSTOM_SCHEMA_PATH = _VALIDATION_SAMPLES_DIR / "custom_schema.jsonl"
 
-    Columns are discovered from existing reviews + a default schema.
-    """
-    default_schema = {
+
+def _load_full_schema() -> dict:
+    """Build merged schema: defaults + custom additions + discovered from reviews."""
+    schema = {
         "quality": {"values": ["ok", "wrong", "unsure"], "color": "#3498db"},
         "confusing": {"values": ["yes", "no"], "color": "#e67e22"},
-        "cursor_type": {"values": ["arrow", "hand", "ibeam", "busy", "crosshair", "move", "unknown"], "color": "#9b59b6"},
+        "cursor_type": {"values": ["arrow", "hand", "ibeam", "busy", "crosshair", "excel_cross", "move", "unknown"], "color": "#9b59b6"},
         "visibility": {"values": ["full", "partial", "hidden", "offscreen"], "color": "#2ecc71"},
-        "background": {"values": ["clean", "noisy", "animated", "textured"], "color": "#e74c3c"},
+        "background": {"values": ["clean", "noisy", "animated", "textured", "text"], "color": "#e74c3c"},
+        "application": {"values": ["excel", "ms_teams", "win_desktop_env", "win_explorer"], "color": "#1abc9c"},
     }
 
-    # Discover extra columns from existing reviews
+    # Merge custom schema additions (append-only log)
+    if _CUSTOM_SCHEMA_PATH.exists():
+        for line in _CUSTOM_SCHEMA_PATH.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+                action = entry.get("action")
+                col = entry.get("column", "")
+                if action == "add_column" and col:
+                    if col not in schema:
+                        schema[col] = {
+                            "values": entry.get("values", []),
+                            "color": entry.get("color", "#888"),
+                        }
+                elif action == "add_value" and col and col in schema:
+                    val = entry.get("value", "")
+                    if val and val not in schema[col]["values"]:
+                        schema[col]["values"].append(val)
+                elif action == "add_value" and col and col not in schema:
+                    # Auto-create column if adding value to non-existent column
+                    schema[col] = {"values": [entry.get("value", "")], "color": "#888"}
+            except Exception:
+                pass
+
+    # Discover extra columns/values from existing reviews
     if _VALIDATION_REVIEWS_PATH.exists():
         for line in _VALIDATION_REVIEWS_PATH.read_text().splitlines():
             if not line.strip():
@@ -3062,14 +3121,74 @@ async def get_tag_schema():
                 r = json.loads(line)
                 if r.get("action") == "tag" and "tags" in r:
                     for k, v in r["tags"].items():
-                        if k not in default_schema:
-                            default_schema[k] = {"values": [], "color": "#888"}
-                        if v not in default_schema[k]["values"]:
-                            default_schema[k]["values"].append(v)
+                        if k not in schema:
+                            schema[k] = {"values": [], "color": "#888"}
+                        if v and v not in schema[k]["values"]:
+                            schema[k]["values"].append(v)
             except Exception:
                 pass
 
-    return {"schema": default_schema}
+    return schema
+
+
+@app.get("/api/validation/tag_schema")
+async def get_tag_schema():
+    """Return the current tag columns and their possible values."""
+    return {"schema": _load_full_schema()}
+
+
+@app.post("/api/validation/schema/add_column")
+async def add_schema_column(request: Request):
+    """Add a new tag column to the schema.
+
+    Body: {"column": "scene_type", "values": ["static", "scrolling"], "color": "#e67e22"}
+    """
+    body = await request.json()
+    col = body.get("column", "").strip()
+    values = body.get("values", [])
+    color = body.get("color", "#888")
+
+    if not col:
+        return {"error": "column name required"}
+    if not isinstance(values, list) or len(values) == 0:
+        return {"error": "at least one value required"}
+
+    record = {
+        "action": "add_column",
+        "column": col,
+        "values": values,
+        "color": color,
+        "timestamp": time.time(),
+    }
+    with open(_CUSTOM_SCHEMA_PATH, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+    return {"ok": True, "column": col, "values": values}
+
+
+@app.post("/api/validation/schema/add_value")
+async def add_schema_value(request: Request):
+    """Add a new value to an existing tag column.
+
+    Body: {"column": "background", "value": "gradient"}
+    """
+    body = await request.json()
+    col = body.get("column", "").strip()
+    val = body.get("value", "").strip()
+
+    if not col or not val:
+        return {"error": "column and value required"}
+
+    record = {
+        "action": "add_value",
+        "column": col,
+        "value": val,
+        "timestamp": time.time(),
+    }
+    with open(_CUSTOM_SCHEMA_PATH, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+    return {"ok": True, "column": col, "value": val}
 
 
 @app.post("/api/validation/retrain")

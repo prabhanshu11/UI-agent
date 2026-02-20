@@ -25,6 +25,7 @@ import numpy as np
 
 PATCH_SIZE = 64
 HALF = PATCH_SIZE // 2
+CONTEXT_SIZE = 256  # Larger crop saved alongside patch for high-value sources
 
 # Default data directory (relative to project root)
 _PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -93,6 +94,30 @@ class CursorSampleCollector:
         cv2.imwrite(str(path), patch)
         return filename
 
+    def _save_context_crop(
+        self, frame: np.ndarray, x: int, y: int, filename: str,
+    ) -> bool:
+        """Save a 256x256 context crop centered at (x, y), clamped to frame edges."""
+        ctx = extract_gray_patch(frame, x, y, size=CONTEXT_SIZE)
+        if ctx is None:
+            # Clamped extraction: pad with black if near edges
+            half = CONTEXT_SIZE // 2
+            h, w = frame.shape[:2]
+            x0 = max(0, x - half)
+            y0 = max(0, y - half)
+            x1 = min(w, x + half)
+            y1 = min(h, y + half)
+            region = frame[y0:y1, x0:x1]
+            if len(region.shape) == 3:
+                region = cv2.cvtColor(region, cv2.COLOR_RGB2GRAY)
+            ctx = np.zeros((CONTEXT_SIZE, CONTEXT_SIZE), dtype=np.uint8)
+            ox = max(0, half - x)
+            oy = max(0, half - y)
+            ctx[oy:oy + region.shape[0], ox:ox + region.shape[1]] = region
+        ctx_filename = "ctx_" + filename
+        cv2.imwrite(str(self.data_dir / ctx_filename), ctx)
+        return True
+
     def _append_index(self, filename: str, label: str, x: int, y: int,
                       source: str, confidence: float,
                       cursor_type: Optional[str] = None,
@@ -149,6 +174,7 @@ class CursorSampleCollector:
         h, w = frame.shape[:2]
 
         # Positive: cursor patch
+        _high_value = source in ("claude_vision", "ground_truth", "lissajous")
         patch = extract_gray_patch(frame, x, y)
         if patch is not None:
             filename = self._save_patch(patch, "pos")
@@ -160,6 +186,8 @@ class CursorSampleCollector:
                     distance_from_estimated=distance_from_estimated,
                 )
                 saved += 1
+                if _high_value:
+                    self._save_context_crop(frame, x, y, filename)
 
         # Negatives: random positions far from cursor
         neg_source = f"{source}_neg"

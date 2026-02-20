@@ -37,11 +37,25 @@ tr:hover { background: #12121a; }
 .source.ground-truth { color: #2ecc71; }
 .confusing-badge { color: #FF9800; font-size: 10px; margin-left: 4px; }
 .disagree-badge { color: #ff5252; font-size: 10px; margin-left: 4px; }
+/* CNN agreement badges */
+.cnn-badge { font-size: 9px; margin-left: 4px; padding: 1px 5px; border-radius: 3px; font-weight: bold; }
+.cnn-badge.disagree { background: #ff525220; color: #ff5252; border: 1px solid #ff525240; }
+.cnn-badge.agree { background: #4CAF5010; color: #4CAF5080; border: 1px solid #4CAF5020; font-weight: normal; }
+/* Origin type badges */
+.origin-badge { font-size: 8px; padding: 1px 4px; border-radius: 2px; margin-right: 4px; font-weight: bold; letter-spacing: 0.5px; display: inline-block; vertical-align: middle; }
+.origin-badge.ground_truth { background: #2ecc7120; color: #2ecc71; border: 1px solid #2ecc7140; }
+.origin-badge.sensor { background: #3498db20; color: #3498db; border: 1px solid #3498db40; }
+.origin-badge.prediction { background: #f39c1220; color: #f39c12; border: 1px solid #f39c1240; }
 .conf-bar { width: 60px; height: 6px; background: #1a1a24; border-radius: 3px; display: inline-block; vertical-align: middle; margin-right: 6px; }
 .conf-fill { height: 100%; border-radius: 3px; }
 .conf-high { background: #4CAF50; }
 .conf-mid { background: #FF9800; }
 .conf-low { background: #ff5252; }
+/* Schema add buttons */
+.schema-add-btn { background: none; border: 1px dashed #333; color: #555; font-size: 10px; width: 18px; height: 18px; border-radius: 50%; cursor: pointer; margin-left: 4px; padding: 0; line-height: 16px; vertical-align: middle; }
+.schema-add-btn:hover { border-color: #888; color: #ccc; background: #1a1a24; }
+.schema-add-col-btn { background: none; border: 1px dashed #444; color: #555; font-size: 9px; padding: 2px 8px; border-radius: 3px; cursor: pointer; font-family: inherit; }
+.schema-add-col-btn:hover { border-color: #888; color: #ccc; background: #1a1a24; }
 .actions-cell { display: flex; gap: 4px; }
 .btn-ok { border-color: #4CAF50; color: #4CAF50; }
 .btn-ok:hover { background: #4CAF5020; }
@@ -59,8 +73,12 @@ tr:hover { background: #12121a; }
 .toast { position: fixed; bottom: 20px; right: 20px; padding: 10px 16px; background: #1a1a24; border: 1px solid #4CAF50; color: #4CAF50; border-radius: 4px; font-size: 12px; display: none; z-index: 100; }
 .preview-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.85); z-index: 200; justify-content: center; align-items: center; flex-direction: column; gap: 12px; }
 .preview-overlay.active { display: flex; }
+.preview-panels { display: flex; gap: 24px; align-items: flex-start; }
+.preview-panel { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.preview-panel-label { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 1px; }
 .preview-container { position: relative; }
-.preview-overlay img { width: 512px; height: 512px; image-rendering: pixelated; border: 2px solid #444; cursor: crosshair; }
+.preview-overlay #preview-img { width: 512px; height: 512px; image-rendering: pixelated; border: 2px solid #444; cursor: crosshair; }
+.context-img { width: 512px; height: 512px; image-rendering: pixelated; border: 2px solid #555; cursor: default; }
 .tip-marker { position: absolute; width: 12px; height: 12px; border: 2px solid #ff0; border-radius: 50%; transform: translate(-50%, -50%); pointer-events: none; box-shadow: 0 0 8px #ff0; }
 .preview-info { color: #888; font-size: 12px; text-align: center; }
 .preview-info em { color: #ff0; font-style: normal; }

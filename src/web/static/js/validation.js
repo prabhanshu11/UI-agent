@@ -60,11 +60,16 @@ async function loadSamples() {
         tr.id = 'row-' + s.filename;
         tr.dataset.idx = idx;
 
-        // Patch image
+        // Patch image — show context crop as thumbnail if available, 64x64 otherwise
         var tdImg = document.createElement('td');
         var img = document.createElement('img');
         img.className = 'patch-img';
-        img.src = '/api/validation/patch/' + encodeURIComponent(s.filename);
+        if (s.has_context) {
+            img.src = '/api/validation/context/' + encodeURIComponent(s.filename);
+            img.title = '256x256 context (click for full view)';
+        } else {
+            img.src = '/api/validation/patch/' + encodeURIComponent(s.filename);
+        }
         img.onclick = function() { showPreview(s.filename); };
         tdImg.appendChild(img);
         tr.appendChild(tdImg);
@@ -81,11 +86,21 @@ async function loadSamples() {
             reviewSpan.textContent = '[' + s.review.action + ']';
             tdLabel.appendChild(reviewSpan);
         }
-        if (s.cnn_disagrees) {
-            var dBadge = document.createElement('span');
-            dBadge.className = 'disagree-badge';
-            dBadge.textContent = 'DISAGREE';
-            tdLabel.appendChild(dBadge);
+        // CNN agreement/disagreement indicator
+        if (s.cnn_predicted) {
+            var cnnBadge = document.createElement('span');
+            if (s.cnn_disagrees) {
+                cnnBadge.className = 'cnn-badge disagree';
+                cnnBadge.textContent = 'CNN\u2192' + s.cnn_predicted.toUpperCase() +
+                    ', Label: ' + s.label.toUpperCase();
+                cnnBadge.title = 'Model predicts ' + s.cnn_predicted +
+                    ' but sample is labeled ' + s.label;
+            } else {
+                cnnBadge.className = 'cnn-badge agree';
+                cnnBadge.textContent = 'CNN \u2713';
+                cnnBadge.title = 'Model agrees with label (' + s.label + ')';
+            }
+            tdLabel.appendChild(cnnBadge);
         }
         if (s.needs_review) {
             var nrBadge = document.createElement('span');
@@ -114,8 +129,15 @@ async function loadSamples() {
         }
         tr.appendChild(tdType);
 
-        // Source
+        // Source + origin badge
         var tdSource = document.createElement('td');
+        // Origin type badge
+        var originBadge = document.createElement('span');
+        originBadge.className = 'origin-badge ' + (s.origin_type || 'sensor');
+        var originLabels = {ground_truth: 'GROUND TRUTH', sensor: 'SENSOR', prediction: 'PREDICTION'};
+        originBadge.textContent = originLabels[s.origin_type] || 'SENSOR';
+        tdSource.appendChild(originBadge);
+        // Source name
         var srcSpan = document.createElement('span');
         var srcClass = 'source';
         if (s.source && s.source.indexOf('claude') >= 0) srcClass += ' claude';
@@ -234,17 +256,78 @@ async function loadTagSchema() {
     var res = await fetch('/api/validation/tag_schema');
     var data = await res.json();
     window.tagSchema = data.schema;
+    // Remove old dynamic headers (on refresh)
+    document.querySelectorAll('.tag-th').forEach(function(el) { el.remove(); });
     var thead = document.querySelector('#samples-table thead tr');
     if (thead) {
         Object.keys(data.schema).forEach(function(col) {
             var th = document.createElement('th');
-            th.textContent = col;
+            th.className = 'tag-th';
             th.style.color = data.schema[col].color;
             th.style.fontSize = '0.65rem';
             th.style.textTransform = 'uppercase';
+            // Column name
+            var nameSpan = document.createElement('span');
+            nameSpan.textContent = col;
+            th.appendChild(nameSpan);
+            // "+" button to add value to this column
+            var addBtn = document.createElement('button');
+            addBtn.className = 'schema-add-btn';
+            addBtn.textContent = '+';
+            addBtn.title = 'Add new value to ' + col;
+            addBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                promptAddValue(col, data.schema[col].color);
+            });
+            th.appendChild(addBtn);
             thead.appendChild(th);
         });
+        // "Add Column" header
+        var addColTh = document.createElement('th');
+        addColTh.className = 'tag-th';
+        var addColBtn = document.createElement('button');
+        addColBtn.className = 'schema-add-col-btn';
+        addColBtn.textContent = '+ Column';
+        addColBtn.title = 'Add a new tag column';
+        addColBtn.addEventListener('click', function() { promptAddColumn(); });
+        addColTh.appendChild(addColBtn);
+        thead.appendChild(addColTh);
     }
+}
+
+function promptAddValue(column, color) {
+    var val = prompt('Add new value to "' + column + '":');
+    if (!val || !val.trim()) return;
+    fetch('/api/validation/schema/add_value', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({column: column, value: val.trim()})
+    }).then(function(r) { return r.json(); }).then(function(d) {
+        if (d.ok) {
+            showToast('Added "' + val.trim() + '" to ' + column);
+            // Reload schema + samples to show new value
+            loadTagSchema().then(function() { loadSamples(); });
+        }
+    });
+}
+
+function promptAddColumn() {
+    var col = prompt('New column name (e.g. "scene_type"):');
+    if (!col || !col.trim()) return;
+    var vals = prompt('Comma-separated values (e.g. "static,scrolling,popup"):');
+    if (!vals || !vals.trim()) return;
+    var valArr = vals.split(',').map(function(v) { return v.trim(); }).filter(Boolean);
+    if (valArr.length === 0) return;
+    var colors = ['#e67e22', '#1abc9c', '#9b59b6', '#e74c3c', '#3498db', '#f39c12'];
+    var color = colors[Object.keys(window.tagSchema || {}).length % colors.length];
+    fetch('/api/validation/schema/add_column', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({column: col.trim(), values: valArr, color: color})
+    }).then(function(r) { return r.json(); }).then(function(d) {
+        if (d.ok) {
+            showToast('Added column "' + col.trim() + '" with values: ' + valArr.join(', '));
+            loadTagSchema().then(function() { loadSamples(); });
+        }
+    });
 }
 
 async function reviewSample(filename, action) {
@@ -297,6 +380,19 @@ function showPreview(filename) {
     document.getElementById('preview-img').src = '/api/validation/patch/' + encodeURIComponent(filename);
     document.getElementById('preview-overlay').classList.add('active');
     document.getElementById('preview-info').textContent = 'Click on the cursor tip to annotate. ESC to close.';
+
+    // Show context crop if available
+    var ctxImg = document.getElementById('context-img');
+    var ctxLabel = document.getElementById('context-label');
+    var sample = currentSamples.find(function(s) { return s.filename === filename; });
+    if (sample && sample.has_context) {
+        ctxImg.src = '/api/validation/context/' + encodeURIComponent(filename);
+        ctxImg.style.display = 'block';
+        ctxLabel.style.display = 'block';
+    } else {
+        ctxImg.style.display = 'none';
+        ctxLabel.style.display = 'none';
+    }
 }
 
 // Click-to-annotate cursor tip

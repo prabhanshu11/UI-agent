@@ -125,9 +125,18 @@
 </table>
 <div class="toast" id="toast"></div>
 <div class="preview-overlay" id="preview-overlay">
-  <div class="preview-container" id="preview-container">
-    <img id="preview-img">
-    <div class="tip-marker" id="tip-marker" style="display:none"></div>
+  <div class="preview-panels">
+    <div class="preview-panel">
+      <div class="preview-panel-label">64x64 Patch (CNN input)</div>
+      <div class="preview-container" id="preview-container">
+        <img id="preview-img">
+        <div class="tip-marker" id="tip-marker" style="display:none"></div>
+      </div>
+    </div>
+    <div class="preview-panel">
+      <div class="preview-panel-label" id="context-label" style="display:none">256x256 Context</div>
+      <img id="context-img" class="context-img" style="display:none">
+    </div>
   </div>
   <div class="preview-info" id="preview-info">Click on the <em>cursor tip</em> to annotate (saves immediately). ESC to close.</div>
 </div>
