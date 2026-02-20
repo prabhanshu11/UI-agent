@@ -362,9 +362,86 @@ Experience → human review on /experiences → inform future agent decisions
 6. Filter by "Unreviewed" — verify only untagged sessions show
 7. Check nav link appears on all existing pages (Dashboard, Profiler, Validation, etc.)
 
+## Temporal Calibration — The Core Evidence Problem
+
+### Why this matters
+
+When the system evaluates its own actions as "pass" or "fail," the conclusion is
+unreliable without millisecond-precise temporal evidence. The fundamental problem:
+
+```
+Did focus loss happen BEFORE the movement? → The movement caused focus loss (action error)
+Did focus loss happen AFTER the movement?  → Focus was already lost (perception error)
+These look identical unless you have sub-frame timing correlation.
+```
+
+The agent's timestamps say "I clicked at T=1234ms" and the dashboard says "blob disappeared
+at T=1250ms" — but are those clocks synchronized? What's the latency between the ESP32
+sending a HID report and the HDMI capture card showing the result?
+
+### What the detail panel needs
+
+The experience detail panel should include a **profiler-correlated event timeline** — not just
+the narrative, but the raw evidence:
+
+```
+TIME (ms)     SOURCE          EVENT
+─────────────────────────────────────────────────────
+0.000         ESP32           move(dx=5, dy=0) sent
+16.4          HDMI capture    frame decoded (blob at 502,300)
+18.2          Silhouette      ROI match, confidence 0.82
+33.1          HDMI capture    next frame (blob at 507,300)
+35.0          CNN             inference: 0.91 confidence
+46.8          Dashboard       state poll #1234 served
+```
+
+This timeline cross-references:
+1. **Action timestamps** from ExperienceLogger (when the agent commanded something)
+2. **Pipeline profiler data** from the daemon loop (when each frame was processed)
+3. **Dashboard state polls** (what the frontend was seeing at each moment)
+4. **System clock on Windows** (visible in bottom-right of HDMI capture — the human
+   ground truth for "what time was it on the target machine?")
+
+### Clock synchronization
+
+The system has multiple clocks that may drift:
+
+| Clock | Source | Precision | Known Issues |
+|-------|--------|-----------|-------------|
+| Desktop `CLOCK_REALTIME` | Linux system time | ~1ms | NTP synced |
+| Dashboard UTC (`utc_now_ms()`) | Same Linux clock | ~1ms | Same as above |
+| C daemon timestamps | `clock_gettime(CLOCK_REALTIME)` | ~1μs | Same clock |
+| ESP32 serial | No clock — latency from USB serial | ~2-5ms | USB serial buffer delay |
+| Windows system clock | Visible on HDMI capture | ~1s resolution (taskbar) | May drift from Linux clock |
+| HDMI capture card | V4L2 frame timestamp | ~33ms (30fps) | Frame arrival, not scene time |
+
+**Key insight:** The Windows taskbar clock visible in the HDMI feed is the one ground-truth
+timestamp the human can verify visually. By OCR'ing the taskbar time and comparing it to the
+Linux timestamp when that frame was captured, we can establish the **cross-machine clock offset**.
+
+### Integration with existing profiler
+
+The pipeline profiler (`/profiler` page) already measures per-stage latency. The experience
+validation timeline should incorporate profiler samples that overlap with the experience's
+time window:
+
+```python
+# In the GET /api/experiences/{id}/timeline endpoint:
+# 1. Load experience events (ExperienceLogger JSONL)
+# 2. Load profiler samples within the experience time window
+# 3. Load daemon blob data within the time window (if blob JSONL logging exists)
+# 4. Merge all three into a unified timeline sorted by timestamp
+# 5. Return to frontend for rendering
+```
+
+This gives the human reviewer **the actual evidence** to judge whether a "pass" or "fail"
+evaluation was correct — not just the agent's narrative, but the raw sensor data.
+
 ## Open Questions
 
-- **Event timeline viewer:** Should the detail panel show a scrollable event timeline (like a mini-log viewer) in addition to the narrative? This would show the raw JSONL events with timestamps. More useful for debugging but adds complexity.
+- **Event timeline viewer:** Should the detail panel show a scrollable event timeline (like a mini-log viewer) in addition to the narrative? This would show the raw JSONL events with timestamps. More useful for debugging but adds complexity. **Update: Yes — the profiler-correlated timeline described above IS this timeline. It's essential for validating pass/fail conclusions.**
 - **Screenshot viewer:** When screenshots exist, should they be shown inline in the detail panel or as a separate lightbox/gallery? Inline thumbnails are simpler.
 - **Span-level tagging:** Should individual OTel spans within an experience be independently taggable, or is session-level tagging sufficient for now? Session-level is simpler and probably sufficient for initial version.
 - **Export format:** Should validated experiences be exportable as a training dataset (e.g., JSONL of session + tags) for fine-tuning agent behavior? Useful but not MVP.
+- **Windows clock OCR:** Should the dashboard automatically OCR the Windows taskbar clock from HDMI frames to compute cross-machine clock offset? This would enable fully automatic temporal calibration but adds an OCR dependency.
+- **Profiler sample retention:** Currently profiler samples are only collected during explicit 3-minute profiling runs. Should the daemon continuously log per-frame timing so that ANY experience can be retroactively correlated with pipeline data?
