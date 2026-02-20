@@ -6880,6 +6880,177 @@ def init_hardware():
     print("\nDashboard: http://localhost:8766")
 
 
+# ── Icon Validation endpoints ──────────────────────────────────────
+
+_DATALAKE_DB = Path.home() / "Programs" / "datalake" / "datalake.db"
+
+
+@app.get("/icons")
+async def icons_page():
+    """Waybar icon validation page."""
+    return _serve_page("icons.html")
+
+
+@app.get("/api/icons/validations")
+async def get_icon_validations(page: int = 0, page_size: int = 20,
+                                filter: str = "all",
+                                test_filter: str = "all",
+                                device_filter: str = "all"):
+    """Get paginated icon validation results from datalake."""
+    import sqlite3 as _sql
+    if not _DATALAKE_DB.exists():
+        return {"results": [], "total": 0, "counts": {}}
+
+    conn = _sql.connect(str(_DATALAKE_DB))
+    conn.row_factory = _sql.Row
+
+    # Build WHERE clauses
+    conditions = []
+    params = []
+
+    if filter == "passed":
+        conditions.append("passed = 1")
+    elif filter == "failed":
+        conditions.append("passed = 0")
+    elif filter == "unreviewed":
+        conditions.append("human_review IS NULL")
+
+    if test_filter != "all":
+        conditions.append("test_name = ?")
+        params.append(test_filter)
+
+    if device_filter != "all":
+        conditions.append("source_device = ?")
+        params.append(device_filter)
+
+    where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    # Get total count
+    total = conn.execute(
+        f"SELECT COUNT(*) FROM icon_validations{where}", params
+    ).fetchone()[0]
+
+    # Get filter counts (unfiltered by current filter, but with test/device)
+    base_conditions = []
+    base_params = []
+    if test_filter != "all":
+        base_conditions.append("test_name = ?")
+        base_params.append(test_filter)
+    if device_filter != "all":
+        base_conditions.append("source_device = ?")
+        base_params.append(device_filter)
+    base_where = (" WHERE " + " AND ".join(base_conditions)) if base_conditions else ""
+
+    count_all = conn.execute(
+        f"SELECT COUNT(*) FROM icon_validations{base_where}", base_params
+    ).fetchone()[0]
+    count_passed = conn.execute(
+        f"SELECT COUNT(*) FROM icon_validations{base_where}{' AND ' if base_conditions else ' WHERE '}passed = 1",
+        base_params
+    ).fetchone()[0]
+    count_failed = conn.execute(
+        f"SELECT COUNT(*) FROM icon_validations{base_where}{' AND ' if base_conditions else ' WHERE '}passed = 0",
+        base_params
+    ).fetchone()[0]
+    count_unreviewed = conn.execute(
+        f"SELECT COUNT(*) FROM icon_validations{base_where}{' AND ' if base_conditions else ' WHERE '}human_review IS NULL",
+        base_params
+    ).fetchone()[0]
+
+    # Get page of results
+    rows = conn.execute(
+        f"SELECT * FROM icon_validations{where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        params + [page_size, page * page_size]
+    ).fetchall()
+
+    conn.close()
+
+    results = [dict(r) for r in rows]
+    return {
+        "results": results,
+        "total": total,
+        "counts": {
+            "all": count_all,
+            "passed": count_passed,
+            "failed": count_failed,
+            "unreviewed": count_unreviewed,
+        }
+    }
+
+
+@app.post("/api/icons/review")
+async def review_icon_validation(request: Request):
+    """Submit human review for an icon validation result."""
+    import sqlite3 as _sql
+    data = await request.json()
+    val_id = data.get("id")
+    action = data.get("action")  # 'ok' or 'wrong'
+
+    if not val_id or action not in ("ok", "wrong"):
+        return {"error": "id and action (ok/wrong) required"}, 400
+
+    conn = _sql.connect(str(_DATALAKE_DB))
+    conn.execute(
+        "UPDATE icon_validations SET human_review = ? WHERE id = ?",
+        (action, val_id)
+    )
+    conn.commit()
+    conn.close()
+    return {"success": True}
+
+
+@app.post("/api/icons/ingest")
+async def ingest_icon_results():
+    """Run the icon validation parser to ingest new results from verification log."""
+    import subprocess
+    parser_path = Path.home() / "Programs" / "datalake" / "parsers" / "icon_validation_parser.py"
+    if not parser_path.exists():
+        return {"error": "Parser not found", "count": 0}
+
+    result = subprocess.run(
+        ["python3", str(parser_path)],
+        capture_output=True, text=True, timeout=30
+    )
+
+    # Parse count from output
+    count = 0
+    for line in result.stdout.split('\n'):
+        if 'Ingested' in line:
+            try:
+                count = int(line.split('Ingested')[1].strip().split()[0])
+            except (IndexError, ValueError):
+                pass
+
+    return {"success": result.returncode == 0, "count": count, "output": result.stdout}
+
+
+@app.post("/api/icons/run_test")
+async def run_icon_test():
+    """Trigger a visual icon test run via Docker or native pytest."""
+    import subprocess
+    test_dir = Path.home() / "Programs" / "local-bootstrapping" / "tests" / "visual"
+    run_script = test_dir / "run-tests.sh"
+
+    if run_script.exists():
+        result = subprocess.run(
+            [str(run_script), "-v", "--tb=short"],
+            capture_output=True, text=True, timeout=120
+        )
+    else:
+        result = subprocess.run(
+            ["python3", "-m", "pytest", str(test_dir / "test_waybar_icons.py"),
+             "-v", "--tb=short"],
+            capture_output=True, text=True, timeout=120
+        )
+
+    passed = result.returncode == 0
+    return {
+        "success": passed,
+        "output": result.stdout,
+        "error": result.stderr if not passed else None,
+    }
+
+
 if __name__ == "__main__":
     import argparse
     import uvicorn

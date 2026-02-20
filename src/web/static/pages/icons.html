@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Waybar Icon Validation</title>
+<link rel="stylesheet" href="/static/css/base.css">
+<link rel="stylesheet" href="/static/css/icons.css">
+</head>
+<body>
+<div class="header">
+  <div style="display:flex;align-items:center;gap:16px">
+    <h1>WAYBAR ICON VALIDATION</h1>
+    <div class="nav">
+      <a href="/" class="nav-link">Dashboard</a>
+      <a href="/profiler" class="nav-link">Profiler</a>
+      <a href="/validation" class="nav-link">Validation</a>
+      <a href="/loss_events" class="nav-link">Loss Events</a>
+      <a href="/yolo" class="nav-link">YOLO Gallery</a>
+      <a href="/models" class="nav-link">Models</a>
+      <a href="/icons" class="nav-link active">Icons</a>
+    </div>
+  </div>
+  <div class="actions">
+    <button class="btn btn-run-test" onclick="runTest()">Run Test Now</button>
+    <button class="btn btn-ingest" onclick="ingestResults()">Ingest to Datalake</button>
+  </div>
+</div>
+
+<div class="info-bar" id="info-bar">
+<div class="info-bar-inner">
+  <div>
+    <h3>What is this page</h3>
+    Visual regression testing for waybar status bar icons. Claude Haiku 4.5 analyzes screenshots
+    to verify all expected icons are visible (microphone, clipboard, keyboard layout, bluetooth,
+    wifi, volume, power-profile). Tests run inside Docker containers with host Wayland socket bindings.
+    <ul>
+      <li><b>OK</b> &mdash; Vision model's assessment is correct</li>
+      <li><b>Wrong</b> &mdash; Vision model made an error (false positive/negative)</li>
+    </ul>
+  </div>
+  <div>
+    <h3>Filters</h3>
+    <ul>
+      <li><b>All</b>: every test result</li>
+      <li><b>Passed</b>: tests where all icons were found</li>
+      <li><b>Failed</b>: tests with missing icons</li>
+      <li><b>Unreviewed</b>: results without human review</li>
+    </ul>
+  </div>
+  <div>
+    <h3>Keyboard Shortcuts</h3>
+    <ul>
+      <li><b>J/K</b> &mdash; navigate rows</li>
+      <li><b>1</b> &mdash; mark OK</li>
+      <li><b>2</b> &mdash; mark Wrong</li>
+      <li><b>Space</b> &mdash; expand details</li>
+    </ul>
+  </div>
+</div>
+</div>
+
+<!-- Stats bar -->
+<div class="stats-bar" id="stats-bar"></div>
+
+<!-- Filters -->
+<div class="control-bar">
+  <div class="filter-group">
+    <button class="filter-btn active" data-filter="all" onclick="setFilter('all')">All <span class="count" id="count-all">0</span></button>
+    <button class="filter-btn" data-filter="passed" onclick="setFilter('passed')">Passed <span class="count" id="count-passed">0</span></button>
+    <button class="filter-btn" data-filter="failed" onclick="setFilter('failed')">Failed <span class="count" id="count-failed">0</span></button>
+    <button class="filter-btn" data-filter="unreviewed" onclick="setFilter('unreviewed')">Unreviewed <span class="count" id="count-unreviewed">0</span></button>
+  </div>
+  <div class="filter-group">
+    <select id="test-filter" onchange="setTestFilter(this.value)">
+      <option value="all">All Tests</option>
+      <option value="test_waybar_icons_visible">Icons Visible</option>
+      <option value="test_battery_charging_indicator">Battery/Power</option>
+    </select>
+    <select id="device-filter" onchange="setDeviceFilter(this.value)">
+      <option value="all">All Devices</option>
+      <option value="desktop">Desktop</option>
+      <option value="laptop">Laptop</option>
+    </select>
+  </div>
+</div>
+
+<!-- Results table -->
+<div class="table-wrap">
+  <table id="results-table">
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Timestamp</th>
+        <th>Test</th>
+        <th>Device</th>
+        <th>Model</th>
+        <th>Icons Found</th>
+        <th>Icons Missing</th>
+        <th>Result</th>
+        <th>Review</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody id="results-body"></tbody>
+  </table>
+</div>
+
+<!-- Pagination -->
+<div class="pagination" id="pagination"></div>
+
+<!-- Detail overlay -->
+<div class="overlay" id="detail-overlay" onclick="if(event.target===this)closeDetail()">
+  <div class="detail-panel">
+    <div class="detail-header">
+      <h3 id="detail-title">Validation Detail</h3>
+      <button class="close-btn" onclick="closeDetail()">&times;</button>
+    </div>
+    <div class="detail-body">
+      <div class="detail-meta" id="detail-meta"></div>
+      <div class="detail-icons">
+        <div class="icon-list found" id="detail-found">
+          <h4>Found</h4>
+        </div>
+        <div class="icon-list missing" id="detail-missing">
+          <h4>Missing</h4>
+        </div>
+      </div>
+      <div class="detail-notes" id="detail-notes"></div>
+    </div>
+  </div>
+</div>
+
+<script src="/static/js/icons.js"></script>
+</body>
+</html>
