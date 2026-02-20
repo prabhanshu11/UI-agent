@@ -3370,38 +3370,151 @@ def _build_profiler_state() -> dict:
 def _ocr_windows_clock(frame: np.ndarray) -> Optional[str]:
     """Read the Windows taskbar clock from bottom-right of HDMI frame.
 
-    Returns time string like '4:44 PM' or '16:44', or None if OCR fails.
-    Tuned for Windows 11 taskbar at 1920x1080 (light text on dark bg).
+    Returns time string like '4:57 PM' or '16:44', or None if OCR fails.
+    Tuned for Windows 11 Segoe UI at 1920x1080.
+
+    Pipeline: crop time line only → 5x upscale → threshold → invert
+    (dark-on-white) → PSM 7 single-line + digit/colon whitelist.
     """
     try:
         import pytesseract
     except ImportError:
         return None
     h, w = frame.shape[:2]
-    # Tight crop: just the time+date text, excluding system tray icons.
-    # Windows 11 clock is ~80px wide in the bottom-right corner.
-    clock_roi = frame[h - 35:h - 5, w - 80:w - 5]
-    # Upscale 4x for small text
-    clock_big = cv2.resize(clock_roi, None, fx=4, fy=4,
-                           interpolation=cv2.INTER_CUBIC)
-    gray = cv2.cvtColor(clock_big, cv2.COLOR_BGR2GRAY)
+    # Time line only (top half of clock area) — excludes date and icons
+    time_roi = frame[h - 35:h - 20, w - 80:w - 5]
+    # 5x upscale for thin Segoe UI glyphs
+    big = cv2.resize(time_roi, None, fx=5, fy=5,
+                     interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
-    # Pad with black border — tesseract needs margin around text
-    padded = cv2.copyMakeBorder(thresh, 20, 20, 20, 20,
-                                cv2.BORDER_CONSTANT, value=0)
-    # Whitelist constrains to clock characters — prevents colon→period misread
+    # Invert: tesseract prefers dark text on white background
+    inverted = cv2.bitwise_not(thresh)
+    padded = cv2.copyMakeBorder(inverted, 20, 20, 20, 20,
+                                cv2.BORDER_CONSTANT, value=255)
+    # PSM 7 (single line) + whitelist (no '/' — prevents 7→/ misread)
     text = pytesseract.image_to_string(
         padded,
-        config='--psm 6 -c tessedit_char_whitelist=0123456789:/APMapm ')
-    # Flexible regex: allow . or : as separator, or no separator (e.g. "446")
-    match = _re.search(r'(\d{1,2})[.:]\s*(\d{2})\s*(AM|PM|am|pm)?', text.strip())
+        config='--psm 7 -c tessedit_char_whitelist=0123456789:APMapm ')
+    clean = text.strip().replace(' ', '')
+    # Try with separator first (4:57PM, 4.57PM)
+    match = _re.search(r'(\d{1,2})[.:]\s*(\d{2})\s*(AM|PM|am|pm)?', clean)
+    if not match:
+        # Fallback: no separator (500PM → 5:00 PM) — daemon JPEG can lose colon
+        match = _re.search(r'(\d{1,2})(\d{2})(AM|PM|am|pm)', clean)
     if not match:
         return None
     hour, minute, ampm = match.group(1), match.group(2), match.group(3)
+    if not (0 <= int(minute) <= 59):
+        return None
     result = f"{hour}:{minute}"
     if ampm:
         result += f" {ampm.upper()}"
     return result
+
+
+def _extract_clock_pixels(frame: np.ndarray) -> np.ndarray:
+    """Extract just the clock digit pixels from bottom-right of frame.
+
+    Returns a small grayscale patch that changes when the clock ticks.
+    Uses the full clock area (time + date) for maximum sensitivity —
+    date line changes less often but still useful for transition detection.
+    """
+    h, w = frame.shape[:2]
+    roi = frame[h - 35:h - 5, w - 80:w - 5]
+    return cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+
+# Background clock sync state
+_clock_sync_running = False
+_clock_sync_results: list[dict] = []
+
+
+def _clock_sync_loop(duration_s: float):
+    """Tight loop detecting clock transitions at frame rate (~30fps).
+
+    Pixel-diffs the clock region every frame. When pixels change,
+    OCRs both the previous and current frame to get exact time values.
+    Records transitions with daemon nanosecond timestamps for precise
+    calibration between our clock and the Windows clock.
+
+    At 30fps, each transition is located within a ~33ms window.
+    Over many samples, offset precision improves to single-digit ms.
+    """
+    global _clock_sync_running, _clock_sync_results
+    _clock_sync_running = True
+    _clock_sync_results = []
+
+    if not daemon_client or not daemon_client.is_running():
+        _clock_sync_running = False
+        return
+
+    deadline = time.monotonic() + duration_s
+    prev_gray = None
+    prev_frame = None
+    prev_ds = None
+    transition_count = 0
+    frame_count = 0
+
+    while time.monotonic() < deadline and _clock_sync_running:
+        # Read frame from daemon shared memory (essentially free)
+        try:
+            jpeg = daemon_client.read_jpeg()
+            if jpeg is None:
+                time.sleep(0.005)
+                continue
+            ds = daemon_client.read_state()
+        except Exception:
+            time.sleep(0.01)
+            continue
+
+        mono_now = time.monotonic()
+        frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            continue
+
+        gray = _extract_clock_pixels(frame)
+        frame_count += 1
+
+        if prev_gray is not None:
+            # Fast pixel comparison — detect ANY change in clock region
+            diff = cv2.absdiff(gray, prev_gray)
+            changed_pixels = np.count_nonzero(diff > 25)
+
+            if changed_pixels > 5:
+                # Clock just ticked — OCR both frames
+                old_time = _ocr_windows_clock(prev_frame)
+                new_time = _ocr_windows_clock(frame)
+
+                if old_time and new_time and old_time != new_time:
+                    transition = {
+                        "transition": transition_count,
+                        "old_time": old_time,
+                        "new_time": new_time,
+                        "monotonic": mono_now,
+                        "daemon_ns": ds.timestamp_ns if ds else 0,
+                        "daemon_frame": ds.frame_count if ds else 0,
+                        "prev_daemon_ns": prev_ds.timestamp_ns if prev_ds else 0,
+                        "changed_pixels": int(changed_pixels),
+                        "iso": datetime.now().isoformat(timespec="milliseconds"),
+                    }
+                    _clock_sync_results.append(transition)
+                    transition_count += 1
+                    print(f"[clock_sync] Transition #{transition_count}: "
+                          f"{old_time} → {new_time}  "
+                          f"mono={mono_now:.3f}  "
+                          f"pixels={changed_pixels}")
+
+        prev_gray = gray
+        prev_frame = frame
+        prev_ds = ds
+
+        # Sleep just enough to not busy-spin — daemon is ~30fps
+        time.sleep(0.015)
+
+    _clock_sync_running = False
+    print(f"[clock_sync] Done: {transition_count} transitions in "
+          f"{frame_count} frames over {duration_s}s")
 
 
 def _record_frame_correlation(sess: dict):
@@ -3846,6 +3959,60 @@ async def passthrough_calibrate_clock():
         _passthrough_session["clock_calibration"] = calibration
         _passthrough_session["logger"].log("clock_calibration", details=calibration)
     return calibration
+
+
+@app.post("/api/passthrough/clock_sync")
+async def passthrough_clock_sync(request: Request):
+    """Run high-frequency clock transition detection for precise calibration.
+
+    Monitors daemon frames at ~30fps, detects when the Windows clock
+    second/minute changes by pixel-diffing the clock region. Each
+    transition is timestamped with daemon nanoseconds and monotonic time.
+
+    Body: {"duration_s": 70}  (default 70s — enough for minute boundary)
+    Returns: list of transition records with precise timestamps.
+
+    NOTE: Windows must show seconds (HH:MM:SS) for 1Hz transitions.
+    With HH:MM only, transitions occur every 60s — use duration_s >= 70.
+    """
+    global _clock_sync_running
+    if _clock_sync_running:
+        return {"status": "already_running", "transitions": len(_clock_sync_results)}
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    duration_s = min(float(data.get("duration_s", 70)), 300)  # Cap at 5min
+
+    # Run in background thread (blocking loop)
+    import asyncio
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _clock_sync_loop, duration_s)
+
+    # Store in session if active
+    if _passthrough_session and _clock_sync_results:
+        _passthrough_session["clock_sync"] = _clock_sync_results
+        if _passthrough_session.get("logger"):
+            _passthrough_session["logger"].log("clock_sync_complete", details={
+                "transitions": len(_clock_sync_results),
+                "duration_s": duration_s,
+            })
+
+    return {
+        "transitions": _clock_sync_results,
+        "count": len(_clock_sync_results),
+        "duration_s": duration_s,
+    }
+
+
+@app.get("/api/passthrough/clock_sync_status")
+async def passthrough_clock_sync_status():
+    """Check status of running clock sync."""
+    return {
+        "running": _clock_sync_running,
+        "transitions": len(_clock_sync_results),
+        "results": _clock_sync_results[-5:] if _clock_sync_results else [],
+    }
 
 
 @app.get("/api/config")
