@@ -58,21 +58,22 @@ class CursorPatchDataset(Dataset):
             label = 1.0 if entry["label"] == "pos" else 0.0
 
         if self.augment:
-            patch = self._augment(patch)
+            patch = self._augment(patch, is_positive=(label == 1.0))
 
         tensor = torch.from_numpy(patch.astype(np.float32) / 255.0).unsqueeze(0)
         return tensor, torch.tensor([label], dtype=torch.float32)
 
-    def _augment(self, patch: np.ndarray) -> np.ndarray:
-        """Apply random augmentations: flip, rotation, brightness jitter."""
+    def _augment(self, patch: np.ndarray, is_positive: bool = False) -> np.ndarray:
+        """Apply random augmentations: flip, rotation (neg only), brightness jitter."""
         # Random horizontal flip
         if random.random() > 0.5:
             patch = np.fliplr(patch).copy()
 
-        # Random rotation (0, 90, 180, 270 degrees)
-        k = random.randint(0, 3)
-        if k > 0:
-            patch = np.rot90(patch, k).copy()
+        # Random rotation — ONLY for negatives (cursors have orientation)
+        if not is_positive:
+            k = random.randint(0, 3)
+            if k > 0:
+                patch = np.rot90(patch, k).copy()
 
         # Brightness jitter (+-30)
         jitter = random.randint(-30, 30)
@@ -135,6 +136,13 @@ def load_index(samples_dir: Path) -> list[dict]:
                     entry["label"] = review.get("corrected_label",
                                                 "neg" if entry["label"] == "pos" else "pos")
                     flipped += 1
+
+            # Normalize numeric labels to strings (ground_truth uses 1/0)
+            raw = entry["label"]
+            if raw == 1 or raw == "1":
+                entry["label"] = "pos"
+            elif raw == 0 or raw == "0":
+                entry["label"] = "neg"
 
             entries.append(entry)
 
