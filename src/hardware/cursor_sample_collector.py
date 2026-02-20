@@ -174,7 +174,8 @@ class CursorSampleCollector:
         h, w = frame.shape[:2]
 
         # Positive: cursor patch
-        _high_value = source in ("claude_vision", "ground_truth", "lissajous")
+        _high_value = source in ("claude_vision", "ground_truth", "lissajous",
+                                  "passthrough_gold", "passthrough_click")
         patch = extract_gray_patch(frame, x, y)
         if patch is not None:
             filename = self._save_patch(patch, "pos")

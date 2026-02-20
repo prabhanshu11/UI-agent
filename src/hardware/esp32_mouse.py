@@ -340,6 +340,17 @@ class ESP32Mouse:
             self.ser.flush()
         time.sleep(0.05)
 
+    def scroll(self, clicks: int = -3):
+        """Send scroll wheel event.
+
+        Args:
+            clicks: Scroll amount. Negative = scroll down, positive = scroll up.
+        """
+        with self._serial_lock:
+            self.ser.write(f'SCROLL:{clicks}\n'.encode())
+            self.ser.flush()
+        time.sleep(0.05)
+
     def circle(
         self,
         radius: int = 200,

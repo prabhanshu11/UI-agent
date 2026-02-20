@@ -96,6 +96,43 @@
                 <div class="hw-row"><span class="hw-label">Latency</span><span class="hw-value" id="sil-latency" style="color:#888">&mdash;</span></div>
                 <div class="hw-row"><span class="hw-label">Trusted</span><span class="hw-value" id="sil-trusted" style="color:#888">&mdash;</span></div>
             </div>
+            <!-- Input Passthrough -->
+            <div class="panel" id="passthrough-panel" style="border-color:#e74c3c">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
+                    <div class="panel-title" style="color:#e74c3c; margin-bottom:0">Input Passthrough</div>
+                    <button id="passthrough-btn" onclick="togglePassthrough()"
+                        style="background:#e74c3c; color:#fff; border:none; padding:3px 10px;
+                        cursor:pointer; border-radius:3px; font-weight:bold; font-size:0.65rem;">
+                        ACTIVATE
+                    </button>
+                </div>
+                <div style="display:flex; align-items:center; gap:6px; margin-bottom:5px;">
+                    <label for="pt-label" style="font-size:0.6rem; color:#888;">Session</label>
+                    <select id="pt-label" style="font-size:0.6rem; background:#1a1a25; color:#ccc; border:1px solid #444; border-radius:3px; padding:1px 4px;">
+                        <option value="passthrough">General</option>
+                        <option value="k380_pairing">K380 Pairing</option>
+                        <option value="corporate_work">Corporate Work</option>
+                    </select>
+                </div>
+                <div id="passthrough-zone"
+                    style="width:100%; height:120px; background:#1a1a25; border:2px dashed #444;
+                    border-radius:6px; display:flex; align-items:center; justify-content:center;
+                    cursor:pointer; user-select:none; font-size:0.75rem; color:#555;
+                    transition: border-color 0.2s, background 0.2s;"
+                    onclick="enterPassthrough()">
+                    Click to control remote mouse + keyboard<br>
+                    <span style="font-size:0.6rem; color:#444">Press Esc to release</span>
+                </div>
+                <div style="display:flex; align-items:center; gap:6px; margin-top:5px;">
+                    <label for="pt-sensitivity" style="font-size:0.6rem; color:#888; white-space:nowrap;">Sensitivity</label>
+                    <input type="range" id="pt-sensitivity" min="0.2" max="3.0" step="0.1" value="1.0"
+                        style="flex:1; height:4px; accent-color:#e74c3c;"
+                        oninput="ptSensitivity=parseFloat(this.value); document.getElementById('pt-sens-val').textContent=this.value+'x'">
+                    <span id="pt-sens-val" style="font-size:0.6rem; color:#888; min-width:2.5em;">1.0x</span>
+                </div>
+                <div id="pt-stats" style="font-size:0.55rem; color:#666; margin-top:3px; display:none;"></div>
+                <div id="passthrough-status" style="font-size:0.6rem; color:#555; margin-top:3px;"></div>
+            </div>
             <!-- CNN -->
             <div class="panel">
                 <div class="panel-title">CNN Cursor Recognition</div>

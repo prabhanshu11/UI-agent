@@ -154,6 +154,19 @@ async function updateState() {
             s.pi_keyboard === false ? 'Discoverable' : 'Unreachable');
         document.getElementById('hw-frames').textContent = s.frame_count;
 
+        // Passthrough live stats
+        var ptStats = document.getElementById('pt-stats');
+        if (s.passthrough && s.passthrough.active && s.passthrough.session) {
+            var ps = s.passthrough.session;
+            ptStats.style.display = 'block';
+            ptStats.textContent = '\u25CF REC ' + ps.label + ' | ' +
+                ps.duration_s + 's | ' + ps.events + ' events | ' +
+                ps.screenshots + ' shots | ' + ps.cnn_samples + ' CNN';
+            ptStats.style.color = '#e74c3c';
+        } else {
+            ptStats.style.display = 'none';
+        }
+
         // YOLO panel
         if (s.yolo) {
             var yoloStatus = document.getElementById('yolo-status');
@@ -346,6 +359,195 @@ async function submitTag() {
         statusEl.style.color = '#e74c3c';
     }
 }
+
+// ── Mouse Passthrough ────────────────────────────────────────
+var passthroughActive = false;
+var ptBatchDx = 0;
+var ptBatchDy = 0;
+var ptFlushInterval = null;
+var ptSensitivity = 1.0;
+
+function _ptToggleFetch() {
+    var label = document.getElementById('pt-label').value;
+    return fetch('/api/passthrough/toggle', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({label: label})
+    }).then(function(r) { return r.json(); });
+}
+
+function togglePassthrough() {
+    _ptToggleFetch().then(function(d) {
+        passthroughActive = d.active;
+        updatePassthroughUI();
+        if (!passthroughActive) exitPassthrough();
+    });
+}
+
+function enterPassthrough() {
+    if (!passthroughActive) {
+        _ptToggleFetch().then(function(d) {
+            passthroughActive = d.active;
+            updatePassthroughUI();
+            if (passthroughActive) requestPointerLock();
+        });
+    } else {
+        requestPointerLock();
+    }
+}
+
+function requestPointerLock() {
+    var zone = document.getElementById('passthrough-zone');
+    zone.requestPointerLock = zone.requestPointerLock || zone.mozRequestPointerLock;
+    zone.requestPointerLock();
+}
+
+function exitPassthrough() {
+    if (document.pointerLockElement) {
+        document.exitPointerLock();
+    }
+    if (ptFlushInterval) {
+        clearInterval(ptFlushInterval);
+        ptFlushInterval = null;
+    }
+    flushPassthroughBatch();
+}
+
+function setZoneContent(zone, captured) {
+    while (zone.firstChild) zone.removeChild(zone.firstChild);
+    var main = document.createElement('span');
+    if (captured) {
+        main.style.color = '#e74c3c';
+        main.style.fontWeight = 'bold';
+        main.textContent = 'MOUSE CAPTURED';
+    } else {
+        main.textContent = 'Click here to control remote mouse';
+    }
+    zone.appendChild(main);
+    zone.appendChild(document.createElement('br'));
+    var sub = document.createElement('span');
+    sub.style.fontSize = '0.6rem';
+    sub.style.color = captured ? '#888' : '#444';
+    sub.textContent = 'Press Esc to release';
+    zone.appendChild(sub);
+}
+
+function onPointerLockChange() {
+    var zone = document.getElementById('passthrough-zone');
+    var statusEl = document.getElementById('passthrough-status');
+    if (document.pointerLockElement === zone) {
+        document.addEventListener('mousemove', onPassthroughMove);
+        document.addEventListener('mousedown', onPassthroughClick);
+        document.addEventListener('wheel', onPassthroughScroll, {passive: false});
+        document.addEventListener('keydown', onPassthroughKey);
+        ptBatchDx = 0;
+        ptBatchDy = 0;
+        ptFlushInterval = setInterval(flushPassthroughBatch, 20);
+        zone.style.borderColor = '#e74c3c';
+        zone.style.background = '#2a1015';
+        setZoneContent(zone, true);
+        statusEl.textContent = 'Pointer locked \u2014 input piped to remote';
+        statusEl.style.color = '#e74c3c';
+        // Auto-start browser recording if Recorder is available
+        if (typeof Recorder !== 'undefined' && !Recorder.isRecording()) {
+            try { Recorder.start(); } catch(e) {}
+        }
+    } else {
+        document.removeEventListener('mousemove', onPassthroughMove);
+        document.removeEventListener('mousedown', onPassthroughClick);
+        document.removeEventListener('wheel', onPassthroughScroll);
+        document.removeEventListener('keydown', onPassthroughKey);
+        if (ptFlushInterval) {
+            clearInterval(ptFlushInterval);
+            ptFlushInterval = null;
+        }
+        flushPassthroughBatch();
+        zone.style.borderColor = '#444';
+        zone.style.background = '#1a1a25';
+        setZoneContent(zone, false);
+        statusEl.textContent = 'Released';
+        statusEl.style.color = '#555';
+        // Auto-stop browser recording
+        if (typeof Recorder !== 'undefined' && Recorder.isRecording()) {
+            try { Recorder.stop(); } catch(e) {}
+        }
+    }
+}
+
+function onPassthroughMove(e) {
+    ptBatchDx += Math.round(e.movementX * ptSensitivity);
+    ptBatchDy += Math.round(e.movementY * ptSensitivity);
+}
+
+function onPassthroughClick(e) {
+    if (!passthroughActive) return;
+    var btn = e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left';
+    fetch('/api/passthrough/click', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({button: btn})
+    });
+    e.preventDefault();
+}
+
+function onPassthroughScroll(e) {
+    if (!passthroughActive) return;
+    // Normalize deltaY to discrete scroll clicks (most mice: 100-120px per notch)
+    var clicks = Math.round(e.deltaY / 100) || (e.deltaY > 0 ? 1 : -1);
+    fetch('/api/passthrough/scroll', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({clicks: clicks})
+    });
+    e.preventDefault();
+}
+
+var _ptKeyMap = {'Enter': '\n', 'Tab': '\t', 'Backspace': '\b'};
+
+function onPassthroughKey(e) {
+    if (!passthroughActive) return;
+    // Escape is reserved for releasing pointer lock
+    if (e.key === 'Escape') return;
+    var text = _ptKeyMap[e.key] || (e.key.length === 1 ? e.key : null);
+    if (!text) return;
+    fetch('/api/passthrough/key', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({text: text})
+    });
+    e.preventDefault();
+}
+
+function flushPassthroughBatch() {
+    if (ptBatchDx === 0 && ptBatchDy === 0) return;
+    var dx = ptBatchDx;
+    var dy = ptBatchDy;
+    ptBatchDx = 0;
+    ptBatchDy = 0;
+    fetch('/api/passthrough/move', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({dx: dx, dy: dy})
+    });
+}
+
+function updatePassthroughUI() {
+    var btn = document.getElementById('passthrough-btn');
+    if (passthroughActive) {
+        btn.textContent = 'DEACTIVATE';
+        btn.style.background = '#c0392b';
+    } else {
+        btn.textContent = 'ACTIVATE';
+        btn.style.background = '#e74c3c';
+    }
+}
+
+document.addEventListener('pointerlockchange', onPointerLockChange);
+document.addEventListener('mozpointerlockchange', onPointerLockChange);
+
+document.addEventListener('contextmenu', function(e) {
+    if (document.pointerLockElement) e.preventDefault();
+});
 
 // ── Init on DOM ready ────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', initDashboard);

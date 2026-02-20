@@ -26,6 +26,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, Response, StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
+import httpx
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -41,6 +42,8 @@ from src.hardware.cursor_vision_detector import ClaudeVisionCursorDetector
 from src.hardware.silhouette_tracker import SilhouetteTracker, CandidateBlob
 from src.hardware.commanded_movement import CommandedMovement
 from src.hardware.yolo_detector import YOLOCursorDetector
+from src.hardware.experience_logger import ExperienceLogger
+from src.agents.storyline_logger import StorylineLogger
 
 def utc_now_ms() -> str:
     """UTC timestamp with millisecond precision, e.g. '2026-02-20T14:30:05.123Z'."""
@@ -341,6 +344,17 @@ _cnn_lockout_until: float = 0.0    # monotonic time until which CNN position is 
 # Silhouette tracking, CNN, YOLO still run for data capture, but
 # no jitter, probes, calibrate_to_corner, or any HID mouse reports.
 _passive_mode: bool = False
+
+# Mouse passthrough: pipe user's mouse through ESP32 pebble
+_passthrough_active: bool = False
+_passthrough_dx: int = 0  # Accumulated delta (batched by frontend at 50Hz)
+_passthrough_dy: int = 0
+_passthrough_lock = threading.Lock()
+
+# Passthrough experience recording
+_passthrough_session: Optional[dict] = None  # Active recording session
+_PT_SCREENSHOT_INTERVAL_S = 5.0
+_PT_CNN_SAMPLE_INTERVAL_S = 10.0
 
 # Noise grid: shared between daemon loop (writer) and probe (reader)
 _NOISE_GRID_W, _NOISE_GRID_H = 48, 27
@@ -1854,6 +1868,13 @@ def jitter_loop():
         if _vtest_running:
             continue
 
+        # Pause jitter/probes during passthrough — user controls the mouse.
+        # Heartbeat stays on (keeps BLE alive), but jitter would cause
+        # visible micro-jerks while user is actively moving the cursor.
+        if _passthrough_active:
+            state.jitter_count += 1
+            continue
+
         # Update hardware monitoring state
         # Check _ser (private) to avoid triggering the lazy-init property.
         # If heartbeat thread is alive, the serial IS working.
@@ -2455,8 +2476,8 @@ def cursor_validation_loop():
                     except Exception as e:
                         print(f"[cnn_loop] Grid scan error: {e}")
 
-                # 3. Mouse-based recovery (skip in passive mode)
-                if not _passive_mode:
+                # 3. Mouse-based recovery (skip in passive/passthrough mode)
+                if not _passive_mode and not _passthrough_active:
                     if not reacquired and cmd_movement and pos:
                         mr = cmd_movement.escalate(pos.x, pos.y)
                         if mr:
@@ -2475,7 +2496,7 @@ def cursor_validation_loop():
                 # Calibrate to known corner: immediately if urgent + probes failed,
                 # or after 3 cycles otherwise
                 calibrate_threshold = 1 if _cnn_urgent_recheck else 3
-                if not _passive_mode and _stale_recovery_attempts >= calibrate_threshold and mouse:
+                if not _passive_mode and not _passthrough_active and _stale_recovery_attempts >= calibrate_threshold and mouse:
                     try:
                         print(f"[cnn_loop] {_stale_recovery_attempts} stale recoveries"
                               " failed — calibrating to corner")
@@ -2852,6 +2873,17 @@ async def get_state():
             "age_s": round(time.monotonic() - state.vision_timestamp, 1)
                 if state.vision_timestamp > 0 else -1,
             "count": state.vision_count,
+        },
+        "passthrough": {
+            "active": _passthrough_active,
+            "session": {
+                "session_id": _passthrough_session["session_id"],
+                "label": _passthrough_session["label"],
+                "duration_s": round(time.monotonic() - _passthrough_session["start_time"], 1),
+                "events": _passthrough_session["event_count"],
+                "screenshots": _passthrough_session["screenshot_count"],
+                "cnn_samples": _passthrough_session["cnn_sample_count"],
+            } if _passthrough_session else None,
         },
         "fps": round(state.fps, 1),
         "frame_count": state.frame_count,
@@ -3289,6 +3321,309 @@ async def yolo_detect_now():
 
     except Exception as e:
         return {"error": str(e)}
+
+
+# ── Passthrough Experience Helpers ────────────────────────────────
+
+def _passthrough_screenshot_loop():
+    """Background thread: periodic screenshots + CNN samples during passthrough."""
+    import os
+    last_cnn_time = time.monotonic()
+    while _passthrough_active and _passthrough_session:
+        time.sleep(_PT_SCREENSHOT_INTERVAL_S)
+        if not _passthrough_active or not _passthrough_session:
+            break
+        sess = _passthrough_session
+        # Capture frame from daemon
+        frame = None
+        if daemon_client and daemon_client.is_running():
+            try:
+                frame = daemon_client.get_frame()
+            except Exception:
+                pass
+        if frame is None:
+            continue
+        # Save screenshot as JPEG
+        ts = datetime.now().strftime("%H%M%S_%f")[:-3]
+        shot_path = os.path.join(sess["screenshots_dir"], f"pt_{ts}.jpg")
+        try:
+            cv2.imwrite(shot_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            sess["screenshot_count"] += 1
+            sess["logger"].log("screenshot", details={"path": shot_path})
+        except Exception:
+            pass
+        # CNN gold sample every _PT_CNN_SAMPLE_INTERVAL_S
+        now = time.monotonic()
+        if collector and mouse and (now - last_cnn_time) >= _PT_CNN_SAMPLE_INTERVAL_S:
+            try:
+                collector.collect_from_locate(
+                    frame, mouse.estimated_x, mouse.estimated_y,
+                    correlation=0.95, source="passthrough_gold")
+                sess["cnn_sample_count"] += 1
+                last_cnn_time = now
+            except Exception:
+                pass
+
+
+def _passthrough_capture_click(pos: tuple[int, int]):
+    """Immediate screenshot + CNN sample on click (highest-value moment)."""
+    if not _passthrough_session:
+        return
+    import os
+    sess = _passthrough_session
+    frame = None
+    if daemon_client and daemon_client.is_running():
+        try:
+            frame = daemon_client.get_frame()
+        except Exception:
+            pass
+    if frame is None:
+        return
+    # Screenshot
+    ts = datetime.now().strftime("%H%M%S_%f")[:-3]
+    shot_path = os.path.join(sess["screenshots_dir"], f"click_{ts}.jpg")
+    try:
+        cv2.imwrite(shot_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        sess["screenshot_count"] += 1
+        sess["logger"].log("click_screenshot", position=pos, details={"path": shot_path})
+    except Exception:
+        pass
+    # CNN sample — user clicked exactly where cursor is
+    if collector:
+        try:
+            collector.collect_from_locate(
+                frame, pos[0], pos[1],
+                correlation=0.99, source="passthrough_click")
+            sess["cnn_sample_count"] += 1
+        except Exception:
+            pass
+
+
+# ── Input Passthrough ─────────────────────────────────────────────
+# Pipes user's mouse/keyboard through ESP32 pebble device + Pi Zero.
+# Frontend sends batched (dx,dy) at 50Hz via Pointer Lock API.
+
+@app.post("/api/passthrough/move")
+async def passthrough_move(request: Request):
+    """Accept batched mouse delta from frontend Pointer Lock."""
+    if not _passthrough_active:
+        return {"error": "passthrough not active"}
+    if not mouse:
+        return {"error": "mouse not connected"}
+    data = await request.json()
+    dx = int(data.get("dx", 0))
+    dy = int(data.get("dy", 0))
+    if dx == 0 and dy == 0:
+        return {"ok": True}
+    # Send directly — ESP32 HID_MAX is 127, chunk if larger
+    try:
+        while abs(dx) > 0 or abs(dy) > 0:
+            chunk_x = max(-127, min(127, dx))
+            chunk_y = max(-127, min(127, dy))
+            mouse._send_raw(chunk_x, chunk_y)
+            dx -= chunk_x
+            dy -= chunk_y
+    except Exception as e:
+        return {"error": str(e)}
+    # Sync dashboard state from ESP32 dead-reckoning
+    with state.lock:
+        state.cursor_x = mouse.estimated_x
+        state.cursor_y = mouse.estimated_y
+        state.cursor_method = "passthrough"
+        state.cursor_age_s = 0.0
+    if sil_tracker:
+        sil_tracker.reset()
+    if _passthrough_session:
+        _passthrough_session["logger"].log("mouse_move",
+            position=(mouse.estimated_x, mouse.estimated_y),
+            details={"dx": int(data.get("dx", 0)), "dy": int(data.get("dy", 0))})
+        _passthrough_session["event_count"] += 1
+    return {"ok": True}
+
+
+@app.post("/api/passthrough/click")
+async def passthrough_click(request: Request):
+    """Forward mouse click through ESP32."""
+    if not _passthrough_active:
+        return {"error": "passthrough not active"}
+    if not mouse:
+        return {"error": "mouse not connected"}
+    data = await request.json()
+    button = data.get("button", "left")
+    if button not in ("left", "right", "middle"):
+        return {"error": "invalid button"}
+    try:
+        mouse.click(button)
+    except Exception as e:
+        return {"error": str(e)}
+    # Refresh cursor age on click
+    with state.lock:
+        state.cursor_age_s = 0.0
+    if _passthrough_session:
+        pos = (mouse.estimated_x, mouse.estimated_y)
+        _passthrough_session["logger"].log("click",
+            position=pos, details={"button": button})
+        _passthrough_session["event_count"] += 1
+        # Click = highest-value moment — trigger immediate screenshot + CNN sample
+        threading.Thread(
+            target=_passthrough_capture_click,
+            args=(pos,),
+            daemon=True,
+        ).start()
+    return {"ok": True}
+
+
+@app.post("/api/passthrough/scroll")
+async def passthrough_scroll(request: Request):
+    """Forward scroll wheel through ESP32."""
+    if not _passthrough_active:
+        return {"error": "passthrough not active"}
+    if not mouse:
+        return {"error": "mouse not connected"}
+    data = await request.json()
+    clicks = int(data.get("clicks", 0))
+    if clicks == 0:
+        return {"ok": True}
+    try:
+        mouse.scroll(clicks)
+    except Exception as e:
+        return {"error": str(e)}
+    if _passthrough_session:
+        _passthrough_session["logger"].log("scroll",
+            position=(mouse.estimated_x, mouse.estimated_y),
+            details={"clicks": clicks})
+        _passthrough_session["event_count"] += 1
+    return {"ok": True}
+
+
+_PI_KEYBOARD_URL = "http://10.55.0.2:8081/api/keyboard/type"
+_pi_http_client: Optional[httpx.AsyncClient] = None
+
+
+@app.post("/api/passthrough/key")
+async def passthrough_key(request: Request):
+    """Forward keypress to Windows via Pi Zero keyboard API."""
+    global _pi_http_client
+    if not _passthrough_active:
+        return {"error": "passthrough not active"}
+    data = await request.json()
+    text = data.get("text", "")
+    if not text:
+        return {"ok": True}
+    if _pi_http_client is None:
+        _pi_http_client = httpx.AsyncClient(timeout=3.0)
+    try:
+        resp = await _pi_http_client.post(
+            _PI_KEYBOARD_URL,
+            json={"text": text},
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        return {"error": f"Pi keyboard: {e}"}
+    if _passthrough_session:
+        _passthrough_session["logger"].log("key",
+            position=(mouse.estimated_x if mouse else 0, mouse.estimated_y if mouse else 0),
+            details={"text": text})
+        _passthrough_session["event_count"] += 1
+    return {"ok": True}
+
+
+@app.post("/api/passthrough/toggle")
+async def passthrough_toggle(request: Request):
+    """Toggle input passthrough mode with experience recording."""
+    global _passthrough_active, _passthrough_session
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    label = data.get("label", "passthrough")
+
+    _passthrough_active = not _passthrough_active
+
+    if _passthrough_active:
+        # Snapshot cursor state at activation
+        start_x = mouse.estimated_x if mouse else 0
+        start_y = mouse.estimated_y if mouse else 0
+        print(f"[passthrough] ACTIVE — starting at ({start_x}, {start_y})")
+
+        # Start experience recording
+        session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        session_dir = Path("logs/experiences/passthrough")
+        screenshots_dir = session_dir / f"{session_id}_{label}" / "screenshots"
+        screenshots_dir.mkdir(parents=True, exist_ok=True)
+
+        storyline = StorylineLogger(
+            experience_dir=session_dir / f"{session_id}_{label}",
+            session_id=session_id,
+        )
+        storyline.start_experience(f"passthrough_{label}", attributes={
+            "label": label,
+            "start_x": start_x,
+            "start_y": start_y,
+        })
+        exp_logger = ExperienceLogger(
+            log_dir=str(session_dir),
+            storyline_logger=storyline,
+        )
+        exp_logger.log("passthrough_start", position=(start_x, start_y), details={
+            "label": label,
+            "session_id": session_id,
+        })
+        _passthrough_session = {
+            "logger": exp_logger,
+            "storyline": storyline,
+            "session_id": session_id,
+            "label": label,
+            "start_time": time.monotonic(),
+            "event_count": 0,
+            "screenshot_count": 0,
+            "cnn_sample_count": 0,
+            "screenshots_dir": str(screenshots_dir),
+        }
+        # Start screenshot capture thread
+        threading.Thread(
+            target=_passthrough_screenshot_loop,
+            daemon=True,
+            name="pt-screenshots",
+        ).start()
+    else:
+        # Flush final state and trigger CNN validation
+        if mouse:
+            with state.lock:
+                state.cursor_x = mouse.estimated_x
+                state.cursor_y = mouse.estimated_y
+                state.cursor_method = "passthrough_end"
+                state.cursor_age_s = 0.0
+                state.cursor_validated = False
+
+        # End experience recording
+        if _passthrough_session:
+            sess = _passthrough_session
+            duration = time.monotonic() - sess["start_time"]
+            sess["logger"].log("passthrough_end", position=(state.cursor_x, state.cursor_y), details={
+                "duration_s": round(duration, 1),
+                "event_count": sess["event_count"],
+                "screenshot_count": sess["screenshot_count"],
+                "cnn_sample_count": sess["cnn_sample_count"],
+            })
+            sess["storyline"].save_narrative(
+                sess["storyline"].experience_dir / "narrative.md"
+            )
+            sess["logger"].close()
+            print(f"[passthrough] Session saved: {sess['event_count']} events, "
+                  f"{sess['screenshot_count']} screenshots, "
+                  f"{sess['cnn_sample_count']} CNN samples, "
+                  f"{round(duration, 1)}s")
+            _passthrough_session = None
+
+        print(f"[passthrough] INACTIVE — final pos ({state.cursor_x}, {state.cursor_y})")
+    return {"active": _passthrough_active}
+
+
+@app.get("/api/passthrough/status")
+async def passthrough_status():
+    """Get passthrough state."""
+    return {"active": _passthrough_active}
 
 
 @app.get("/api/config")
