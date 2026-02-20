@@ -39,6 +39,7 @@ from src.hardware.daemon_client import DaemonClient
 from src.hardware.cursor_vision_detector import ClaudeVisionCursorDetector
 from src.hardware.silhouette_tracker import SilhouetteTracker
 from src.hardware.commanded_movement import CommandedMovement
+from src.hardware.yolo_detector import YOLOCursorDetector
 
 def utc_now_ms() -> str:
     """UTC timestamp with millisecond precision, e.g. '2026-02-20T14:30:05.123Z'."""
@@ -85,6 +86,15 @@ class MotionState:
     silhouette_latency_ms: float = 0.0
     silhouette_misses: int = 0
     error: Optional[str] = None
+    # YOLO full-screen detection
+    yolo_active: bool = False
+    yolo_x: int = 0
+    yolo_y: int = 0
+    yolo_confidence: float = 0.0
+    yolo_bbox: tuple[int, int, int, int] = (0, 0, 0, 0)  # x1, y1, x2, y2
+    yolo_inference_ms: float = 0.0
+    yolo_timestamp: float = 0.0  # monotonic time of last detection
+    yolo_detection_count: int = 0
     # Claude Vision (ground truth)
     vision_x: int = 0
     vision_y: int = 0
@@ -181,11 +191,14 @@ daemon_client: Optional[DaemonClient] = None
 claude_detector: Optional[ClaudeVisionCursorDetector] = None
 sil_tracker: Optional[SilhouetteTracker] = None
 cmd_movement: Optional[CommandedMovement] = None
+yolo_detector: Optional[YOLOCursorDetector] = None
 
 # Sustained low-confidence tracker for jitter-based re-acquisition
 _low_confidence_since: float = 0.0  # monotonic time when CNN confidence first went <0.7
 _vision_lockout_until: float = 0.0  # monotonic time until which motion blobs can't override position
 _VISION_LOCKOUT_S: float = 30.0     # how long Vision position is protected from motion override
+_YOLO_LOCKOUT_S: float = 5.0       # how long a high-confidence YOLO position is protected
+_yolo_lockout_until: float = 0.0   # monotonic time until which YOLO position is protected
 
 # Noise grid: shared between daemon loop (writer) and probe (reader)
 _NOISE_GRID_W, _NOISE_GRID_H = 48, 27
@@ -266,7 +279,9 @@ def noise_grid_features() -> dict:
 def draw_blob_overlay(frame: np.ndarray, blobs: list[MotionBlob],
                       cursor_pos: tuple[int, int],
                       pointer_blob_idx: int = -1,
-                      roi_bounds: Optional[tuple[int, int, int, int]] = None) -> np.ndarray:
+                      roi_bounds: Optional[tuple[int, int, int, int]] = None,
+                      yolo_bbox: Optional[tuple[int, int, int, int]] = None,
+                      yolo_conf: float = 0.0) -> np.ndarray:
     """Draw motion blob rectangles and cursor crosshair on frame.
 
     Args:
@@ -315,8 +330,14 @@ def draw_blob_overlay(frame: np.ndarray, blobs: list[MotionBlob],
         cv2.putText(overlay, label, (x_min, y_min - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
-    # Cursor position and HUD info are shown by the browser-side CSS dot
-    # and sidebar panels respectively — no need to draw on the video frame.
+    # YOLO bounding box (cyan) — shows full-screen detection result
+    if yolo_bbox and yolo_conf > 0.25:
+        yx1, yy1, yx2, yy2 = yolo_bbox
+        color_yolo = (0, 255, 255)  # Cyan
+        cv2.rectangle(overlay, (yx1, yy1), (yx2, yy2), color_yolo, 2)
+        yolo_label = f"YOLO {yolo_conf:.0%}"
+        cv2.putText(overlay, yolo_label, (yx1, yy1 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, color_yolo, 1)
 
     return overlay
 
@@ -383,7 +404,7 @@ def _daemon_motion_loop():
     # UI animation regions stay above threshold because they get blobs
     # every frame. Cursor regions clear quickly because cursor motion
     # is transient (only during movement).
-    global _noise_grid
+    global _noise_grid, _yolo_lockout_until
     _noise_grid = [[_NOISE_THRESHOLD] * _NOISE_GRID_W for _ in range(_NOISE_GRID_H)]
 
     while True:
@@ -499,6 +520,14 @@ def _daemon_motion_loop():
                             if blob_dist_from_vision > 80:
                                 accept = False  # Blob too far from Vision truth
 
+                        # YOLO lockout: don't let blobs override YOLO-confirmed pos
+                        if accept and now < _yolo_lockout_until and state.yolo_active:
+                            blob_dist_from_yolo = (
+                                (best.centroid[0] - state.yolo_x) ** 2 +
+                                (best.centroid[1] - state.yolo_y) ** 2) ** 0.5
+                            if blob_dist_from_yolo > 80:
+                                accept = False  # Blob too far from YOLO detection
+
                         if accept:
                             primary_blob = best
                             bx, by = best.centroid
@@ -564,6 +593,56 @@ def _daemon_motion_loop():
                     if frame is not None:
                         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                         state.prof_jpeg_decode_ms = (time.monotonic() - t_decode) * 1000
+
+                        # ── YOLO full-screen detection (~10fps) ──
+                        if yolo_detector and yolo_detector.loaded:
+                            yolo_dets = yolo_detector.detect(frame_rgb)
+                            if yolo_dets:
+                                best_yolo = yolo_dets[0]
+                                state.yolo_active = True
+                                state.yolo_x = best_yolo.cx
+                                state.yolo_y = best_yolo.cy
+                                state.yolo_confidence = best_yolo.confidence
+                                state.yolo_bbox = (best_yolo.x1, best_yolo.y1,
+                                                   best_yolo.x2, best_yolo.y2)
+                                state.yolo_inference_ms = best_yolo.inference_ms
+                                state.yolo_timestamp = now
+                                state.yolo_detection_count += 1
+
+                                pos = tracker.position if tracker else None
+
+                                # Priority 1: No position / stale / lost → YOLO seeds
+                                if (not pos or
+                                        (now - pos.timestamp > 5) or
+                                        state.silhouette_method == "lost"):
+                                    if tracker and best_yolo.confidence > 0.5:
+                                        tracker.set_position(
+                                            best_yolo.cx, best_yolo.cy,
+                                            method="yolo")
+                                        pos = tracker.position
+                                        if sil_tracker:
+                                            sil_tracker.reset()
+                                        _yolo_lockout_until = now + _YOLO_LOCKOUT_S
+
+                                # Priority 2: YOLO disagrees with silhouette → anchor correction
+                                # If YOLO high-conf and silhouette is tracking a different position
+                                elif pos and best_yolo.confidence > 0.7:
+                                    drift = ((best_yolo.cx - pos.x) ** 2 +
+                                             (best_yolo.cy - pos.y) ** 2) ** 0.5
+                                    if drift > 80:
+                                        # YOLO sees cursor at a different position than
+                                        # silhouette is tracking → YOLO wins (full-screen)
+                                        if tracker:
+                                            tracker.set_position(
+                                                best_yolo.cx, best_yolo.cy,
+                                                method="yolo_anchor")
+                                            pos = tracker.position
+                                        if sil_tracker:
+                                            sil_tracker.reset()
+                                        _yolo_lockout_until = now + _YOLO_LOCKOUT_S
+                                        state.cursor_validated = False
+                            else:
+                                state.yolo_active = False
 
                         # ── Silhouette tracking on decoded frame ──
                         pos = tracker.position if tracker else None
@@ -631,7 +710,9 @@ def _daemon_motion_loop():
                         cursor_pos = (pos.x, pos.y) if pos else (0, 0)
                         overlay = draw_blob_overlay(
                             frame_rgb, ds.blobs, cursor_pos,
-                            roi_bounds=roi_bounds)
+                            roi_bounds=roi_bounds,
+                            yolo_bbox=state.yolo_bbox if state.yolo_active else None,
+                            yolo_conf=state.yolo_confidence)
 
                         # ── HUD: tracking quality on the frame ──
                         cursor_age = (now - pos.timestamp) if pos else 999.0
@@ -734,6 +815,35 @@ def _python_motion_loop():
                 state.cursor_y = pos.y
                 state.cursor_method = pos.method
                 state.cursor_age_s = time.monotonic() - pos.timestamp
+
+            # ── YOLO full-screen detection ──────────────────────
+            if yolo_detector and yolo_detector.loaded:
+                yolo_dets = yolo_detector.detect(frame)
+                if yolo_dets:
+                    best_yolo = yolo_dets[0]
+                    state.yolo_active = True
+                    state.yolo_x = best_yolo.cx
+                    state.yolo_y = best_yolo.cy
+                    state.yolo_confidence = best_yolo.confidence
+                    state.yolo_bbox = (best_yolo.x1, best_yolo.y1,
+                                       best_yolo.x2, best_yolo.y2)
+                    state.yolo_inference_ms = best_yolo.inference_ms
+                    state.yolo_timestamp = t0
+                    state.yolo_detection_count += 1
+
+                    # Seed position from YOLO if stale or lost
+                    if (not pos or
+                            (t0 - pos.timestamp > 5) or
+                            not state.silhouette_active):
+                        if tracker and best_yolo.confidence > 0.5:
+                            tracker.set_position(
+                                best_yolo.cx, best_yolo.cy, method="yolo")
+                            pos = tracker.position
+                            cursor_pos = (pos.x, pos.y)
+                            if sil_tracker:
+                                sil_tracker.reset()
+                else:
+                    state.yolo_active = False
 
             # ── FAST PATH: Silhouette tracking in ROI ──────────────
             silhouette_handled = False
@@ -865,7 +975,10 @@ def _python_motion_loop():
                             if sil_tracker:
                                 sil_tracker.reset()
 
-            overlay = draw_blob_overlay(frame, blobs, cursor_pos, pointer_blob_idx, roi_bounds)
+            overlay = draw_blob_overlay(
+                frame, blobs, cursor_pos, pointer_blob_idx, roi_bounds,
+                yolo_bbox=state.yolo_bbox if state.yolo_active else None,
+                yolo_conf=state.yolo_confidence)
             jpeg = frame_to_jpeg(overlay)
 
             with state.lock:
@@ -931,6 +1044,9 @@ def _ring_capture(jpeg_bytes: bytes | None):
         "blobs": blobs_snap,
         "fps": state.fps,
         "vision_x": state.vision_x, "vision_y": state.vision_y,
+        "yolo_x": state.yolo_x, "yolo_y": state.yolo_y,
+        "yolo_conf": state.yolo_confidence,
+        "yolo_active": state.yolo_active,
     }
     with _ring_lock:
         _ring_buffer.append(entry)
@@ -1370,8 +1486,15 @@ def jitter_loop():
         need_reacquire = (cnn_trigger or sil_trigger) and (use_daemon or sensor)
 
         if need_reacquire:
-            # Correlation probe: the jitter IS the probe signal
-            result = _jitter_reacquire(use_daemon)
+            # Try YOLO first: if YOLO recently detected cursor, use that position
+            # instead of the slow jitter probe (saves ~2s)
+            yolo_age = now - state.yolo_timestamp if state.yolo_timestamp > 0 else 999
+            if (yolo_detector and state.yolo_active
+                    and state.yolo_confidence > 0.5 and yolo_age < 5.0):
+                result = (state.yolo_x, state.yolo_y)
+            else:
+                # Correlation probe: the jitter IS the probe signal
+                result = _jitter_reacquire(use_daemon)
             if result:
                 rx, ry = result
                 state.cursor_x = rx
@@ -1636,10 +1759,19 @@ def cursor_validation_loop():
             position_stale = (not pos) or (now - pos.timestamp > 60)
 
             if position_stale:
-                # Position unknown or very stale — try commanded movement
-                # escalation first (silhouette-verified), fall back to legacy
+                # Position unknown or very stale — try YOLO first (no mouse needed),
+                # then commanded movement, then legacy probe
                 reacquired = False
-                if cmd_movement and pos:
+                yolo_age = now - state.yolo_timestamp if state.yolo_timestamp > 0 else 999
+                if (yolo_detector and state.yolo_active
+                        and state.yolo_confidence > 0.5 and yolo_age < 5.0):
+                    tracker.set_position(state.yolo_x, state.yolo_y, method="yolo")
+                    state.cursor_x = state.yolo_x
+                    state.cursor_y = state.yolo_y
+                    state.cursor_method = "yolo"
+                    state.cursor_age_s = 0.0
+                    reacquired = True
+                if not reacquired and cmd_movement and pos:
                     mr = cmd_movement.escalate(pos.x, pos.y)
                     if mr:
                         tracker.set_position(mr.x, mr.y, method=mr.method)
@@ -1808,6 +1940,16 @@ async def get_state():
                 "pos": state.sample_count_pos,
                 "neg": state.sample_count_neg,
             },
+        },
+        "yolo": {
+            "active": state.yolo_active,
+            "x": state.yolo_x, "y": state.yolo_y,
+            "confidence": round(state.yolo_confidence, 3),
+            "bbox": state.yolo_bbox,
+            "inference_ms": round(state.yolo_inference_ms, 1),
+            "age_s": round(time.monotonic() - state.yolo_timestamp, 1)
+                if state.yolo_timestamp > 0 else -1,
+            "detection_count": state.yolo_detection_count,
         },
         "silhouette": {
             "active": state.silhouette_active,
@@ -2382,6 +2524,16 @@ async def log_experience_snapshot(request: Request):
             "roi_size": state.silhouette_roi_size,
             "misses": state.silhouette_misses,
             "hz": state.silhouette_hz,
+        },
+        "yolo": {
+            "active": state.yolo_active,
+            "x": state.yolo_x, "y": state.yolo_y,
+            "confidence": round(state.yolo_confidence, 3),
+            "bbox": state.yolo_bbox,
+            "inference_ms": round(state.yolo_inference_ms, 1),
+            "age_s": round(now_mono - state.yolo_timestamp, 1)
+                if state.yolo_timestamp > 0 else -1,
+            "detection_count": state.yolo_detection_count,
         },
         "vision": {
             "x": state.vision_x, "y": state.vision_y,
@@ -4006,6 +4158,29 @@ DASHBOARD_HTML = r"""
                 </table>
             </div>
             <div class="panel">
+                <div class="panel-title" style="color:#0ff">YOLO Full-Screen</div>
+                <div class="hw-row">
+                    <span class="hw-label">Status</span>
+                    <span class="hw-value" id="yolo-status">—</span>
+                </div>
+                <div class="hw-row">
+                    <span class="hw-label">Position</span>
+                    <span class="hw-value" id="yolo-position" style="color:#888">—</span>
+                </div>
+                <div class="hw-row">
+                    <span class="hw-label">Confidence</span>
+                    <span class="hw-value" id="yolo-confidence">—</span>
+                </div>
+                <div class="hw-row">
+                    <span class="hw-label">Inference</span>
+                    <span class="hw-value" id="yolo-inference" style="color:#888">—</span>
+                </div>
+                <div class="hw-row">
+                    <span class="hw-label">Detections</span>
+                    <span class="hw-value" id="yolo-count" style="color:#888">—</span>
+                </div>
+            </div>
+            <div class="panel">
                 <div class="panel-title">Silhouette Tracking</div>
                 <div class="hw-row">
                     <span class="hw-label">Status</span>
@@ -4289,6 +4464,22 @@ DASHBOARD_HTML = r"""
                     s.pi_keyboard === true, 'BT Connected',
                     s.pi_keyboard === false ? 'Discoverable' : 'Unreachable');
                 document.getElementById('hw-frames').textContent = s.frame_count;
+
+                // YOLO full-screen panel
+                if (s.yolo) {
+                    var yoloStatus = document.getElementById('yolo-status');
+                    yoloStatus.textContent = s.yolo.active ? 'Detecting' : 'No detection';
+                    yoloStatus.className = 'hw-value ' + (s.yolo.active ? 'ok' : 'warn');
+                    document.getElementById('yolo-position').textContent =
+                        s.yolo.active ? '(' + s.yolo.x + ', ' + s.yolo.y + ')' : '—';
+                    var yoloConf = document.getElementById('yolo-confidence');
+                    yoloConf.textContent = s.yolo.active ? (s.yolo.confidence * 100).toFixed(1) + '%' : '—';
+                    yoloConf.className = 'hw-value ' + (s.yolo.confidence > 0.7 ? 'ok' :
+                        s.yolo.confidence > 0.4 ? 'warn' : 'err');
+                    document.getElementById('yolo-inference').textContent =
+                        s.yolo.inference_ms.toFixed(1) + 'ms';
+                    document.getElementById('yolo-count').textContent = s.yolo.detection_count;
+                }
 
                 // Silhouette tracking panel
                 if (s.silhouette) {
@@ -5560,7 +5751,7 @@ pre { white-space: pre-wrap; word-wrap: break-word; font-size: 0.82rem; line-hei
 # ── Startup ─────────────────────────────────────────────────────────
 
 def init_hardware():
-    global mouse, sensor, tracker, recognizer, collector, daemon_client, claude_detector, sil_tracker, cmd_movement
+    global mouse, sensor, tracker, recognizer, collector, daemon_client, claude_detector, sil_tracker, cmd_movement, yolo_detector
 
     print("Initializing hardware...")
     mouse = ESP32Mouse('/dev/ttyUSB0', screen_width=1920, screen_height=1080)
@@ -5607,6 +5798,15 @@ def init_hardware():
     cmd_movement = CommandedMovement(
         mouse, sil_tracker, sensor=sensor, daemon_client=daemon_client)
     print("  Commanded movement initialized (jitter→probe→lissajous)")
+
+    # YOLO full-screen cursor detector (GPU-accelerated)
+    yolo_detector = YOLOCursorDetector(conf_threshold=0.3)
+    if yolo_detector.load():
+        print("  YOLO cursor detector initialized ("
+              + str(yolo_detector.model_path) + ")")
+    else:
+        print("  YOLO cursor detector: no model loaded (will use pretrained)")
+        yolo_detector = None
 
     # Claude Vision cursor detector (uses subscription, no API key)
     claude_detector = ClaudeVisionCursorDetector(model="haiku")

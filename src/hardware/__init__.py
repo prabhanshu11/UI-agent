@@ -19,6 +19,7 @@ from .cursor_tracker import CursorTracker, TrackedPosition
 from .cursor_sample_collector import CursorSampleCollector, extract_gray_patch
 from .cursor_recognizer import CursorRecognizer
 from .daemon_client import DaemonClient, DaemonState
+from .yolo_detector import YOLOCursorDetector, YOLODetection
 
 __all__ = [
     "USBCaptureCard",
@@ -39,4 +40,6 @@ __all__ = [
     "match_curve_segment",
     "DaemonClient",
     "DaemonState",
+    "YOLOCursorDetector",
+    "YOLODetection",
 ]

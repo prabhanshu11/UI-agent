@@ -50,5 +50,14 @@ data/cursor_models/*.pt
 data/cursor_models/training_log.jsonl
 data/cursor_models/performance_log.jsonl
 
+# YOLO cursor detection models and training data
+data/yolo_models/*.pt
+data/yolo_models/*.engine
+data/yolo_models/yolov8n.pt
+data/yolo_models/runs/
+data/yolo_training/images/
+data/yolo_training/labels/
+data/yolo_training/composites/
+
 # Video recordings (large binaries)
 data/recordings/
