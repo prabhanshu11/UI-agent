@@ -89,3 +89,24 @@ git status               # What's the current state?
 ```
 
 Check the "Proven vs Untested" table in the research doc (§11) before choosing an approach.
+
+## Disk Usage Warning (2026-02-20)
+
+**cursor-daemon records 720p@30fps H.264 MKV chunks indefinitely with no cleanup.**
+
+| Source | Location | Rate | Cleanup |
+|--------|----------|------|---------|
+| KVM recordings | `data/recordings/kvm_*.mkv` | 3-20 GB/day | **None** |
+| Loss events | `data/loss_events/*/` | 0-9 GB/day | **None** |
+
+- **Free space (2026-02-20):** 247 GB of 446 GB
+- **Estimated disk full:** ~March 12, 2026 (~20 days at current idle-screen rate)
+- **Heavy use could accelerate to ~8 days**
+
+**Plan:** `docs/RECORDING_LIFECYCLE_PLAN.md` — datalake sync, retention engine, dashboard storage tab, archive to external drive. Not yet implemented.
+
+**Stopgap if urgent:**
+```bash
+find ~/Programs/UI-agent/data/recordings/ -name "kvm_*.mkv" -mtime +7 -delete
+find ~/Programs/UI-agent/data/loss_events/ -maxdepth 1 -type d -mtime +3 -exec rm -rf {} +
+```
