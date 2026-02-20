@@ -86,7 +86,10 @@ class SilhouetteTracker:
     SHAPE_MIN_SCORE = 0.3       # Minimum cursor shape score
 
     # Expansion trigger
-    MISS_EXPAND_AFTER = 2       # Expand ROI after N consecutive misses
+    MISS_EXPAND_AFTER = 1       # Expand ROI after N consecutive misses (was 2)
+
+    # Velocity-proportional ROI scaling
+    VELOCITY_ROI_SCALE = 0.6   # px of ROI per px/s of velocity
 
     def __init__(self, recognizer: CursorRecognizer):
         self.recognizer = recognizer
@@ -95,6 +98,7 @@ class SilhouetteTracker:
         self._consecutive_misses = 0
         self._last_track_time = 0.0
         self._tracking_hz = 0.0
+        self._velocity_px_s = 0.0  # Current estimated velocity
 
     @property
     def roi_size(self) -> int:
@@ -116,6 +120,32 @@ class SilhouetteTracker:
         self._roi_size = self.ROI_MIN
         self._prev_gray = None
         self._consecutive_misses = 0
+
+    def set_velocity(self, velocity_px_s: float):
+        """Update velocity estimate for ROI scaling.
+
+        At 1000px/s the cursor exits a 200px box in 0.2s — too fast
+        for the tracker. Scaling ROI with velocity keeps the cursor
+        inside the search window.
+
+        Args:
+            velocity_px_s: Current cursor velocity in pixels/second.
+        """
+        self._velocity_px_s = max(0.0, velocity_px_s)
+
+    def _velocity_roi_size(self) -> int:
+        """Compute ROI size based on current velocity.
+
+        At 0 velocity:    200px (tight, fast)
+        At 500 px/s:     ~500px
+        At 1000+ px/s:    800px (max)
+        """
+        base = self.ROI_MIN
+        velocity_bonus = min(
+            self.ROI_MAX - base,
+            self._velocity_px_s * self.VELOCITY_ROI_SCALE,
+        )
+        return int(base + velocity_bonus)
 
     def track(
         self,
@@ -141,6 +171,10 @@ class SilhouetteTracker:
         else:
             gray = frame
 
+        # Velocity-aware ROI: scale search window with cursor speed
+        vel_roi = self._velocity_roi_size()
+        self._roi_size = max(self._roi_size, vel_roi)
+
         # Extract ROI from current frame
         roi, x0, y0 = self._extract_roi(gray, last_x, last_y)
 
@@ -160,7 +194,7 @@ class SilhouetteTracker:
         if result:
             result.latency_ms = elapsed_ms
             self._consecutive_misses = 0
-            self._roi_size = self.ROI_MIN
+            self._roi_size = self._velocity_roi_size()  # Reset to velocity-based, not hardcoded MIN
         else:
             self._consecutive_misses += 1
             if self._consecutive_misses >= self.MISS_EXPAND_AFTER:

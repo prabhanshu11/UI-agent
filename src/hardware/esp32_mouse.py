@@ -220,6 +220,9 @@ class ESP32Mouse:
     def _send_raw(self, dx: int, dy: int):
         """Send raw mouse movement command (single HID report).
 
+        Also updates dead-reckoning position estimate. Every displacement
+        we command is accumulated so we always have a predicted position.
+
         Args:
             dx: X movement (-127 to 127).
             dy: Y movement (-127 to 127).
@@ -229,6 +232,13 @@ class ESP32Mouse:
 
         self.ser.write(f'MOUSE:{dx},{dy}\n'.encode())
         self.ser.flush()
+
+        # Dead reckoning: accumulate every commanded displacement
+        self.estimated_x = max(0, min(self.screen_width,
+                                      self.estimated_x + dx))
+        self.estimated_y = max(0, min(self.screen_height,
+                                      self.estimated_y + dy))
+
         time.sleep(0.02)
 
     def _send_chunked(self, dx: int, dy: int):
@@ -271,12 +281,8 @@ class ESP32Mouse:
             dx = new_x - self.estimated_x
             dy = new_y - self.estimated_y
 
-        # Send the movement
+        # Send the movement (_send_raw updates estimated position via dead reckoning)
         self._send_chunked(dx, dy)
-
-        # Update estimated position
-        self.estimated_x += dx
-        self.estimated_y += dy
 
         return dx, dy
 

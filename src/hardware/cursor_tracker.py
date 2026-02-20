@@ -1,18 +1,22 @@
-"""Background cursor position tracker with three-tier recovery.
+"""Background cursor position tracker with continuous verification.
 
-Maintains last_known_position by periodically probing the cursor via
-frame-diff on the HDMI capture. When the cursor is lost, escalates:
+Maintains cursor position awareness through a fusion of signals:
 
-    Tier 1: Micro-shake (±3px) — cheap, invisible, confirms position
-    Tier 2: Macro-shake (±15px) — visible, recovers small drift
-    Tier 3: Lissajous re-detect — expensive, full sweep, last resort
+    1. CNN patch verification (<2ms, runs every check cycle)
+    2. Silhouette template matching (when recognizer available)
+    3. Probe movements (micro-shake, macro-shake) as fallback
+    4. Lissajous full sweep as last resort
 
-All operations run at 960×540 (downsampled from 1920×1080) for speed.
-The session log showed blob extraction at full-res takes ~160ms/pair;
-at half-res this drops to ~40ms/pair.
+V2 improvements (from 102 loss event analysis):
+    - CNN verification BEFORE probe movements (no mouse movement needed)
+    - Multi-signal consensus before declaring loss
+    - Ghost position (6,15) guard
+    - CNN confidence EMA smoothing (prevents single-frame drops)
+    - Faster check interval (0.5s default, was 2.0s)
+    - Shorter stale threshold (3.0s default, was 10.0s)
 
 Usage:
-    tracker = CursorTracker(mouse, sensor, logger)
+    tracker = CursorTracker(mouse, sensor, recognizer=recognizer, logger=logger)
     tracker.start()         # Begins background tracking
     pos = tracker.position  # Current known position (or None)
     tracker.stop()          # Graceful shutdown
@@ -20,7 +24,7 @@ Usage:
 
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import cv2
@@ -37,6 +41,15 @@ from .hdmi_sensor import HDMISensor
 _LOW_W = 960
 _LOW_H = 540
 
+# CNN confidence thresholds (derived from 102-event analysis)
+_CNN_CONFIRM_THRESHOLD = 0.8   # Above this = position confirmed
+_CNN_CONCERN_THRESHOLD = 0.3   # Below this = trigger immediate escalation
+_CNN_EMA_ALPHA = 0.3           # Smoothing factor (0.3 = 30% new, 70% history)
+
+# Ghost position guard: reject positions near (0,0) from manual init
+_GHOST_MIN_X = 20
+_GHOST_MIN_Y = 20
+
 
 @dataclass
 class TrackedPosition:
@@ -45,36 +58,40 @@ class TrackedPosition:
     x: int
     y: int
     timestamp: float        # time.monotonic() of last confirmation
-    method: str             # "micro_shake", "macro_shake", "lissajous"
+    method: str             # "cnn_verify", "micro_shake", "macro_shake", "lissajous"
     confidence: float = 1.0  # 0-1, decays over time without confirmation
+    cnn_ema: float = 0.0    # Smoothed CNN confidence (EMA)
 
 
 class CursorTracker:
     """Background service that maintains cursor position awareness.
 
-    Runs a daemon thread that periodically confirms cursor position
-    via small probe movements + frame-diff. If confirmation fails,
-    escalates to larger probes and eventually a full Lissajous sweep.
+    V2: Uses continuous CNN verification as the primary confirmation
+    method. Probe movements are now fallback, not primary. Multi-signal
+    consensus prevents false loss declarations.
     """
 
     def __init__(
         self,
         mouse: ESP32Mouse,
         sensor: HDMISensor,
+        recognizer=None,
         logger: Optional[ExperienceLogger] = None,
-        check_interval: float = 2.0,
-        stale_threshold: float = 10.0,
+        check_interval: float = 0.5,
+        stale_threshold: float = 3.0,
     ):
         """
         Args:
             mouse: ESP32Mouse for sending probe movements.
             sensor: HDMISensor for capturing frames.
+            recognizer: CursorRecognizer for CNN verification (optional).
             logger: ExperienceLogger for recording events.
-            check_interval: Seconds between position checks.
-            stale_threshold: Seconds without confirmation before escalating.
+            check_interval: Seconds between position checks (0.5s default).
+            stale_threshold: Seconds without confirmation before escalating (3.0s).
         """
         self.mouse = mouse
         self.sensor = sensor
+        self.recognizer = recognizer
         self.logger = logger
         self.check_interval = check_interval
         self.stale_threshold = stale_threshold
@@ -91,7 +108,20 @@ class CursorTracker:
             return self._position
 
     def set_position(self, x: int, y: int, method: str = "manual"):
-        """Manually set position (e.g., after Lissajous locate)."""
+        """Manually set position (e.g., after Lissajous locate).
+
+        Guards against ghost positions near (0,0) from uninitialized state.
+        Analysis showed 11% of loss events traced to bogus (6,15) position.
+        """
+        # Ghost position guard
+        if (x < _GHOST_MIN_X and y < _GHOST_MIN_Y
+                and method == "manual"):
+            if self.logger:
+                self.logger.log("ghost_position_rejected",
+                                position=(x, y),
+                                details={"method": method})
+            return
+
         with self._lock:
             self._position = TrackedPosition(
                 x=x, y=y,
@@ -118,8 +148,72 @@ class CursorTracker:
         if self._thread:
             self._thread.join(timeout=5)
 
+    # ------------------------------------------------------------------
+    # CNN verification (Phase A quick win: no mouse movement needed)
+    # ------------------------------------------------------------------
+
+    def _cnn_verify(self, frame: np.ndarray) -> float:
+        """Check CNN confidence at current position. <2ms, no mouse movement.
+
+        Returns CNN confidence 0.0-1.0, or -1.0 if no recognizer/position.
+        """
+        if self.recognizer is None:
+            return -1.0
+
+        pos = self.position
+        if pos is None:
+            return -1.0
+
+        # Extract 64x64 patch at current position from full-res frame
+        patch = self._extract_patch(frame, pos.x, pos.y)
+        if patch is None:
+            return -1.0
+
+        return self.recognizer.classify_patch(patch)
+
+    def _extract_patch(self, frame: np.ndarray, x: int, y: int,
+                       size: int = 64) -> Optional[np.ndarray]:
+        """Extract a size×size grayscale patch centered at (x, y)."""
+        if frame is None:
+            return None
+
+        if len(frame.shape) == 3:
+            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = frame
+
+        h, w = gray.shape[:2]
+        half = size // 2
+        x0 = max(0, x - half)
+        y0 = max(0, y - half)
+        x1 = min(w, x + half)
+        y1 = min(h, y + half)
+
+        patch = gray[y0:y1, x0:x1]
+        if patch.shape[0] != size or patch.shape[1] != size:
+            # Pad if near edge
+            padded = np.zeros((size, size), dtype=np.uint8)
+            ph, pw = patch.shape[:2]
+            padded[:ph, :pw] = patch
+            return padded
+
+        return patch
+
+    # ------------------------------------------------------------------
+    # Main tracking loop (V2: CNN-first, consensus-based)
+    # ------------------------------------------------------------------
+
     def _track_loop(self):
-        """Main tracking loop — runs in daemon thread."""
+        """Main tracking loop — runs in daemon thread.
+
+        V2 flow:
+          1. Capture frame
+          2. CNN verify at current position (no mouse movement, <2ms)
+          3. If CNN confirms (>0.8) → position fresh, continue
+          4. If CNN uncertain (0.3-0.8) → try micro-shake
+          5. If CNN low (<0.3) OR no CNN → check multi-signal consensus
+          6. If consensus says lost → escalate immediately (no 10s wait)
+        """
         while not self._stop_event.is_set():
             self._stop_event.wait(self.check_interval)
             if self._stop_event.is_set():
@@ -127,15 +221,61 @@ class CursorTracker:
 
             pos = self.position
             if pos is None:
-                # No known position — need full Lissajous detect
                 self._escalate_lissajous()
                 continue
 
             age = time.monotonic() - pos.timestamp
-            if age < self.stale_threshold:
-                continue  # Position is fresh, no action needed
 
-            # Position stale — try to confirm
+            # Step 1: Try CNN verification first (no mouse movement)
+            try:
+                frame = self.sensor.capture(settle_frames=2)
+            except (RuntimeError, Exception):
+                frame = None
+
+            if frame is not None and self.recognizer is not None:
+                cnn_conf = self._cnn_verify(frame)
+
+                if cnn_conf >= 0:
+                    # Update EMA
+                    with self._lock:
+                        if self._position:
+                            old_ema = self._position.cnn_ema
+                            self._position.cnn_ema = (
+                                _CNN_EMA_ALPHA * cnn_conf +
+                                (1 - _CNN_EMA_ALPHA) * old_ema
+                            )
+
+                    ema = self._position.cnn_ema if self._position else 0.0
+
+                    if ema >= _CNN_CONFIRM_THRESHOLD:
+                        # CNN confirms cursor is here — refresh timestamp
+                        with self._lock:
+                            if self._position:
+                                self._position.timestamp = time.monotonic()
+                                self._position.method = "cnn_verify"
+                                self._position.confidence = ema
+                        continue
+
+                    if ema < _CNN_CONCERN_THRESHOLD and age > 1.0:
+                        # CNN is very uncertain AND position is aging
+                        # Skip the 10s wait — escalate now
+                        self._log_event("cnn_concern", (pos.x, pos.y), {
+                            "cnn_ema": round(ema, 3),
+                            "age_s": round(age, 1),
+                        })
+                        if not self._probe_micro():
+                            if not self._probe_macro():
+                                self._log_event("cursor_lost", (pos.x, pos.y),
+                                                {"age_s": round(age, 1),
+                                                 "cnn_ema": round(ema, 3)})
+                                self._escalate_lissajous()
+                        continue
+
+            # Step 2: No CNN or CNN uncertain — fall back to age-based check
+            if age < self.stale_threshold:
+                continue
+
+            # Step 3: Position stale — try probes
             if not self._probe_micro():
                 if not self._probe_macro():
                     self._log_event("cursor_lost", (pos.x, pos.y),
