@@ -1,0 +1,289 @@
+{
+  "V0_right": {
+    "count": 39,
+    "velocity_px_s_mean": 0.0,
+    "velocity_px_s_max": 0.0,
+    "error_mean": 38.0,
+    "error_max": 148.0,
+    "error_min": 0.0,
+    "error_p95": 148.0,
+    "labels": {
+      "accurate": 23,
+      "drift": 12,
+      "wrong": 4,
+      "lost": 0
+    },
+    "accuracy_pct": 59.0,
+    "methods": [
+      "motion_track"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.8468,
+      "v001_20260219": 0.7109,
+      "v002_20260220": 0.7116,
+      "v003_20260220": 0.6963,
+      "v004_20260220": 0.7022,
+      "v005_20260220": 0.9252,
+      "v006_20260220": 0.7925
+    }
+  },
+  "V0_down": {
+    "count": 39,
+    "velocity_px_s_mean": 0.0,
+    "velocity_px_s_max": 0.0,
+    "error_mean": 4.0,
+    "error_max": 65.1,
+    "error_min": 0.0,
+    "error_p95": 65.1,
+    "labels": {
+      "accurate": 36,
+      "drift": 3,
+      "wrong": 0,
+      "lost": 0
+    },
+    "accuracy_pct": 92.3,
+    "methods": [
+      "motion_track",
+      "jitter"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.6337,
+      "v001_20260219": 0.5358,
+      "v002_20260220": 0.5168,
+      "v003_20260220": 0.4801,
+      "v004_20260220": 0.4922,
+      "v005_20260220": 0.8531,
+      "v006_20260220": 0.6127
+    }
+  },
+  "V100_right": {
+    "count": 39,
+    "velocity_px_s_mean": 100.0,
+    "velocity_px_s_max": 100.0,
+    "error_mean": 140.6,
+    "error_max": 293.0,
+    "error_min": 2.0,
+    "error_p95": 291.0,
+    "labels": {
+      "accurate": 4,
+      "drift": 12,
+      "wrong": 10,
+      "lost": 13
+    },
+    "accuracy_pct": 10.3,
+    "methods": [
+      "motion_track",
+      "esp32_dead_reckoning"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.7172,
+      "v001_20260219": 0.5807,
+      "v002_20260220": 0.5435,
+      "v003_20260220": 0.5185,
+      "v004_20260220": 0.5235,
+      "v005_20260220": 0.8566,
+      "v006_20260220": 0.6639
+    }
+  },
+  "V100_down": {
+    "count": 39,
+    "velocity_px_s_mean": 100.0,
+    "velocity_px_s_max": 100.0,
+    "error_mean": 154.6,
+    "error_max": 300.0,
+    "error_min": 2.0,
+    "error_p95": 298.0,
+    "labels": {
+      "accurate": 7,
+      "drift": 0,
+      "wrong": 18,
+      "lost": 14
+    },
+    "accuracy_pct": 17.9,
+    "methods": [
+      "motion_track",
+      "esp32_dead_reckoning"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.8027,
+      "v001_20260219": 0.6777,
+      "v002_20260220": 0.6476,
+      "v003_20260220": 0.6362,
+      "v004_20260220": 0.6345,
+      "v005_20260220": 0.911,
+      "v006_20260220": 0.7496
+    }
+  },
+  "V300_right": {
+    "count": 26,
+    "velocity_px_s_mean": 300.0,
+    "velocity_px_s_max": 300.0,
+    "error_mean": 293.7,
+    "error_max": 589.0,
+    "error_min": 6.0,
+    "error_p95": 535.0,
+    "labels": {
+      "accurate": 1,
+      "drift": 3,
+      "wrong": 6,
+      "lost": 16
+    },
+    "accuracy_pct": 3.8,
+    "methods": [
+      "motion_track"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.7785,
+      "v001_20260219": 0.5905,
+      "v002_20260220": 0.5202,
+      "v003_20260220": 0.4954,
+      "v004_20260220": 0.4938,
+      "v005_20260220": 0.8957,
+      "v006_20260220": 0.683
+    }
+  },
+  "V300_down": {
+    "count": 26,
+    "velocity_px_s_mean": 300.0,
+    "velocity_px_s_max": 300.0,
+    "error_mean": 421.8,
+    "error_max": 807.2,
+    "error_min": 72.2,
+    "error_p95": 793.9,
+    "labels": {
+      "accurate": 0,
+      "drift": 2,
+      "wrong": 4,
+      "lost": 20
+    },
+    "accuracy_pct": 0.0,
+    "methods": [
+      "sil_template",
+      "motion_track",
+      "esp32_dead_reckoning"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.8538,
+      "v001_20260219": 0.6146,
+      "v002_20260220": 0.4444,
+      "v003_20260220": 0.4082,
+      "v004_20260220": 0.4063,
+      "v005_20260220": 0.8406,
+      "v006_20260220": 0.5887
+    }
+  },
+  "V500_right": {
+    "count": 26,
+    "velocity_px_s_mean": 500.0,
+    "velocity_px_s_max": 500.0,
+    "error_mean": 170.2,
+    "error_max": 194.8,
+    "error_min": 10.0,
+    "error_p95": 194.8,
+    "labels": {
+      "accurate": 1,
+      "drift": 1,
+      "wrong": 24,
+      "lost": 0
+    },
+    "accuracy_pct": 3.8,
+    "methods": [
+      "sil_template",
+      "motion_track",
+      "esp32_dead_reckoning"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.1245,
+      "v001_20260219": 0.1685,
+      "v002_20260220": 0.1295,
+      "v003_20260220": 0.0912,
+      "v004_20260220": 0.0967,
+      "v005_20260220": 0.1643,
+      "v006_20260220": 0.109
+    }
+  },
+  "V500_down": {
+    "count": 26,
+    "velocity_px_s_mean": 500.0,
+    "velocity_px_s_max": 500.0,
+    "error_mean": 509.6,
+    "error_max": 1000.0,
+    "error_min": 10.0,
+    "error_p95": 970.0,
+    "labels": {
+      "accurate": 1,
+      "drift": 1,
+      "wrong": 3,
+      "lost": 21
+    },
+    "accuracy_pct": 3.8,
+    "methods": [
+      "sil_template"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.2119,
+      "v001_20260219": 0.3922,
+      "v002_20260220": 0.3842,
+      "v003_20260220": 0.4298,
+      "v004_20260220": 0.3755,
+      "v005_20260220": 0.3006,
+      "v006_20260220": 0.2545
+    }
+  },
+  "V1K_right": {
+    "count": 14,
+    "velocity_px_s_mean": 1000.0,
+    "velocity_px_s_max": 1000.0,
+    "error_mean": 535.7,
+    "error_max": 1000.0,
+    "error_min": 20.0,
+    "error_p95": 1000.0,
+    "labels": {
+      "accurate": 0,
+      "drift": 1,
+      "wrong": 2,
+      "lost": 11
+    },
+    "accuracy_pct": 0.0,
+    "methods": [
+      "sil_template"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.2119,
+      "v001_20260219": 0.3922,
+      "v002_20260220": 0.3842,
+      "v003_20260220": 0.4298,
+      "v004_20260220": 0.3755,
+      "v005_20260220": 0.3006,
+      "v006_20260220": 0.2545
+    }
+  },
+  "V1K_down": {
+    "count": 14,
+    "velocity_px_s_mean": 1000.0,
+    "velocity_px_s_max": 1000.0,
+    "error_mean": 535.7,
+    "error_max": 1000.0,
+    "error_min": 20.0,
+    "error_p95": 1000.0,
+    "labels": {
+      "accurate": 0,
+      "drift": 1,
+      "wrong": 2,
+      "lost": 11
+    },
+    "accuracy_pct": 0.0,
+    "methods": [
+      "sil_template"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.2119,
+      "v001_20260219": 0.3922,
+      "v002_20260220": 0.3842,
+      "v003_20260220": 0.4298,
+      "v004_20260220": 0.3755,
+      "v005_20260220": 0.3006,
+      "v006_20260220": 0.2545
+    }
+  }
+}

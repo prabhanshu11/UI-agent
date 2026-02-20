@@ -107,7 +107,8 @@ class CursorRecognizer:
     used for fast shape scoring in the motion detection loop.
     """
 
-    def __init__(self, model_dir: Optional[Path] = None):
+    def __init__(self, model_dir: Optional[Path] = None,
+                 model_file: Optional[Path] = None):
         self.model_dir = Path(model_dir) if model_dir else MODEL_DIR
 
         # Synthetic templates for Stage 0
@@ -121,7 +122,10 @@ class CursorRecognizer:
         # CNN model (loaded lazily)
         self._cnn_model = None
         self._cnn_version = "none"
-        self._load_cnn_model()
+        if model_file:
+            self._load_specific_model(model_file)
+        else:
+            self._load_cnn_model()
 
     @property
     def cursor_template(self) -> Optional[np.ndarray]:
@@ -153,6 +157,20 @@ class CursorRecognizer:
             self._cnn_version = model_files[0].stem
         except (ImportError, Exception):
             pass  # torch not installed or model incompatible — stay on Stage 0
+
+    def _load_specific_model(self, model_file: Path):
+        """Load a specific model file by path."""
+        try:
+            import torch
+            from .cursor_cnn import TinyCursorNet
+
+            model = TinyCursorNet()
+            model.load_state_dict(torch.load(model_file, map_location="cpu", weights_only=True))
+            model.eval()
+            self._cnn_model = model
+            self._cnn_version = model_file.stem
+        except (ImportError, Exception):
+            pass
 
     def classify_patch(self, patch: np.ndarray) -> float:
         """Classify a 64x64 grayscale patch as cursor (1.0) or not (0.0).
@@ -206,6 +224,84 @@ class CursorRecognizer:
             confidence = self._cnn_model(tensor).item()
 
         return confidence
+
+    def grid_scan(
+        self,
+        frame: np.ndarray,
+        stride: int = 64,
+        threshold: float = 0.6,
+    ) -> list[tuple[int, int, float]]:
+        """Scan the full frame with CNN on a grid of patches.
+
+        Phase 1 visual detection: find the cursor anywhere on screen
+        without knowing its position. Uses batched inference for speed.
+
+        Args:
+            frame: Full color or grayscale frame (H x W x 3 or H x W).
+            stride: Grid stride in pixels. 64 = non-overlapping, 32 = 50% overlap.
+            threshold: Minimum confidence to include in results.
+
+        Returns:
+            List of (x, y, confidence) sorted by confidence descending.
+            x, y are center coordinates of the patch.
+        """
+        if self._cnn_model is None:
+            return []
+
+        import torch
+
+        if len(frame.shape) == 3:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = frame
+
+        h, w = gray.shape
+        half = PATCH_SIZE // 2
+
+        # Extract patches on grid
+        patches = []
+        positions = []
+        for y in range(half, h - half, stride):
+            for x in range(half, w - half, stride):
+                patch = gray[y - half:y + half, x - half:x + half]
+                if patch.shape == (PATCH_SIZE, PATCH_SIZE):
+                    patches.append(patch.astype(np.float32) / 255.0)
+                    positions.append((x, y))
+
+        if not patches:
+            return []
+
+        # Batch inference
+        batch = torch.from_numpy(np.array(patches)).unsqueeze(1)  # (N, 1, 64, 64)
+        with torch.no_grad():
+            confidences = self._cnn_model(batch).squeeze(-1).numpy()  # (N,)
+
+        # Filter and sort
+        results = []
+        for i, conf in enumerate(confidences):
+            if conf >= threshold:
+                x, y = positions[i]
+                results.append((x, y, float(conf)))
+
+        results.sort(key=lambda r: r[2], reverse=True)
+
+        # NMS: suppress nearby lower-confidence hits (cursor can't be in two
+        # places). Keeps only the highest-confidence hit within suppress_radius.
+        if results:
+            suppress_radius = stride * 1.5
+            kept = []
+            for x, y, c in results:
+                suppressed = False
+                for kx, ky, kc in kept:
+                    dist = ((x - kx) ** 2 + (y - ky) ** 2) ** 0.5
+                    if dist < suppress_radius:
+                        suppressed = True
+                        break
+                if not suppressed:
+                    kept.append((x, y, c))
+            results = kept
+
+        return results
 
     def update_cursor_template(self, patch: np.ndarray):
         """Update the learned cursor template from a confirmed cursor position.

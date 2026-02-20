@@ -100,6 +100,11 @@ class SilhouetteTracker:
         self._tracking_hz = 0.0
         self._velocity_px_s = 0.0  # Current estimated velocity
 
+        # Jitter expect state — lowered thresholds during commanded motion
+        self._expecting_motion = False
+        self._expected_amplitude = 3
+        self._motion_expect_until = 0.0
+
     @property
     def roi_size(self) -> int:
         """Current ROI window size in pixels."""
@@ -133,6 +138,19 @@ class SilhouetteTracker:
         """
         self._velocity_px_s = max(0.0, velocity_px_s)
 
+    def expect_motion(self, amplitude_px: int = 3):
+        """Hint that commanded motion (jitter) is about to happen.
+
+        Lowers motion detection threshold for a 500ms window so that
+        the small ±3px jitter displacement is detectable. If motion
+        matching the expected amplitude is found during this window,
+        the result is tagged as "jitter_confirm" with 0.95 confidence —
+        because only the cursor moves when we command jitter.
+        """
+        self._expecting_motion = True
+        self._expected_amplitude = amplitude_px
+        self._motion_expect_until = time.monotonic() + 0.5  # 500ms window
+
     def _velocity_roi_size(self) -> int:
         """Compute ROI size based on current velocity.
 
@@ -164,6 +182,10 @@ class SilhouetteTracker:
             TrackResult if cursor found in ROI, None if lost.
         """
         t0 = time.monotonic()
+
+        # Clear expired jitter expect window
+        if self._expecting_motion and t0 > self._motion_expect_until:
+            self._expecting_motion = False
 
         # Convert to grayscale
         if len(frame.shape) == 3:
@@ -400,6 +422,9 @@ class SilhouetteTracker:
 
         Both ROIs are extracted at the same (last_x, last_y) position,
         ensuring pixel-aligned comparison.
+
+        When _expecting_motion is True (jitter window), uses lower
+        thresholds to catch the small ±3px commanded displacement.
         """
         # Handle size mismatch (cursor near frame edge)
         rh = min(roi_curr.shape[0], roi_prev.shape[0])
@@ -411,9 +436,17 @@ class SilhouetteTracker:
         curr = roi_curr[:rh, :rw]
         prev = roi_prev[:rh, :rw]
 
+        # Jitter-aware thresholds: during expect window, lower the bar
+        jitter_mode = (
+            self._expecting_motion
+            and time.monotonic() < self._motion_expect_until
+        )
+        motion_thresh = 5 if jitter_mode else self.MOTION_THRESHOLD
+        min_blob = 3 if jitter_mode else self.MIN_BLOB_PIXELS
+
         # Frame difference
         diff = cv2.absdiff(curr, prev)
-        _, mask = cv2.threshold(diff, self.MOTION_THRESHOLD, 255, cv2.THRESH_BINARY)
+        _, mask = cv2.threshold(diff, motion_thresh, 255, cv2.THRESH_BINARY)
 
         # Find contours
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -424,10 +457,11 @@ class SilhouetteTracker:
         # Score each contour by cursor-likeness
         best_score = 0.0
         best_cx, best_cy = 0, 0
+        best_max_dim = 0
 
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area < self.MIN_BLOB_PIXELS or area > self.MAX_BLOB_PIXELS:
+            if area < min_blob or area > self.MAX_BLOB_PIXELS:
                 continue
 
             bx, by, bw, bh = cv2.boundingRect(cnt)
@@ -471,6 +505,7 @@ class SilhouetteTracker:
                 best_score = score
                 best_cx = cx
                 best_cy = cy
+                best_max_dim = max_dim
 
         if best_score <= 0:
             return None
@@ -478,6 +513,19 @@ class SilhouetteTracker:
         # Convert ROI coords to full-frame coords
         full_x = x0 + best_cx
         full_y = y0 + best_cy
+
+        # Jitter confirm: during expect window, if detected motion is small
+        # (consistent with commanded ±Npx), this is a confirmed cursor position.
+        # Only the cursor moves when we command jitter — UI stays still.
+        if jitter_mode and best_max_dim < self._expected_amplitude * 10:
+            self._expecting_motion = False  # Consumed — don't confirm twice
+            return TrackResult(
+                x=full_x,
+                y=full_y,
+                confidence=0.95,  # High — commanded motion = proof
+                method="jitter_confirm",
+                roi_size=self._roi_size,
+            )
 
         return TrackResult(
             x=full_x,

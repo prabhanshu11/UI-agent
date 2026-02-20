@@ -113,13 +113,20 @@ var CanvasOverlays = (function() {
         ctx.setLineDash([]);
     }
 
-    /** Green/yellow/red crosshair at cursor position. */
+    /** Determine best confidence score from CNN or YOLO. */
+    function _cursorConfidence(state) {
+        var cnn = (state.cnn && state.cnn.confidence) || 0;
+        var yolo = (state.yolo && state.yolo.active && state.yolo.confidence) || 0;
+        return Math.max(cnn, yolo);
+    }
+
+    /** Green/yellow/red crosshair — color based on CNN/YOLO confidence. */
     function drawCursorCrosshair(ctx, state, w, h) {
         var cx = state.cursor.x, cy = state.cursor.y;
         if (cx <= 0 && cy <= 0) return;
 
-        var age = state.cursor.age_s;
-        var color = age < 5 ? '#00cc00' : age < 30 ? '#ffcc00' : '#ff3333';
+        var conf = _cursorConfidence(state);
+        var color = conf >= 0.7 ? '#00cc00' : conf >= 0.4 ? '#ffcc00' : '#ff3333';
         var size = 20;
 
         ctx.strokeStyle = color;
@@ -136,21 +143,21 @@ var CanvasOverlays = (function() {
         ctx.stroke();
     }
 
-    /** TRACKING/STALE/LOST text in bottom-left. */
+    /** TRACKING/STALE/LOST text in bottom-left — based on CNN/YOLO confidence. */
     function drawTrackingHud(ctx, state, w, h) {
-        var age = state.cursor.age_s;
         var cx = state.cursor.x, cy = state.cursor.y;
+        var conf = _cursorConfidence(state);
         var color, label;
 
-        if (age < 5) {
+        if (conf >= 0.7) {
             color = '#00cc00';
-            label = 'TRACKING (' + cx + ',' + cy + ')';
-        } else if (age < 30) {
+            label = 'TRACKING ' + Math.round(conf * 100) + '% (' + cx + ',' + cy + ')';
+        } else if (conf >= 0.4) {
             color = '#ffcc00';
-            label = 'STALE ' + Math.round(age) + 's (' + cx + ',' + cy + ')';
+            label = 'LOW CONF ' + Math.round(conf * 100) + '% (' + cx + ',' + cy + ')';
         } else {
             color = '#ff3333';
-            label = 'LOST ' + Math.round(age) + 's';
+            label = 'LOST ' + Math.round(conf * 100) + '%';
         }
 
         ctx.font = '14px JetBrains Mono, monospace';

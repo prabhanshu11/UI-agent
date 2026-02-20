@@ -423,3 +423,27 @@
 {"filename": "pos_000742.png", "action": "tag", "tags": {"cursor_type": "ibeam"}, "timestamp": 1771558793.3545482}
 {"filename": "pos_000340.png", "action": "wrong", "timestamp": 1771558795.6783826, "corrected_label": "neg"}
 {"filename": "pos_000341.png", "action": "wrong", "timestamp": 1771558796.3473623, "corrected_label": "neg"}
+{"filename": "pos_001698.png", "action": "correct", "timestamp": 1771561166.4132965}
+{"filename": "neg_000285.png", "action": "wrong", "timestamp": 1771561168.946842, "corrected_label": "pos"}
+{"filename": "neg_001274.png", "action": "wrong", "timestamp": 1771561169.9610283, "corrected_label": "pos"}
+{"filename": "pos_001465.png", "action": "wrong", "timestamp": 1771561196.7820652, "corrected_label": "neg"}
+{"filename": "neg_001116.png", "action": "correct", "timestamp": 1771561212.3364787}
+{"filename": "pos_001076.png", "action": "correct", "timestamp": 1771561213.4988089}
+{"filename": "neg_001120.png", "action": "correct", "timestamp": 1771561215.028543}
+{"filename": "pos_001077.png", "action": "correct", "timestamp": 1771561216.2596803}
+{"filename": "neg_001124.png", "action": "correct", "timestamp": 1771561217.2558498}
+{"filename": "pos_001078.png", "action": "correct", "timestamp": 1771561218.3953404}
+{"filename": "neg_001128.png", "action": "correct", "timestamp": 1771561222.0025127}
+{"filename": "neg_001114.png", "action": "correct", "timestamp": 1771561223.2265208}
+{"filename": "neg_001115.png", "action": "correct", "timestamp": 1771561223.7807398}
+{"filename": "neg_001117.png", "action": "correct", "timestamp": 1771561224.7569985}
+{"filename": "neg_001129.png", "action": "correct", "timestamp": 1771561228.0427966}
+{"filename": "neg_001127.png", "action": "correct", "timestamp": 1771561229.6475508}
+{"filename": "neg_001126.png", "action": "correct", "timestamp": 1771561230.8526123}
+{"filename": "pos_001075.png", "action": "wrong", "timestamp": 1771561231.709297, "corrected_label": "neg"}
+{"filename": "neg_001125.png", "action": "correct", "timestamp": 1771561232.4731586}
+{"filename": "neg_001123.png", "action": "correct", "timestamp": 1771561232.9536421}
+{"filename": "neg_001122.png", "action": "correct", "timestamp": 1771561233.380799}
+{"filename": "neg_001121.png", "action": "correct", "timestamp": 1771561233.928686}
+{"filename": "neg_001119.png", "action": "correct", "timestamp": 1771561234.4085395}
+{"filename": "neg_001118.png", "action": "correct", "timestamp": 1771561236.0664778}

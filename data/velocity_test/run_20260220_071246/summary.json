@@ -1,0 +1,243 @@
+{
+  "V1_right": {
+    "count": 25,
+    "error_mean": 82.2,
+    "error_max": 155.0,
+    "error_min": 2.0,
+    "error_p95": 153.0,
+    "labels": {
+      "accurate": 1,
+      "drift": 11,
+      "wrong": 13,
+      "lost": 0
+    },
+    "accuracy_pct": 4.0,
+    "methods": [
+      "sil_template",
+      "motion_track"
+    ]
+  },
+  "V1_down": {
+    "count": 25,
+    "error_mean": 47.8,
+    "error_max": 87.3,
+    "error_min": 2.0,
+    "error_p95": 85.9,
+    "labels": {
+      "accurate": 6,
+      "drift": 16,
+      "wrong": 3,
+      "lost": 0
+    },
+    "accuracy_pct": 24.0,
+    "methods": [
+      "sil_template",
+      "motion_track"
+    ]
+  },
+  "V2_right": {
+    "count": 30,
+    "error_mean": 39.8,
+    "error_max": 80.4,
+    "error_min": 6.1,
+    "error_p95": 70.8,
+    "labels": {
+      "accurate": 6,
+      "drift": 23,
+      "wrong": 1,
+      "lost": 0
+    },
+    "accuracy_pct": 20.0,
+    "methods": [
+      "motion_track",
+      "probe_15"
+    ]
+  },
+  "V2_down": {
+    "count": 30,
+    "error_mean": 155.0,
+    "error_max": 300.0,
+    "error_min": 10.0,
+    "error_p95": 290.0,
+    "labels": {
+      "accurate": 1,
+      "drift": 6,
+      "wrong": 12,
+      "lost": 11
+    },
+    "accuracy_pct": 3.3,
+    "methods": [
+      "motion_track"
+    ]
+  },
+  "V3_right": {
+    "count": 10,
+    "error_mean": 275.0,
+    "error_max": 500.0,
+    "error_min": 50.0,
+    "error_p95": 500.0,
+    "labels": {
+      "accurate": 0,
+      "drift": 1,
+      "wrong": 2,
+      "lost": 7
+    },
+    "accuracy_pct": 0.0,
+    "methods": [
+      "motion_track"
+    ]
+  },
+  "V3_down": {
+    "count": 10,
+    "error_mean": 275.0,
+    "error_max": 500.0,
+    "error_min": 50.0,
+    "error_p95": 500.0,
+    "labels": {
+      "accurate": 0,
+      "drift": 1,
+      "wrong": 2,
+      "lost": 7
+    },
+    "accuracy_pct": 0.0,
+    "methods": [
+      "motion_track"
+    ]
+  },
+  "V4_right": {
+    "count": 1,
+    "error_mean": 400.0,
+    "error_max": 400.0,
+    "error_min": 400.0,
+    "error_p95": 400.0,
+    "labels": {
+      "accurate": 0,
+      "drift": 0,
+      "wrong": 0,
+      "lost": 1
+    },
+    "accuracy_pct": 0.0,
+    "methods": [
+      "motion_track"
+    ]
+  },
+  "V4_down": {
+    "count": 1,
+    "error_mean": 300.0,
+    "error_max": 300.0,
+    "error_min": 300.0,
+    "error_p95": 300.0,
+    "labels": {
+      "accurate": 0,
+      "drift": 0,
+      "wrong": 0,
+      "lost": 1
+    },
+    "accuracy_pct": 0.0,
+    "methods": [
+      "motion_track"
+    ]
+  },
+  "A1_right": {
+    "count": 20,
+    "error_mean": 118.2,
+    "error_max": 320.0,
+    "error_min": 2.0,
+    "error_p95": 320.0,
+    "labels": {
+      "accurate": 4,
+      "drift": 5,
+      "wrong": 6,
+      "lost": 5
+    },
+    "accuracy_pct": 20.0,
+    "methods": [
+      "motion_track"
+    ]
+  },
+  "A1_down": {
+    "count": 20,
+    "error_mean": 118.2,
+    "error_max": 320.0,
+    "error_min": 2.0,
+    "error_p95": 320.0,
+    "labels": {
+      "accurate": 4,
+      "drift": 5,
+      "wrong": 6,
+      "lost": 5
+    },
+    "accuracy_pct": 20.0,
+    "methods": [
+      "motion_track"
+    ]
+  },
+  "A2_right": {
+    "count": 20,
+    "error_mean": 209.8,
+    "error_max": 300.0,
+    "error_min": 30.0,
+    "error_p95": 300.0,
+    "labels": {
+      "accurate": 0,
+      "drift": 2,
+      "wrong": 6,
+      "lost": 12
+    },
+    "accuracy_pct": 0.0,
+    "methods": [
+      "motion_track"
+    ]
+  },
+  "A2_down": {
+    "count": 20,
+    "error_mean": 209.8,
+    "error_max": 300.0,
+    "error_min": 30.0,
+    "error_p95": 300.0,
+    "labels": {
+      "accurate": 0,
+      "drift": 2,
+      "wrong": 6,
+      "lost": 12
+    },
+    "accuracy_pct": 0.0,
+    "methods": [
+      "motion_track"
+    ]
+  },
+  "A3_right": {
+    "count": 50,
+    "error_mean": 1.0,
+    "error_max": 2.0,
+    "error_min": 0.0,
+    "error_p95": 2.0,
+    "labels": {
+      "accurate": 50,
+      "drift": 0,
+      "wrong": 0,
+      "lost": 0
+    },
+    "accuracy_pct": 100.0,
+    "methods": [
+      "motion_track"
+    ]
+  },
+  "A3_down": {
+    "count": 50,
+    "error_mean": 1.0,
+    "error_max": 2.0,
+    "error_min": 0.0,
+    "error_p95": 2.0,
+    "labels": {
+      "accurate": 50,
+      "drift": 0,
+      "wrong": 0,
+      "lost": 0
+    },
+    "accuracy_pct": 100.0,
+    "methods": [
+      "motion_track"
+    ]
+  }
+}

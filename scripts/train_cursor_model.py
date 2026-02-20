@@ -34,6 +34,40 @@ SAMPLES_DIR = PROJECT_ROOT / "data" / "cursor_samples"
 MODELS_DIR = PROJECT_ROOT / "data" / "cursor_models"
 
 
+class FocalLoss(nn.Module):
+    """Focal loss for binary classification — focuses on hard examples.
+
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+
+    gamma=2: easy samples (p_t > 0.8) contribute almost nothing to loss
+    alpha=0.6: slight upweight for positives (cursor present) since
+               false negatives are worse than false positives
+    """
+
+    def __init__(self, alpha: float = 0.6, gamma: float = 2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        eps = 1e-7
+        pred = pred.clamp(eps, 1 - eps)
+
+        # Binary cross entropy per sample
+        bce = -(target * torch.log(pred) + (1 - target) * torch.log(1 - pred))
+
+        # p_t = probability of correct class
+        p_t = pred * target + (1 - pred) * (1 - target)
+
+        # Alpha weighting: alpha for positives, (1-alpha) for negatives
+        alpha_t = self.alpha * target + (1 - self.alpha) * (1 - target)
+
+        # Focal modulation
+        focal_weight = alpha_t * (1 - p_t) ** self.gamma
+
+        return (focal_weight * bce).mean()
+
+
 class CursorPatchDataset(Dataset):
     """Dataset of 64x64 grayscale cursor patches with binary labels."""
 
@@ -64,7 +98,13 @@ class CursorPatchDataset(Dataset):
         return tensor, torch.tensor([label], dtype=torch.float32)
 
     def _augment(self, patch: np.ndarray, is_positive: bool = False) -> np.ndarray:
-        """Apply random augmentations: flip, rotation (neg only), brightness jitter."""
+        """Apply random augmentations for cursor detection training.
+
+        Positives: brightness, contrast, small translation (cursor at patch edge)
+        Negatives: all of above + rotation, flip
+        """
+        h, w = patch.shape[:2]
+
         # Random horizontal flip
         if random.random() > 0.5:
             patch = np.fliplr(patch).copy()
@@ -75,9 +115,28 @@ class CursorPatchDataset(Dataset):
             if k > 0:
                 patch = np.rot90(patch, k).copy()
 
-        # Brightness jitter (+-30)
-        jitter = random.randint(-30, 30)
+        # Small random translation (±8px) — simulates cursor not perfectly centered
+        if random.random() > 0.4:
+            tx = random.randint(-8, 8)
+            ty = random.randint(-8, 8)
+            M = np.float32([[1, 0, tx], [0, 1, ty]])
+            patch = cv2.warpAffine(patch, M, (w, h), borderMode=cv2.BORDER_REFLECT)
+
+        # Brightness jitter (±40)
+        jitter = random.randint(-40, 40)
         patch = np.clip(patch.astype(np.int16) + jitter, 0, 255).astype(np.uint8)
+
+        # Contrast jitter (0.7-1.3x)
+        if random.random() > 0.5:
+            factor = random.uniform(0.7, 1.3)
+            mean = patch.mean()
+            patch = np.clip((patch.astype(np.float32) - mean) * factor + mean,
+                            0, 255).astype(np.uint8)
+
+        # Gaussian noise (simulates JPEG compression artifacts)
+        if random.random() > 0.6:
+            noise = np.random.normal(0, random.uniform(3, 10), patch.shape)
+            patch = np.clip(patch.astype(np.float32) + noise, 0, 255).astype(np.uint8)
 
         return patch
 
@@ -205,6 +264,19 @@ def train(args):
         print(f"Warning: {len(entries) - len(valid_entries)} samples have missing files, skipped")
     entries = valid_entries
 
+    # Balance classes if requested
+    if args.balance:
+        min_count = min(pos_count, neg_count)
+        pos_list = [e for e in entries if e["label"] == "pos"]
+        neg_list = [e for e in entries if e["label"] == "neg"]
+        random.shuffle(pos_list)
+        random.shuffle(neg_list)
+        entries = pos_list[:min_count] + neg_list[:min_count]
+        random.shuffle(entries)
+        pos_count = min_count
+        neg_count = min_count
+        print(f"Balanced to {min_count} per class ({len(entries)} total)")
+
     train_entries, val_entries = stratified_split(entries, val_ratio=0.2)
     print(f"Split: {len(train_entries)} train, {len(val_entries)} val")
 
@@ -220,8 +292,13 @@ def train(args):
         model.load_state_dict(torch.load(args.from_model, map_location="cpu", weights_only=True))
     print(f"Model parameters: {count_parameters(model):,}")
 
-    criterion = nn.BCELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    if args.focal:
+        criterion = FocalLoss(alpha=args.focal_alpha, gamma=args.focal_gamma)
+        print(f"Using Focal Loss (alpha={args.focal_alpha}, gamma={args.focal_gamma})")
+    else:
+        criterion = nn.BCELoss()
+        print("Using BCE Loss")
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     best_val_loss = float("inf")
     patience_counter = 0
@@ -244,11 +321,12 @@ def train(args):
             train_correct += ((pred > 0.5).float() == y).sum().item()
             train_total += X.size(0)
 
-        # Validate
+        # Validate with per-class metrics
         model.eval()
         val_loss = 0.0
         val_correct = 0
         val_total = 0
+        val_tp = val_fp = val_tn = val_fn = 0
         with torch.no_grad():
             for X, y in val_dl:
                 pred = model(X)
@@ -256,15 +334,23 @@ def train(args):
                 val_loss += loss.item() * X.size(0)
                 val_correct += ((pred > 0.5).float() == y).sum().item()
                 val_total += X.size(0)
+                pred_bin = (pred > 0.5).float()
+                val_tp += ((pred_bin == 1) & (y == 1)).sum().item()
+                val_fp += ((pred_bin == 1) & (y == 0)).sum().item()
+                val_tn += ((pred_bin == 0) & (y == 0)).sum().item()
+                val_fn += ((pred_bin == 0) & (y == 1)).sum().item()
 
         train_loss /= train_total
         val_loss /= val_total
         train_acc = train_correct / train_total
         val_acc = val_correct / val_total
+        prec = val_tp / max(val_tp + val_fp, 1)
+        rec = val_tp / max(val_tp + val_fn, 1)
 
         print(f"Epoch {epoch:3d}/{args.epochs}  "
               f"train_loss={train_loss:.4f} train_acc={train_acc:.3f}  "
-              f"val_loss={val_loss:.4f} val_acc={val_acc:.3f}")
+              f"val_loss={val_loss:.4f} val_acc={val_acc:.3f}  "
+              f"P={prec:.3f} R={rec:.3f}")
 
         # Early stopping
         if val_loss < best_val_loss:
@@ -291,6 +377,9 @@ def train(args):
         "best_val_loss": round(best_val_loss, 4),
         "val_acc": round(val_acc, 4),
         "from_model": str(args.from_model) if args.from_model else None,
+        "loss_fn": "focal" if args.focal else "bce",
+        "focal_alpha": args.focal_alpha if args.focal else None,
+        "focal_gamma": args.focal_gamma if args.focal else None,
     }
     model_path = save_model(model, MODELS_DIR, metrics=metrics)
     print(f"\nModel saved to {model_path}")
@@ -307,6 +396,14 @@ def main():
                         help="Minimum samples per class required to train")
     parser.add_argument("--from-model", type=Path, default=None,
                         help="Path to existing .pt model for fine-tuning")
+    parser.add_argument("--balance", action="store_true",
+                        help="Balance classes by undersampling majority class")
+    parser.add_argument("--focal", action="store_true",
+                        help="Use focal loss instead of BCE (better for hard examples)")
+    parser.add_argument("--focal-alpha", type=float, default=0.6,
+                        help="Focal loss alpha (positive class weight)")
+    parser.add_argument("--focal-gamma", type=float, default=2.0,
+                        help="Focal loss gamma (focus on hard examples)")
     args = parser.parse_args()
     train(args)
 

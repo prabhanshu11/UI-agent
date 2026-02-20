@@ -192,10 +192,12 @@ async function updateState() {
             document.getElementById('sil-latency').textContent =
                 s.silhouette.latency_ms.toFixed(2) + 'ms';
             var trusted = s.cnn.cursor_validated ||
-                s.silhouette.confidence > 0.7 ||
-                s.silhouette.method === 'motion_roi';
+                s.cnn.confidence > 0.8 ||
+                s.silhouette.method === 'motion_roi' ||
+                s.silhouette.method === 'jitter_confirm' ||
+                (s.yolo && s.yolo.active);
             var trustEl = document.getElementById('sil-trusted');
-            trustEl.textContent = trusted ? 'Yes' : 'Gated (CNN < 70%)';
+            trustEl.textContent = trusted ? 'Yes' : 'Gated';
             trustEl.className = 'hw-value ' + (trusted ? 'ok' : 'warn');
         }
 
@@ -280,6 +282,24 @@ function togglePause() {
         document.getElementById('tag-notes').value = '';
         document.getElementById('tag-status').textContent = '';
     }
+}
+
+// ── YOLO manual detect ──────────────────────────────────────
+function runYoloDetect() {
+    var btn = document.getElementById('yolo-btn');
+    btn.textContent = 'Detecting...';
+    btn.disabled = true;
+    fetch('/api/yolo_detect_now')
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            btn.textContent = d.active ? 'Detected!' : 'No detection';
+            btn.disabled = false;
+            setTimeout(function() { btn.textContent = 'Run Detection'; }, 2000);
+        })
+        .catch(function() {
+            btn.textContent = 'Run Detection';
+            btn.disabled = false;
+        });
 }
 
 // ── Claude Vision detect ─────────────────────────────────────

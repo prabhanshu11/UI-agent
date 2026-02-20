@@ -1,0 +1,284 @@
+{
+  "V0_right": {
+    "count": 39,
+    "velocity_px_s_mean": 0.0,
+    "velocity_px_s_max": 0.0,
+    "error_mean": 45.4,
+    "error_max": 130.1,
+    "error_min": 0.0,
+    "error_p95": 130.1,
+    "labels": {
+      "accurate": 15,
+      "drift": 13,
+      "wrong": 11,
+      "lost": 0
+    },
+    "accuracy_pct": 38.5,
+    "methods": [
+      "esp32_dead_reckoning",
+      "motion_track"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.8375,
+      "v001_20260219": 0.7656,
+      "v002_20260220": 0.7526,
+      "v003_20260220": 0.7357,
+      "v004_20260220": 0.7351,
+      "v005_20260220": 0.9152,
+      "v006_20260220": 0.7718
+    }
+  },
+  "V0_down": {
+    "count": 39,
+    "velocity_px_s_mean": 0.0,
+    "velocity_px_s_max": 0.0,
+    "error_mean": 41.4,
+    "error_max": 72.2,
+    "error_min": 0.0,
+    "error_p95": 72.2,
+    "labels": {
+      "accurate": 16,
+      "drift": 23,
+      "wrong": 0,
+      "lost": 0
+    },
+    "accuracy_pct": 41.0,
+    "methods": [
+      "esp32_dead_reckoning",
+      "motion_track"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.7389,
+      "v001_20260219": 0.6735,
+      "v002_20260220": 0.6852,
+      "v003_20260220": 0.6574,
+      "v004_20260220": 0.6666,
+      "v005_20260220": 0.9082,
+      "v006_20260220": 0.7354
+    }
+  },
+  "V100_right": {
+    "count": 39,
+    "velocity_px_s_mean": 100.0,
+    "velocity_px_s_max": 100.0,
+    "error_mean": 3.2,
+    "error_max": 6.0,
+    "error_min": 0.0,
+    "error_p95": 6.0,
+    "labels": {
+      "accurate": 39,
+      "drift": 0,
+      "wrong": 0,
+      "lost": 0
+    },
+    "accuracy_pct": 100.0,
+    "methods": [
+      "esp32_dead_reckoning"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.034,
+      "v001_20260219": 0.1165,
+      "v002_20260220": 0.097,
+      "v003_20260220": 0.0578,
+      "v004_20260220": 0.0671,
+      "v005_20260220": 0.0835,
+      "v006_20260220": 0.0677
+    }
+  },
+  "V100_down": {
+    "count": 39,
+    "velocity_px_s_mean": 100.0,
+    "velocity_px_s_max": 100.0,
+    "error_mean": 2.6,
+    "error_max": 50.0,
+    "error_min": 0.0,
+    "error_p95": 15.0,
+    "labels": {
+      "accurate": 38,
+      "drift": 1,
+      "wrong": 0,
+      "lost": 0
+    },
+    "accuracy_pct": 97.4,
+    "methods": [
+      "esp32_dead_reckoning"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.034,
+      "v001_20260219": 0.1165,
+      "v002_20260220": 0.097,
+      "v003_20260220": 0.0578,
+      "v004_20260220": 0.0671,
+      "v005_20260220": 0.0835,
+      "v006_20260220": 0.0677
+    }
+  },
+  "V300_right": {
+    "count": 26,
+    "velocity_px_s_mean": 300.0,
+    "velocity_px_s_max": 300.0,
+    "error_mean": 4.2,
+    "error_max": 12.0,
+    "error_min": 0.0,
+    "error_p95": 12.0,
+    "labels": {
+      "accurate": 26,
+      "drift": 0,
+      "wrong": 0,
+      "lost": 0
+    },
+    "accuracy_pct": 100.0,
+    "methods": [
+      "esp32_dead_reckoning"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.034,
+      "v001_20260219": 0.1165,
+      "v002_20260220": 0.097,
+      "v003_20260220": 0.0578,
+      "v004_20260220": 0.0671,
+      "v005_20260220": 0.0835,
+      "v006_20260220": 0.0677
+    }
+  },
+  "V300_down": {
+    "count": 26,
+    "velocity_px_s_mean": 300.0,
+    "velocity_px_s_max": 300.0,
+    "error_mean": 11.5,
+    "error_max": 36.0,
+    "error_min": 0.0,
+    "error_p95": 30.0,
+    "labels": {
+      "accurate": 22,
+      "drift": 4,
+      "wrong": 0,
+      "lost": 0
+    },
+    "accuracy_pct": 84.6,
+    "methods": [
+      "esp32_dead_reckoning"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.0362,
+      "v001_20260219": 0.1601,
+      "v002_20260220": 0.1397,
+      "v003_20260220": 0.1037,
+      "v004_20260220": 0.1111,
+      "v005_20260220": 0.1158,
+      "v006_20260220": 0.1059
+    }
+  },
+  "V500_right": {
+    "count": 26,
+    "velocity_px_s_mean": 500.0,
+    "velocity_px_s_max": 500.0,
+    "error_mean": 11.2,
+    "error_max": 30.0,
+    "error_min": 0.0,
+    "error_p95": 30.0,
+    "labels": {
+      "accurate": 17,
+      "drift": 9,
+      "wrong": 0,
+      "lost": 0
+    },
+    "accuracy_pct": 65.4,
+    "methods": [
+      "esp32_dead_reckoning"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.034,
+      "v001_20260219": 0.1165,
+      "v002_20260220": 0.097,
+      "v003_20260220": 0.0578,
+      "v004_20260220": 0.0671,
+      "v005_20260220": 0.0835,
+      "v006_20260220": 0.0677
+    }
+  },
+  "V500_down": {
+    "count": 26,
+    "velocity_px_s_mean": 500.0,
+    "velocity_px_s_max": 500.0,
+    "error_mean": 10.0,
+    "error_max": 20.0,
+    "error_min": 0.0,
+    "error_p95": 20.0,
+    "labels": {
+      "accurate": 22,
+      "drift": 4,
+      "wrong": 0,
+      "lost": 0
+    },
+    "accuracy_pct": 84.6,
+    "methods": [
+      "esp32_dead_reckoning"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.0365,
+      "v001_20260219": 0.144,
+      "v002_20260220": 0.1151,
+      "v003_20260220": 0.075,
+      "v004_20260220": 0.0832,
+      "v005_20260220": 0.1219,
+      "v006_20260220": 0.1125
+    }
+  },
+  "V1K_right": {
+    "count": 14,
+    "velocity_px_s_mean": 1000.0,
+    "velocity_px_s_max": 1000.0,
+    "error_mean": 17.3,
+    "error_max": 40.0,
+    "error_min": 0.0,
+    "error_p95": 40.0,
+    "labels": {
+      "accurate": 5,
+      "drift": 9,
+      "wrong": 0,
+      "lost": 0
+    },
+    "accuracy_pct": 35.7,
+    "methods": [
+      "esp32_dead_reckoning"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.034,
+      "v001_20260219": 0.1165,
+      "v002_20260220": 0.097,
+      "v003_20260220": 0.0578,
+      "v004_20260220": 0.0671,
+      "v005_20260220": 0.0835,
+      "v006_20260220": 0.0677
+    }
+  },
+  "V1K_down": {
+    "count": 14,
+    "velocity_px_s_mean": 1000.0,
+    "velocity_px_s_max": 1000.0,
+    "error_mean": 17.1,
+    "error_max": 40.0,
+    "error_min": 0.0,
+    "error_p95": 40.0,
+    "labels": {
+      "accurate": 3,
+      "drift": 11,
+      "wrong": 0,
+      "lost": 0
+    },
+    "accuracy_pct": 21.4,
+    "methods": [
+      "esp32_dead_reckoning"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.032,
+      "v001_20260219": 0.1374,
+      "v002_20260220": 0.1204,
+      "v003_20260220": 0.0806,
+      "v004_20260220": 0.0901,
+      "v005_20260220": 0.1288,
+      "v006_20260220": 0.1261
+    }
+  }
+}

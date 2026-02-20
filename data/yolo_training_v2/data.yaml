@@ -1,0 +1,8 @@
+# Cursor detection v2 dataset
+path: /home/prabhanshu/Programs/UI-agent/data/yolo_training_v2
+train: images/train
+val: images/val
+
+nc: 1
+names:
+  0: cursor

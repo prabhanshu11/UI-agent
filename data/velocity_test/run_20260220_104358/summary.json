@@ -1,0 +1,284 @@
+{
+  "V0_right": {
+    "count": 39,
+    "velocity_px_s_mean": 0.0,
+    "velocity_px_s_max": 0.0,
+    "error_mean": 0.0,
+    "error_max": 0.0,
+    "error_min": 0.0,
+    "error_p95": 0.0,
+    "labels": {
+      "accurate": 39,
+      "drift": 0,
+      "wrong": 0,
+      "lost": 0
+    },
+    "accuracy_pct": 100.0,
+    "methods": [
+      "sil_template"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.7213,
+      "v001_20260219": 0.8323,
+      "v002_20260220": 0.8754,
+      "v003_20260220": 0.8941,
+      "v004_20260220": 0.8882,
+      "v005_20260220": 0.743,
+      "v006_20260220": 0.9013
+    }
+  },
+  "V0_down": {
+    "count": 39,
+    "velocity_px_s_mean": 0.0,
+    "velocity_px_s_max": 0.0,
+    "error_mean": 0.0,
+    "error_max": 0.0,
+    "error_min": 0.0,
+    "error_p95": 0.0,
+    "labels": {
+      "accurate": 39,
+      "drift": 0,
+      "wrong": 0,
+      "lost": 0
+    },
+    "accuracy_pct": 100.0,
+    "methods": [
+      "sil_template"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.548,
+      "v001_20260219": 0.8105,
+      "v002_20260220": 0.8745,
+      "v003_20260220": 0.8919,
+      "v004_20260220": 0.8862,
+      "v005_20260220": 0.723,
+      "v006_20260220": 0.8796
+    }
+  },
+  "V100_right": {
+    "count": 39,
+    "velocity_px_s_mean": 100.0,
+    "velocity_px_s_max": 100.0,
+    "error_mean": 139.2,
+    "error_max": 266.9,
+    "error_min": 2.0,
+    "error_p95": 265.0,
+    "labels": {
+      "accurate": 3,
+      "drift": 2,
+      "wrong": 25,
+      "lost": 9
+    },
+    "accuracy_pct": 7.7,
+    "methods": [
+      "sil_template",
+      "motion_track"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.6948,
+      "v001_20260219": 0.6925,
+      "v002_20260220": 0.6977,
+      "v003_20260220": 0.6797,
+      "v004_20260220": 0.6838,
+      "v005_20260220": 0.8901,
+      "v006_20260220": 0.7569
+    }
+  },
+  "V100_down": {
+    "count": 39,
+    "velocity_px_s_mean": 100.0,
+    "velocity_px_s_max": 100.0,
+    "error_mean": 156.6,
+    "error_max": 297.1,
+    "error_min": 2.0,
+    "error_p95": 295.1,
+    "labels": {
+      "accurate": 3,
+      "drift": 7,
+      "wrong": 15,
+      "lost": 14
+    },
+    "accuracy_pct": 7.7,
+    "methods": [
+      "motion_track"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.7464,
+      "v001_20260219": 0.5967,
+      "v002_20260220": 0.588,
+      "v003_20260220": 0.5731,
+      "v004_20260220": 0.5701,
+      "v005_20260220": 0.8744,
+      "v006_20260220": 0.6889
+    }
+  },
+  "V300_right": {
+    "count": 26,
+    "velocity_px_s_mean": 300.0,
+    "velocity_px_s_max": 300.0,
+    "error_mean": 331.0,
+    "error_max": 640.5,
+    "error_min": 6.0,
+    "error_p95": 621.7,
+    "labels": {
+      "accurate": 1,
+      "drift": 3,
+      "wrong": 6,
+      "lost": 16
+    },
+    "accuracy_pct": 3.8,
+    "methods": [
+      "sil_motion_roi",
+      "motion_track"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.73,
+      "v001_20260219": 0.6677,
+      "v002_20260220": 0.6558,
+      "v003_20260220": 0.6352,
+      "v004_20260220": 0.6417,
+      "v005_20260220": 0.8559,
+      "v006_20260220": 0.712
+    }
+  },
+  "V300_down": {
+    "count": 26,
+    "velocity_px_s_mean": 300.0,
+    "velocity_px_s_max": 300.0,
+    "error_mean": 583.8,
+    "error_max": 764.0,
+    "error_min": 473.0,
+    "error_p95": 750.0,
+    "labels": {
+      "accurate": 0,
+      "drift": 0,
+      "wrong": 0,
+      "lost": 26
+    },
+    "accuracy_pct": 0.0,
+    "methods": [
+      "motion_track"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.034,
+      "v001_20260219": 0.1165,
+      "v002_20260220": 0.097,
+      "v003_20260220": 0.0578,
+      "v004_20260220": 0.0671,
+      "v005_20260220": 0.0835,
+      "v006_20260220": 0.0677
+    }
+  },
+  "V500_right": {
+    "count": 26,
+    "velocity_px_s_mean": 500.0,
+    "velocity_px_s_max": 500.0,
+    "error_mean": 509.6,
+    "error_max": 1000.0,
+    "error_min": 10.0,
+    "error_p95": 970.0,
+    "labels": {
+      "accurate": 1,
+      "drift": 1,
+      "wrong": 3,
+      "lost": 21
+    },
+    "accuracy_pct": 3.8,
+    "methods": [
+      "motion_track"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.034,
+      "v001_20260219": 0.1165,
+      "v002_20260220": 0.097,
+      "v003_20260220": 0.0578,
+      "v004_20260220": 0.0671,
+      "v005_20260220": 0.0835,
+      "v006_20260220": 0.0677
+    }
+  },
+  "V500_down": {
+    "count": 26,
+    "velocity_px_s_mean": 500.0,
+    "velocity_px_s_max": 500.0,
+    "error_mean": 509.6,
+    "error_max": 1000.0,
+    "error_min": 10.0,
+    "error_p95": 970.0,
+    "labels": {
+      "accurate": 1,
+      "drift": 1,
+      "wrong": 3,
+      "lost": 21
+    },
+    "accuracy_pct": 3.8,
+    "methods": [
+      "motion_track"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.034,
+      "v001_20260219": 0.1165,
+      "v002_20260220": 0.097,
+      "v003_20260220": 0.0578,
+      "v004_20260220": 0.0671,
+      "v005_20260220": 0.0835,
+      "v006_20260220": 0.0677
+    }
+  },
+  "V1K_right": {
+    "count": 14,
+    "velocity_px_s_mean": 1000.0,
+    "velocity_px_s_max": 1000.0,
+    "error_mean": 651.3,
+    "error_max": 1049.0,
+    "error_min": 317.6,
+    "error_p95": 1049.0,
+    "labels": {
+      "accurate": 0,
+      "drift": 0,
+      "wrong": 0,
+      "lost": 14
+    },
+    "accuracy_pct": 0.0,
+    "methods": [
+      "motion_track"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.034,
+      "v001_20260219": 0.1165,
+      "v002_20260220": 0.097,
+      "v003_20260220": 0.0578,
+      "v004_20260220": 0.0671,
+      "v005_20260220": 0.0835,
+      "v006_20260220": 0.0677
+    }
+  },
+  "V1K_down": {
+    "count": 14,
+    "velocity_px_s_mean": 1000.0,
+    "velocity_px_s_max": 1000.0,
+    "error_mean": 556.8,
+    "error_max": 1006.1,
+    "error_min": 112.8,
+    "error_p95": 1006.1,
+    "labels": {
+      "accurate": 0,
+      "drift": 0,
+      "wrong": 2,
+      "lost": 12
+    },
+    "accuracy_pct": 0.0,
+    "methods": [
+      "motion_track"
+    ],
+    "cnn_comparison": {
+      "v007_20260220": 0.034,
+      "v001_20260219": 0.1165,
+      "v002_20260220": 0.097,
+      "v003_20260220": 0.0578,
+      "v004_20260220": 0.0671,
+      "v005_20260220": 0.0835,
+      "v006_20260220": 0.0677
+    }
+  }
+}

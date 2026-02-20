@@ -1,0 +1,5 @@
+path: /home/prabhanshu/Programs/UI-agent/data/yolo_training_v3
+train: images/train
+val: images/val
+nc: 1
+names: ['cursor']

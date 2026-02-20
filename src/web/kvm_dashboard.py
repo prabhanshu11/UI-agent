@@ -152,15 +152,118 @@ _vtest_summary: dict = {}
 _VTEST_DIR = Path(__file__).parent.parent.parent / "data" / "velocity_test"
 
 VELOCITY_PROFILES = {
-    "V0": {"desc": "Stationary", "dx": 0, "dy": 0, "steps": 50, "delay_ms": 200},
-    "V1": {"desc": "Slow diagonal", "dx": 2, "dy": 2, "steps": 25, "delay_ms": 200},
-    "V2": {"desc": "Medium horizontal", "dx": 10, "dy": 0, "steps": 30, "delay_ms": 100},
-    "V3": {"desc": "Fast sweep", "dx": 50, "dy": 0, "steps": 10, "delay_ms": 80},
-    "V4": {"desc": "Snap to corner", "dx": 400, "dy": 300, "steps": 1, "delay_ms": 2000},
-    "A1": {"desc": "Accelerating", "accel": "up", "start_speed": 2, "end_speed": 30, "steps": 20, "delay_ms": 150},
-    "A2": {"desc": "Decelerate+stop", "accel": "down", "start_speed": 30, "end_speed": 0, "steps": 20, "delay_ms": 150},
-    "A3": {"desc": "Tiny jitter", "dx": 2, "dy": 0, "steps": 50, "delay_ms": 200, "alternate": True},
+    # Constant velocity — precise px/s control via HID physics
+    "V0":     {"desc": "Stationary",       "velocity_px_s": 0,    "duration_s": 3.0},
+    "V100":   {"desc": "Slow 100px/s",     "velocity_px_s": 100,  "duration_s": 3.0},
+    "V300":   {"desc": "Medium 300px/s",    "velocity_px_s": 300,  "duration_s": 2.0},
+    "V500":   {"desc": "Medium 500px/s",    "velocity_px_s": 500,  "duration_s": 2.0},
+    "V1K":    {"desc": "Fast 1000px/s",     "velocity_px_s": 1000, "duration_s": 1.0},
+    "V2K":    {"desc": "Very fast 2Kpx/s",  "velocity_px_s": 2000, "duration_s": 0.5},
+    "V3K":    {"desc": "Extreme 3Kpx/s",    "velocity_px_s": 3000, "duration_s": 0.3},
+    "V5K":    {"desc": "Stress 5Kpx/s",     "velocity_px_s": 5000, "duration_s": 0.2},
+    # Acceleration ramps
+    "A_UP":   {"desc": "0→2000 in 0.5s",    "velocity_px_s": 0,    "accel_px_s2": 4000,  "duration_s": 0.5},
+    "A_DOWN": {"desc": "2000→0 in 0.5s",    "velocity_px_s": 2000, "accel_px_s2": -4000, "duration_s": 0.5},
+    "A_BURST":{"desc": "Burst 2K for 0.2s", "velocity_px_s": 2000, "duration_s": 0.2},
+    # Replay actual loss events
+    "REPLAY": {"desc": "Replay loss event",  "replay": True},
+    # Diagonal
+    "D500":   {"desc": "Diagonal 500px/s",  "velocity_px_s": 500,  "duration_s": 2.0, "diagonal": True},
+    "D2K":    {"desc": "Diagonal 2Kpx/s",   "velocity_px_s": 2000, "duration_s": 0.5, "diagonal": True},
+    # Jitter (micro-shake equivalent)
+    "JITTER": {"desc": "±3px jitter",       "velocity_px_s": 0,    "jitter_px": 3,    "duration_s": 3.0},
 }
+
+
+def _generate_hid_reports(velocity_px_s: float, duration_s: float,
+                          direction: tuple = (1, 0), accel: float = 0,
+                          jitter_px: int = 0) -> list[tuple[int, int]]:
+    """Generate list of (dx, dy) HID reports for target velocity.
+
+    At 50Hz (20ms reports): dx_per_report = velocity * 0.02.
+    Tracks fractional remainder for sub-pixel precision.
+    HID values clamped to [-127, 127] per report.
+    """
+    import random
+    reports = []
+    dt = 0.02  # 20ms per report (50Hz USB polling)
+    t = 0.0
+    rem_x, rem_y = 0.0, 0.0
+
+    while t < duration_s:
+        v = velocity_px_s + accel * t
+        if v < 0:
+            v = 0
+
+        if jitter_px > 0 and v == 0:
+            # Random ±jitter displacement
+            raw_x = random.randint(-jitter_px, jitter_px)
+            raw_y = random.randint(-jitter_px, jitter_px)
+        else:
+            disp = v * dt
+            raw_x = disp * direction[0] + rem_x
+            raw_y = disp * direction[1] + rem_y
+
+        dx = int(max(-127, min(127, round(raw_x))))
+        dy = int(max(-127, min(127, round(raw_y))))
+        rem_x = raw_x - dx
+        rem_y = raw_y - dy
+        reports.append((dx, dy))
+        t += dt
+
+    return reports
+
+
+def _replay_loss_event_reports() -> list[tuple[int, int]]:
+    """Extract velocity profile from the latest loss event and generate HID reports.
+
+    Reads timeline.jsonl from the most recent loss event directory,
+    extracts position deltas around the trigger point, and converts
+    them to HID reports that reproduce the movement pattern.
+    """
+    if not _LOSS_EVENT_DIR.exists():
+        return []
+
+    # Find latest event directory
+    event_dirs = sorted(_LOSS_EVENT_DIR.iterdir(), reverse=True)
+    event_dirs = [d for d in event_dirs if d.is_dir() and (d / "timeline.jsonl").exists()]
+    if not event_dirs:
+        return []
+
+    timeline_path = event_dirs[0] / "timeline.jsonl"
+    entries = []
+    with open(timeline_path) as f:
+        for line in f:
+            if line.strip():
+                entries.append(json.loads(line))
+
+    if len(entries) < 2:
+        return []
+
+    # Extract position deltas and timing around the trigger (t_offset_s near 0)
+    reports = []
+    for i in range(1, len(entries)):
+        e0, e1 = entries[i - 1], entries[i]
+        dt = e1.get("t_offset_s", 0) - e0.get("t_offset_s", 0)
+        if dt <= 0:
+            dt = 0.2  # fallback 5Hz
+        ddx = e1.get("cx", 0) - e0.get("cx", 0)
+        ddy = e1.get("cy", 0) - e0.get("cy", 0)
+        # Convert to HID reports at 50Hz within this time window
+        n_reports = max(1, int(dt / 0.02))
+        per_dx = ddx / n_reports
+        per_dy = ddy / n_reports
+        rx, ry = 0.0, 0.0
+        for _ in range(n_reports):
+            rx += per_dx
+            ry += per_dy
+            hdx = int(max(-127, min(127, round(rx))))
+            hdy = int(max(-127, min(127, round(ry))))
+            rx -= hdx
+            ry -= hdy
+            reports.append((hdx, hdy))
+
+    return reports
 
 
 def _auto_label(error_px: float) -> str:
@@ -189,8 +292,15 @@ _ring_lock = threading.Lock()
 
 _loss_event_active: bool = False
 _loss_event_cooldown: float = 0.0
-_loss_prev = {"validated": False, "cnn": 0.0, "sil": 0.0, "x": 0, "y": 0}
+_LOSS_HISTORY_SIZE = 8  # ~1.6s at 5Hz
+_loss_history: deque = deque(maxlen=_LOSS_HISTORY_SIZE)
 _loss_events_log: list[dict] = []  # in-memory index of captured events
+
+# Per-frame state log — compact JSONL for post-hoc debugging
+_STATE_LOG_DIR = Path(__file__).parent.parent.parent / "data"
+_STATE_LOG_PATH = _STATE_LOG_DIR / "state_log.jsonl"
+_STATE_LOG_MAX_BYTES = 50 * 1024 * 1024  # 50MB rotation
+_state_log_bytes = 0  # Track size to avoid stat() every frame
 
 
 mouse: Optional[ESP32Mouse] = None
@@ -204,12 +314,33 @@ sil_tracker: Optional[SilhouetteTracker] = None
 cmd_movement: Optional[CommandedMovement] = None
 yolo_detector: Optional[YOLOCursorDetector] = None
 
+# CNN model comparison for velocity tests (loaded at startup if models exist)
+_vtest_recognizers: dict[str, CursorRecognizer] = {}  # version -> recognizer
+
 # Sustained low-confidence tracker for jitter-based re-acquisition
 _low_confidence_since: float = 0.0  # monotonic time when CNN confidence first went <0.7
 _vision_lockout_until: float = 0.0  # monotonic time until which motion blobs can't override position
+
+# CNN-validated position: where CNN last confirmed cursor presence.
+# cursor_validated auto-revokes when tracked position drifts >100px from this.
+_cnn_validated_x: int = 0
+_cnn_validated_y: int = 0
+_CNN_DRIFT_INVALIDATE_PX = 100  # auto-invalidate threshold
+
+# Urgent CNN recheck: when cursor_validated becomes False unexpectedly,
+# reduce CNN interval to 2s until re-validated or re-acquired.
+_cnn_urgent_recheck: bool = False
+_stale_recovery_attempts: int = 0  # consecutive probe cycles where CNN still fails
 _VISION_LOCKOUT_S: float = 30.0     # how long Vision position is protected from motion override
 _YOLO_LOCKOUT_S: float = 5.0       # how long a high-confidence YOLO position is protected
 _yolo_lockout_until: float = 0.0   # monotonic time until which YOLO position is protected
+_CNN_LOCKOUT_S: float = 10.0       # protect CNN-validated position from motion overrides
+_cnn_lockout_until: float = 0.0    # monotonic time until which CNN position is protected
+
+# Passive mode: observe-only, no mouse movements at all.
+# Silhouette tracking, CNN, YOLO still run for data capture, but
+# no jitter, probes, calibrate_to_corner, or any HID mouse reports.
+_passive_mode: bool = False
 
 # Noise grid: shared between daemon loop (writer) and probe (reader)
 _NOISE_GRID_W, _NOISE_GRID_H = 48, 27
@@ -469,11 +600,24 @@ def _daemon_motion_loop():
                         _noise_grid[gy][gx] = max(0, _noise_grid[gy][gx] - 1)
 
             # Remove blobs in persistent-motion cells (UI animations)
+            # BUT exempt blobs near the VALIDATED cursor position — the cursor
+            # itself creates persistent motion during continuous movement.
+            # Radius 200px (was 400) + require CNN validation to prevent
+            # noise blobs (e.g. UTC clock milliseconds) from self-reinforcing
+            # as the "cursor position".
             filtered_blobs = []
             for b in cursor_blobs:
                 gx = min(_NOISE_GRID_W - 1, b.centroid[0] // _NOISE_CELL_PX)
                 gy = min(_NOISE_GRID_H - 1, b.centroid[1] // _NOISE_CELL_PX)
                 if _noise_grid[gy][gx] >= _NOISE_THRESHOLD:
+                    # Only exempt if cursor position is CNN-validated and close
+                    if (pos and (now - pos.timestamp < 5) and
+                            state.cursor_validated):
+                        blob_dist = ((b.centroid[0] - pos.x) ** 2 +
+                                     (b.centroid[1] - pos.y) ** 2) ** 0.5
+                        if blob_dist < 200:
+                            filtered_blobs.append(b)
+                            continue
                     continue  # Skip: persistent motion = UI animation
                 filtered_blobs.append(b)
             cursor_blobs = filtered_blobs
@@ -511,15 +655,28 @@ def _daemon_motion_loop():
                     best = min(cursor_blobs, key=_blob_score)
                     dist = ((best.centroid[0] - pos.x) ** 2 +
                             (best.centroid[1] - pos.y) ** 2) ** 0.5
-                    if dist < 300:
+                    # Velocity-scaled distance threshold: at high speed,
+                    # cursor moves further between frames
+                    _vel_est = 0.0
+                    if len(velocity_history) >= 2:
+                        _recent = velocity_history[-3:]
+                        _dt = _recent[-1][2] - _recent[0][2]
+                        if _dt > 0:
+                            _avg_d = sum(
+                                (v[0]**2 + v[1]**2)**0.5 for v in _recent
+                            ) / len(_recent)
+                            _vel_est = _avg_d / (_dt / len(_recent))
+                    blob_dist_limit = min(800, 300 + _vel_est * 0.3)
+                    if dist < blob_dist_limit:
                         # Silhouette confidence gate: if tracker is confident,
                         # reject blobs too far from silhouette position
                         accept = True
+                        sil_gate_dist = min(300, 100 + _vel_est * 0.15)
                         if (sil_tracker and state.silhouette_confidence > 0.6
                                 and state.silhouette_latency_ms < 50):
                             sil_dist = ((best.centroid[0] - state.cursor_x) ** 2 +
                                         (best.centroid[1] - state.cursor_y) ** 2) ** 0.5
-                            if sil_dist > 100:
+                            if sil_dist > sil_gate_dist:
                                 accept = False
 
                         # Vision lockout: don't let motion blobs override
@@ -539,6 +696,21 @@ def _daemon_motion_loop():
                             if blob_dist_from_yolo > 80:
                                 accept = False  # Blob too far from YOLO detection
 
+                        # CNN lockout: protect CNN-validated position from
+                        # random blobs — only accept within 80px
+                        if accept and now < _cnn_lockout_until:
+                            blob_dist_from_cnn = (
+                                (best.centroid[0] - _cnn_validated_x) ** 2 +
+                                (best.centroid[1] - _cnn_validated_y) ** 2) ** 0.5
+                            if blob_dist_from_cnn > 80:
+                                accept = False
+
+                        # Urgent recheck lockout: don't let random blobs
+                        # refresh position when CNN has flagged it wrong.
+                        # Let position go stale so calibrate_to_corner fires.
+                        if accept and _cnn_urgent_recheck:
+                            accept = False
+
                         if accept:
                             primary_blob = best
                             bx, by = best.centroid
@@ -548,6 +720,15 @@ def _daemon_motion_loop():
                             velocity_history.append((dx, dy, now))
                             if len(velocity_history) > MAX_VELOCITY_SAMPLES * 2:
                                 velocity_history = velocity_history[-MAX_VELOCITY_SAMPLES:]
+                            # Feed velocity to silhouette tracker for ROI scaling
+                            if sil_tracker and len(velocity_history) >= 2:
+                                recent = velocity_history[-3:]
+                                dt_sum = recent[-1][2] - recent[0][2]
+                                if dt_sum > 0:
+                                    avg_dx = sum(v[0] for v in recent) / len(recent)
+                                    avg_dy = sum(v[1] for v in recent) / len(recent)
+                                    vel = ((avg_dx ** 2 + avg_dy ** 2) ** 0.5) / (dt_sum / len(recent))
+                                    sil_tracker.set_velocity(vel)
                             if tracker:
                                 tracker.set_position(bx, by, method="motion_track")
                             pos = tracker.position
@@ -556,7 +737,9 @@ def _daemon_motion_loop():
                 else:
                     # No known position — use Vision as anchor if recent,
                     # otherwise pick blob closest to typical cursor size
-                    if now < _vision_lockout_until:
+                    if _cnn_urgent_recheck:
+                        pass  # Don't pick random blobs during recovery
+                    elif now < _vision_lockout_until:
                         pass  # Don't pick random blobs during Vision lockout
                     elif (state.vision_x > 0 and state.vision_timestamp > 0
                           and now - state.vision_timestamp < 120):
@@ -586,6 +769,28 @@ def _daemon_motion_loop():
                         velocity_history.clear()
                         if tracker:
                             tracker.set_position(bx, by, method="motion_track")
+                        pos = tracker.position
+                        if sil_tracker:
+                            sil_tracker.reset()
+
+            # ── ESP32 dead-reckoning prior: velocity-gated fallback.
+            # Only use ESP32 estimate when:
+            #   1. Velocity test is running with commanded velocity >= 50 px/s
+            #      (at V0/stationary, silhouette is more accurate than ESP32)
+            #   2. No primary blob found (motion detector can't see cursor)
+            #   3. Position is stale (>0.2s since last update)
+            # This is the middle ground: V0 stays untouched (silhouette),
+            # V100+ gets ESP32 help when silhouette falls behind.
+            if mouse and _vtest_running and primary_blob is None:
+                commanded_vel = _vtest_progress.get("velocity_px_s", 0)
+                if commanded_vel >= 50:
+                    esp_x = mouse.estimated_x
+                    esp_y = mouse.estimated_y
+                    pos = tracker.position if tracker else None
+                    pos_stale = pos is None or (now - pos.timestamp > 0.2)
+                    if pos_stale:
+                        if tracker:
+                            tracker.set_position(esp_x, esp_y, method="esp32_dead_reckoning")
                         pos = tracker.position
                         if sil_tracker:
                             sil_tracker.reset()
@@ -703,22 +908,44 @@ def _daemon_motion_loop():
                                     vd = ((track_result.x - state.vision_x) ** 2 +
                                           (track_result.y - state.vision_y) ** 2) ** 0.5
                                     vision_close = vd < 60
+                                yolo_close = (
+                                    state.yolo_active
+                                    and (now - state.yolo_timestamp) < _YOLO_LOCKOUT_S
+                                    and ((track_result.x - state.yolo_x) ** 2 +
+                                         (track_result.y - state.yolo_y) ** 2) ** 0.5 < 60
+                                )
                                 sil_trusted = (
                                     state.cursor_validated or
-                                    track_result.method == "motion_roi" or
-                                    vision_close
+                                    state.cnn_confidence > 0.8 or      # live CNN high = trust
+                                    track_result.method == "motion_roi" or  # motion always trusted
+                                    track_result.method == "jitter_confirm" or  # jitter-proven
+                                    vision_close or
+                                    yolo_close                          # YOLO agrees
                                 )
+                                # Extra guard: template-only result that jumped far
+                                # from current position is likely a spurious match.
+                                # Even if cursor_validated, the CNN validated at
+                                # the OLD position, not at this new far-away spot.
+                                if (sil_trusted and
+                                        track_result.method == "template" and pos):
+                                    sil_jump = ((track_result.x - pos.x) ** 2 +
+                                                (track_result.y - pos.y) ** 2) ** 0.5
+                                    if sil_jump > 150:
+                                        sil_trusted = False
                                 if sil_trusted and tracker:
                                     tracker.set_position(
                                         track_result.x, track_result.y,
                                         method="sil_" + track_result.method)
                                     pos = tracker.position
                                 elif tracker:
-                                    # Gated but found — refresh timestamp to prevent
-                                    # staleness (don't change x,y, just keep alive)
-                                    tracker.set_position(
-                                        pos.x, pos.y, method=pos.method)
-                                    pos = tracker.position
+                                    # Gated but found — only refresh timestamp if
+                                    # CNN has validated this position. When not
+                                    # validated, let position go stale so recovery
+                                    # kicks in (calibrate_to_corner + re-scan).
+                                    if state.cursor_validated:
+                                        tracker.set_position(
+                                            pos.x, pos.y, method=pos.method)
+                                        pos = tracker.position
                                 state.silhouette_method = track_result.method
                                 state.silhouette_confidence = round(
                                     track_result.confidence, 3)
@@ -729,11 +956,14 @@ def _daemon_motion_loop():
                                 if sil_tracker.roi_size >= SilhouetteTracker.ROI_MAX:
                                     state.silhouette_method = "lost"
                                     # Auto-recovery: probe to re-establish position
-                                    recovery = _jitter_reacquire(True)
-                                    if recovery:
-                                        rx, ry = recovery
-                                        sil_tracker.reset()
-                                        state.silhouette_method = "recovered"
+                                    # But skip if urgent recheck — let CNN loop
+                                    # handle recovery via calibrate_to_corner
+                                    if not _cnn_urgent_recheck:
+                                        recovery = _jitter_reacquire(True)
+                                        if recovery:
+                                            rx, ry = recovery
+                                            sil_tracker.reset()
+                                            state.silhouette_method = "recovered"
                         else:
                             state.silhouette_active = False
 
@@ -1007,7 +1237,7 @@ def _python_motion_loop():
                                 if best:
                                     bx, by = best.centroid
 
-                        if best:
+                        if best and not _cnn_urgent_recheck:
                             try:
                                 pointer_blob_idx = blobs.index(best)
                             except ValueError:
@@ -1056,6 +1286,45 @@ def _python_motion_loop():
 
 # ── Loss Event Sampling ──────────────────────────────────────────
 
+def _log_state_line(entry: dict):
+    """Append compact per-frame state to rotating JSONL.
+
+    ~200 bytes/line x 5Hz = ~1KB/s = ~3.5MB/hour.
+    50MB rotation = ~14 hours of data. Enough for any debugging session.
+    """
+    global _state_log_bytes
+    compact = {
+        "t": entry.get("utc", ""),
+        "cx": entry.get("cx"), "cy": entry.get("cy"),
+        "m": entry.get("method", ""),
+        "cnn": round(entry.get("cnn_conf", 0), 3),
+        "sil": round(entry.get("sil_conf", 0), 3),
+        "sm": entry.get("sil_method", ""),
+        "v": entry.get("validated", False),
+        "ya": entry.get("yolo_active", False),
+        "yc": round(entry.get("yolo_conf", 0), 3) if entry.get("yolo_active") else 0,
+        "bc": entry.get("blob_count", 0),
+    }
+    try:
+        line = json.dumps(compact, separators=(",", ":")) + "\n"
+        line_bytes = len(line.encode())
+
+        # Rotate if over limit
+        if _state_log_bytes > _STATE_LOG_MAX_BYTES:
+            rotated = _STATE_LOG_PATH.with_suffix(".jsonl.1")
+            try:
+                _STATE_LOG_PATH.rename(rotated)
+            except OSError:
+                pass
+            _state_log_bytes = 0
+
+        with open(_STATE_LOG_PATH, "a") as f:
+            f.write(line)
+        _state_log_bytes += line_bytes
+    except Exception:
+        pass  # Never crash the motion loop for logging
+
+
 def _ring_capture(jpeg_bytes: bytes | None):
     """Feed ring buffer from motion loop. Rate-limited to ~5Hz."""
     global _ring_last_t
@@ -1101,47 +1370,140 @@ def _ring_capture(jpeg_bytes: bytes | None):
     with _ring_lock:
         _ring_buffer.append(entry)
 
+    # Append compact state to persistent JSONL log
+    _log_state_line(entry)
+
+    # Auto-invalidate CNN validation if position drifted
+    _check_cnn_drift()
+
     # Check for loss event trigger
     _check_loss_trigger(now)
 
 
+def _check_cnn_drift():
+    """Auto-invalidate cursor_validated if position drifted from CNN-validated spot.
+
+    Called after any position update. Uses velocity-aware threshold:
+    - At 0 px/s: 100px (tight, catches teleports)
+    - At 1000 px/s: 400px cap (allows fast cursor movement)
+
+    Also provides fast-path re-validation: if live CNN confidence is >0.8
+    and position hasn't moved far, re-validate immediately instead of
+    waiting for the 30s CNN validation loop.
+    """
+    global _cnn_urgent_recheck, _cnn_lockout_until
+    if not state.cursor_validated:
+        # Fast-path re-validation: CNN confidence is high but validated=False
+        # (e.g. after YOLO moved position). Re-validate if close to old spot.
+        if (state.cnn_confidence > 0.8
+                and _cnn_validated_x > 0 and _cnn_validated_y > 0):
+            reval_drift = ((state.cursor_x - _cnn_validated_x) ** 2 +
+                           (state.cursor_y - _cnn_validated_y) ** 2) ** 0.5
+            if reval_drift < 50:
+                state.cursor_validated = True
+                _cnn_urgent_recheck = False
+        return
+    drift = ((state.cursor_x - _cnn_validated_x) ** 2 +
+             (state.cursor_y - _cnn_validated_y) ** 2) ** 0.5
+    # Velocity-aware threshold: allow more drift when cursor is moving fast
+    velocity = _estimate_velocity()
+    drift_threshold = max(100, min(400, 100 + velocity * 0.3))
+    if drift > drift_threshold:
+        state.cursor_validated = False
+        _cnn_urgent_recheck = True
+        _cnn_lockout_until = 0.0  # Clear CNN lockout too
+        # Clear vision lockout — the lockout position is likely wrong too
+        global _vision_lockout_until
+        _vision_lockout_until = 0.0
+
+
+def _estimate_velocity() -> float:
+    """Estimate cursor velocity (px/s) from last 3 frames in loss history."""
+    if len(_loss_history) < 2:
+        return 0.0
+    # Use up to last 3 frames for smoothing
+    recent = list(_loss_history)[-3:]
+    velocities = []
+    for i in range(1, len(recent)):
+        dt = recent[i]["t"] - recent[i - 1]["t"]
+        if dt <= 0:
+            continue
+        ddx = recent[i]["x"] - recent[i - 1]["x"]
+        ddy = recent[i]["y"] - recent[i - 1]["y"]
+        dist = (ddx * ddx + ddy * ddy) ** 0.5
+        velocities.append(dist / dt)
+    return sum(velocities) / len(velocities) if velocities else 0.0
+
+
 def _check_loss_trigger(now: float):
-    """Detect confidence transitions that indicate cursor loss."""
-    global _loss_event_active, _loss_event_cooldown, _loss_prev
+    """Detect confidence transitions that indicate cursor loss.
+
+    Uses multi-frame consensus to avoid false triggers:
+    - Position jump: velocity-proportional threshold (400 + vel*0.5, capped at 1200)
+    - CNN drop: 3 of last 4 frames below 0.4, previously above 0.65
+    - Silhouette drop: 3 of last 4 frames below 0.25
+    - Validation lost: 2 consecutive unvalidated frames
+    """
+    global _loss_event_active, _loss_event_cooldown
 
     if _loss_event_active or now < _loss_event_cooldown:
+        # Still append to history for velocity tracking even during cooldown
+        _loss_history.append({
+            "t": now, "x": state.cursor_x, "y": state.cursor_y,
+            "cnn": state.cnn_confidence, "sil": state.silhouette_confidence,
+            "validated": state.cursor_validated, "cnn_ms": state.cnn_inference_ms,
+        })
+        return
+
+    # Append current frame to history
+    _loss_history.append({
+        "t": now, "x": state.cursor_x, "y": state.cursor_y,
+        "cnn": state.cnn_confidence, "sil": state.silhouette_confidence,
+        "validated": state.cursor_validated, "cnn_ms": state.cnn_inference_ms,
+    })
+
+    if len(_loss_history) < 2:
         return
 
     trigger = None
-    prev = _loss_prev
+    hist = list(_loss_history)
+    prev = hist[-2]
 
-    # Validated True → False
-    if prev["validated"] and not state.cursor_validated:
-        trigger = "validation_lost"
+    # ── Position jump — velocity-proportional threshold ──
+    vel = _estimate_velocity()
+    jump_threshold = min(1200, 400 + vel * 0.5)
+    ddx = state.cursor_x - prev["x"]
+    ddy = state.cursor_y - prev["y"]
+    jump = (ddx * ddx + ddy * ddy) ** 0.5
+    if jump > jump_threshold and (prev["x"] > 0 or prev["y"] > 0):
+        trigger = f"position_jump_{int(jump)}px_thr{int(jump_threshold)}"
 
-    # CNN drops from high (>0.7) to low (<0.5)
-    if prev["cnn"] > 0.7 and state.cnn_confidence < 0.5:
-        trigger = "cnn_drop"
+    # ── CNN drop — 3-of-4 consensus ──
+    if not trigger and len(hist) >= 5:
+        last4 = hist[-4:]
+        # Only count frames where CNN was actually running
+        low_count = sum(1 for h in last4 if h["cnn"] < 0.4 and h["cnn_ms"] > 0)
+        # Check that CNN was previously high (before the window)
+        before_window = [h for h in hist[:-4] if h["cnn_ms"] > 0]
+        was_high = any(h["cnn"] > 0.65 for h in before_window) if before_window else False
+        if low_count >= 3 and was_high:
+            trigger = "cnn_drop"
 
-    # Silhouette drops from good (>0.7) to bad (<0.3)
-    if prev["sil"] > 0.7 and state.silhouette_confidence < 0.3:
-        trigger = "silhouette_drop"
+    # ── Silhouette drop — 3-of-4 consensus ──
+    if not trigger and len(hist) >= 5:
+        last4 = hist[-4:]
+        low_sil = sum(1 for h in last4 if h["sil"] < 0.25)
+        before_window = hist[:-4]
+        was_sil_high = any(h["sil"] > 0.7 for h in before_window) if before_window else False
+        if low_sil >= 3 and was_sil_high:
+            trigger = "silhouette_drop"
 
-    # Position jump > 200px
-    if prev["x"] > 0 or prev["y"] > 0:
-        dx = state.cursor_x - prev["x"]
-        dy = state.cursor_y - prev["y"]
-        jump = (dx * dx + dy * dy) ** 0.5
-        if jump > 200:
-            trigger = f"position_jump_{int(jump)}px"
-
-    # Update previous state
-    _loss_prev = {
-        "validated": state.cursor_validated,
-        "cnn": state.cnn_confidence,
-        "sil": state.silhouette_confidence,
-        "x": state.cursor_x, "y": state.cursor_y,
-    }
+    # ── Validation lost — 2-frame confirmation ──
+    if not trigger and len(hist) >= 3:
+        if (hist[-3]["validated"] and
+                not hist[-2]["validated"] and
+                not hist[-1]["validated"]):
+            trigger = "validation_lost"
 
     if trigger:
         _start_loss_event(trigger, now)
@@ -1535,6 +1897,28 @@ def jitter_loop():
         )
         need_reacquire = (cnn_trigger or sil_trigger) and (use_daemon or sensor)
 
+        # Passive mode: skip ALL mouse movements, only observe
+        if _passive_mode:
+            state.jitter_count += 1
+            continue
+
+        # When urgent recheck is active, CNN loop owns recovery.
+        # Jitter probes find random blobs and re-lock to wrong positions,
+        # resetting counters and preventing calibrate_to_corner.
+        if _cnn_urgent_recheck:
+            # Just do anti-sleep jitter, no probing
+            try:
+                px = config.jitter_pixels
+                if sil_tracker:
+                    sil_tracker.expect_motion(amplitude_px=px)
+                mouse._send_raw(px, 0)
+                time.sleep(0.15)  # Wait for motion to appear in frame
+                mouse._send_raw(-px, 0)
+            except Exception:
+                pass
+            state.jitter_count += 1
+            continue
+
         if need_reacquire:
             # Try YOLO first: if YOLO recently detected cursor, use that position
             # instead of the slow jitter probe (saves ~2s)
@@ -1560,8 +1944,10 @@ def jitter_loop():
                 # Probe failed — still do normal jitter for anti-sleep
                 try:
                     px = config.jitter_pixels
+                    if sil_tracker:
+                        sil_tracker.expect_motion(amplitude_px=px)
                     mouse._send_raw(px, 0)
-                    time.sleep(0.1)
+                    time.sleep(0.15)
                     mouse._send_raw(-px, 0)
                 except Exception:
                     pass
@@ -1608,14 +1994,9 @@ def jitter_loop():
                             pass
                 # else: drift is small — tracker is on the right thing, no action
         else:
-            # Normal anti-sleep jitter: ±Npx, net zero displacement
-            try:
-                px = config.jitter_pixels
-                mouse._send_raw(px, 0)
-                time.sleep(0.1)
-                mouse._send_raw(-px, 0)
-            except Exception:
-                pass
+            # Normal anti-sleep jitter: ±Npx — ALSO a discovery opportunity.
+            # Capture before/after, full-frame diff → only the cursor moves.
+            _jitter_discover(use_daemon)
 
         state.last_jitter_time = time.monotonic()
         state.jitter_count += 1
@@ -1631,6 +2012,203 @@ def pi_keyboard_monitor_loop():
         except Exception:
             state.pi_keyboard_connected = None
         time.sleep(5)
+
+
+def _jitter_discover(use_daemon):
+    """Every jitter is a discovery opportunity.
+
+    Instead of blindly sending ±3px, capture frames before and after
+    the jitter, full-frame diff to find where the motion appeared.
+    Only the cursor moves from commanded jitter — everything else stays still.
+
+    If candidates found, YOLO crop-validates. If confirmed → ground truth.
+    Even without YOLO, a single small blob from commanded motion is high
+    confidence cursor discovery.
+
+    This is a lightweight version of _jitter_reacquire() — same principle
+    (commanded motion → observe → correlate), smaller amplitude.
+    """
+    global _yolo_lockout_until
+    px = config.jitter_pixels
+
+    def _capture():
+        if use_daemon and daemon_client:
+            jpeg = daemon_client.read_jpeg()
+            if jpeg:
+                return cv2.imdecode(
+                    np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        elif sensor:
+            return sensor.capture(settle_frames=1)
+        return None
+
+    try:
+        # 1. Capture BEFORE jitter
+        frame_before = _capture()
+        if frame_before is None:
+            # Fallback: just send jitter without observation
+            mouse._send_raw(px, 0)
+            time.sleep(0.15)
+            mouse._send_raw(-px, 0)
+            return
+
+        # 2. Signal silhouette tracker, send jitter
+        if sil_tracker:
+            sil_tracker.expect_motion(amplitude_px=px)
+        mouse._send_raw(px, 0)
+        time.sleep(0.20)  # 200ms for daemon JPEG buffer to refresh
+
+        # 3. Capture AFTER jitter
+        frame_after = _capture()
+
+        # 4. Undo jitter
+        mouse._send_raw(-px, 0)
+
+        if frame_after is None:
+            return
+
+        # 5. Full-frame diff — low threshold for ±3px motion
+        blobs = extract_motion_blobs(
+            frame_before, frame_after,
+            threshold=8,          # Low: catch subtle cursor edge changes
+            min_pixels=3,         # Small: ±3px moves very few pixels
+            max_pixels=500,       # Cursor-sized only (not UI redraws)
+        )
+
+        if not blobs:
+            return
+
+        # 6. Filter: reject known-noisy cells (toolbar, clock animations)
+        clean = []
+        for b in blobs:
+            gx = min(_NOISE_GRID_W - 1, b.centroid[0] // _NOISE_CELL_PX)
+            gy = min(_NOISE_GRID_H - 1, b.centroid[1] // _NOISE_CELL_PX)
+            if _noise_grid[gy][gx] >= _NOISE_THRESHOLD:
+                continue
+            clean.append(b)
+        candidates = clean or blobs  # Fall back to unfiltered if all rejected
+
+        # 7. Score candidates — prefer small, cursor-shaped blobs
+        scored = []
+        for b in candidates:
+            score = 1.0
+            # Prefer cursor-sized blobs (10-100px)
+            if b.pixel_count < 10:
+                score *= 0.5
+            elif b.pixel_count > 200:
+                score *= 0.3
+            # Shape scoring via recognizer
+            if recognizer and recognizer.cursor_template is not None:
+                try:
+                    bx, by = b.centroid
+                    half = 32  # PATCH_SIZE
+                    h, w = frame_after.shape[:2]
+                    if half <= bx < w - half and half <= by < h - half:
+                        gray = cv2.cvtColor(frame_after, cv2.COLOR_RGB2GRAY)
+                        patch = gray[by - half//2:by + half//2,
+                                     bx - half//2:bx + half//2]
+                        if patch.shape == (32, 32):
+                            shape_score = recognizer.score_blob_shape(patch)
+                            score *= (0.5 + shape_score)
+                except Exception:
+                    pass
+            scored.append((score, b))
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        if not scored:
+            return
+
+        # 8. YOLO crop-validation of top candidate(s)
+        best_score, best_blob = scored[0]
+        bx, by = best_blob.centroid
+        yolo_confirmed = False
+
+        if yolo_detector and yolo_detector.loaded:
+            # Crop 300x300 around candidate and run YOLO
+            h, w = frame_after.shape[:2]
+            crop_half = 150
+            cx0 = max(0, bx - crop_half)
+            cy0 = max(0, by - crop_half)
+            cx1 = min(w, bx + crop_half)
+            cy1 = min(h, by + crop_half)
+            crop = frame_after[cy0:cy1, cx0:cx1]
+            if crop.shape[0] > 50 and crop.shape[1] > 50:
+                detections = yolo_detector.detect(crop)
+                if detections:
+                    # YOLO found cursor in the crop — adjust coords to full-frame
+                    det = max(detections, key=lambda d: d.confidence)
+                    bx = cx0 + int(det.cx)
+                    by = cy0 + int(det.cy)
+                    yolo_confirmed = True
+                    state.yolo_active = True
+                    state.yolo_x = bx
+                    state.yolo_y = by
+                    state.yolo_confidence = det.confidence
+                    state.yolo_timestamp = time.monotonic()
+                    _yolo_lockout_until = time.monotonic() + _YOLO_LOCKOUT_S
+                    print(f"[jitter_discover] YOLO confirmed at ({bx},{by}) "
+                          f"conf={det.confidence:.2f}")
+
+        # 9. Decide if we trust this enough to update tracker
+        #    - YOLO confirmed: definite ground truth
+        #    - Single small blob from commanded motion: high confidence
+        #    - Multiple blobs: less certain, pick best but be cautious
+        n_candidates = len(scored)
+        if yolo_confirmed:
+            confidence = 0.95
+            method = "jitter_yolo"
+        elif n_candidates == 1 and best_blob.pixel_count < 200:
+            confidence = 0.85  # Single small blob from commanded motion
+            method = "jitter_discover"
+        elif n_candidates <= 3 and best_score > 0.5:
+            confidence = 0.7
+            method = "jitter_discover"
+        else:
+            # Too many candidates — noisy screen, can't isolate cursor
+            return
+
+        # Check if this position is far from current tracked position
+        cur_drift = ((bx - state.cursor_x) ** 2 +
+                     (by - state.cursor_y) ** 2) ** 0.5
+
+        if cur_drift < 30:
+            # Close to current position — just confirms existing track.
+            # Let silhouette's jitter_confirm handle this via expect_motion.
+            return
+
+        # 10. Update tracker with discovered position
+        print(f"[jitter_discover] {method}: ({bx},{by}) "
+              f"n_blobs={n_candidates} drift={cur_drift:.0f}px "
+              f"blob_px={best_blob.pixel_count} score={best_score:.2f}")
+
+        if tracker:
+            tracker.set_position(bx, by, method=method)
+        state.cursor_x = bx
+        state.cursor_y = by
+        state.cursor_method = method
+        state.cursor_age_s = 0.0
+        state.cursor_validated = False  # Need CNN to confirm
+        if sil_tracker:
+            sil_tracker.reset()
+
+        # Collect training data at discovered position
+        if collector:
+            collector.collect_from_locate(
+                frame_after, bx, by,
+                correlation=confidence,
+                num_negatives=2,
+                source="jitter_discover",
+            )
+            state.sample_count_pos = collector.positive_count
+            state.sample_count_neg = collector.negative_count
+
+    except Exception as e:
+        # Never crash jitter loop — fall back to simple jitter
+        try:
+            mouse._send_raw(px, 0)
+            time.sleep(0.15)
+            mouse._send_raw(-px, 0)
+        except Exception:
+            pass
 
 
 def _jitter_reacquire(use_daemon):
@@ -1793,9 +2371,19 @@ def cursor_validation_loop():
     frames, and matches blobs across both directions. Only the real cursor
     follows both movements — UI noise doesn't.
     """
-    global _low_confidence_since
+    global _low_confidence_since, _cnn_validated_x, _cnn_validated_y, _cnn_urgent_recheck, _stale_recovery_attempts, _cnn_lockout_until
     while True:
-        time.sleep(config.cnn_interval_s)
+        # Use shorter interval when:
+        # - urgent recheck (position drifted from CNN-validated) → 2s
+        # - never validated (startup / never found cursor) → 5s
+        # - validated and stable → normal interval (30s)
+        if _cnn_urgent_recheck:
+            interval = 0.5  # Fast recheck — CNN confidence may already be high
+        elif not state.cursor_validated and _low_confidence_since == 0:
+            interval = 5.0  # First-time search
+        else:
+            interval = config.cnn_interval_s
+        time.sleep(interval)
         if not recognizer or not tracker:
             continue
 
@@ -1806,12 +2394,20 @@ def cursor_validation_loop():
         try:
             pos = tracker.position
             now = time.monotonic()
-            position_stale = (not pos) or (now - pos.timestamp > 60)
+            # Faster stale threshold during urgent recheck (CNN drift detected)
+            stale_threshold = 10.0 if _cnn_urgent_recheck else 60.0
+            position_stale = (not pos) or (now - pos.timestamp > stale_threshold)
 
             if position_stale:
-                # Position unknown or very stale — try YOLO first (no mouse needed),
-                # then commanded movement, then legacy probe
+                # Position unknown or very stale.
+                # Recovery chain (no-mouse-first):
+                #   1. YOLO (if recent detection)
+                #   2. CNN grid scan (Phase 1: find cursor anywhere on screen)
+                #   3. Commanded movement / jitter probe (needs mouse)
+                #   4. calibrate_to_corner (last resort, needs mouse)
                 reacquired = False
+
+                # 1. YOLO shortcut
                 yolo_age = now - state.yolo_timestamp if state.yolo_timestamp > 0 else 999
                 if (yolo_detector and state.yolo_active
                         and state.yolo_confidence > 0.5 and yolo_age < 5.0):
@@ -1821,27 +2417,93 @@ def cursor_validation_loop():
                     state.cursor_method = "yolo"
                     state.cursor_age_s = 0.0
                     reacquired = True
-                if not reacquired and cmd_movement and pos:
-                    mr = cmd_movement.escalate(pos.x, pos.y)
-                    if mr:
-                        tracker.set_position(mr.x, mr.y, method=mr.method)
-                        state.cursor_x = mr.x
-                        state.cursor_y = mr.y
-                        state.cursor_method = mr.method
-                        state.cursor_age_s = 0.0
+
+                # 2. CNN grid scan — Phase 1 visual detection (no mouse needed)
+                if not reacquired and recognizer:
+                    try:
+                        if use_daemon:
+                            jpeg = daemon_client.read_jpeg()
+                            if jpeg:
+                                scan_frame = cv2.imdecode(
+                                    np.frombuffer(jpeg, dtype=np.uint8),
+                                    cv2.IMREAD_COLOR)
+                            else:
+                                scan_frame = None
+                        else:
+                            scan_frame = sensor.capture(settle_frames=1)
+
+                        if scan_frame is not None:
+                            t_scan = time.monotonic()
+                            hits = recognizer.grid_scan(
+                                scan_frame, stride=64, threshold=0.85)
+                            scan_ms = (time.monotonic() - t_scan) * 1000
+
+                            if hits:
+                                gx, gy, gconf = hits[0]
+                                print(f"[cnn_loop] Grid scan found cursor at "
+                                      f"({gx},{gy}) conf={gconf:.3f} "
+                                      f"({len(hits)} hits, {scan_ms:.0f}ms)")
+                                tracker.set_position(gx, gy, method="grid_scan")
+                                state.cursor_x = gx
+                                state.cursor_y = gy
+                                state.cursor_method = "grid_scan"
+                                state.cursor_age_s = 0.0
+                                reacquired = True
+                            else:
+                                print(f"[cnn_loop] Grid scan: no hits "
+                                      f"({scan_ms:.0f}ms)")
+                    except Exception as e:
+                        print(f"[cnn_loop] Grid scan error: {e}")
+
+                # 3. Mouse-based recovery (skip in passive mode)
+                if not _passive_mode:
+                    if not reacquired and cmd_movement and pos:
+                        mr = cmd_movement.escalate(pos.x, pos.y)
+                        if mr:
+                            tracker.set_position(mr.x, mr.y, method=mr.method)
+                            state.cursor_x = mr.x
+                            state.cursor_y = mr.y
+                            state.cursor_method = mr.method
+                            state.cursor_age_s = 0.0
+                            reacquired = True
+                    if not reacquired:
+                        result = _jitter_reacquire(use_daemon)
+                        if result:
+                            reacquired = True
+                # Track consecutive stale-recovery cycles
+                _stale_recovery_attempts += 1
+                # Calibrate to known corner: immediately if urgent + probes failed,
+                # or after 3 cycles otherwise
+                calibrate_threshold = 1 if _cnn_urgent_recheck else 3
+                if not _passive_mode and _stale_recovery_attempts >= calibrate_threshold and mouse:
+                    try:
+                        print(f"[cnn_loop] {_stale_recovery_attempts} stale recoveries"
+                              " failed — calibrating to corner")
+                        mouse.calibrate_to_corner('top_left')
+                        cx_target = mouse.screen_width // 2
+                        cy_target = mouse.screen_height // 2
+                        mouse.move(cx_target, cy_target)
+                        if tracker:
+                            tracker.set_position(
+                                mouse.estimated_x, mouse.estimated_y,
+                                method="calibrate_recovery")
+                        if sil_tracker:
+                            sil_tracker.reset()
                         reacquired = True
-                if not reacquired:
-                    result = _jitter_reacquire(use_daemon)
-                    if result:
-                        reacquired = True
+                        _stale_recovery_attempts = 0
+                        print(f"[cnn_loop] Calibrated to ({mouse.estimated_x}, "
+                              f"{mouse.estimated_y})")
+                    except Exception as e:
+                        print(f"[cnn_loop] Calibrate recovery failed: {e}")
                 if reacquired:
-                    _low_confidence_since = 0.0  # Reset on success
+                    # Do NOT reset _low_confidence_since — only CNN > 0.7
+                    # resets it. Probing a new position doesn't prove the
+                    # cursor is actually there.
                     state.cursor_validated = False
                     state.cnn_confidence = 0.0
                     if sil_tracker:
                         sil_tracker.reset()
                 else:
-                    # Failed to reacquire — signal jitter_loop to try on next cycle
                     if _low_confidence_since == 0.0:
                         _low_confidence_since = time.monotonic()
                 continue
@@ -1875,8 +2537,13 @@ def cursor_validation_loop():
             if confidence > 0.7:
                 # Cursor confirmed — update template + reset silhouette to tight ROI
                 _low_confidence_since = 0.0  # Reset sustained-low tracker
+                _cnn_urgent_recheck = False  # No longer urgent
+                _stale_recovery_attempts = 0  # Recovery succeeded
+                _cnn_lockout_until = time.monotonic() + _CNN_LOCKOUT_S
                 recognizer.update_cursor_template(patch)
                 state.cursor_validated = True
+                _cnn_validated_x = cx
+                _cnn_validated_y = cy
                 if sil_tracker:
                     sil_tracker.reset()
                 if collector:
@@ -1895,17 +2562,30 @@ def cursor_validation_loop():
                 state.cursor_validated = False
                 if sil_tracker:
                     sil_tracker.reset()
-                # Immediate re-acquisition attempt — updates position but
-                # does NOT reset the low-confidence clock
-                if cmd_movement:
-                    mr = cmd_movement.escalate(cx, cy)
-                    if mr:
-                        tracker.set_position(mr.x, mr.y, method=mr.method)
-                        state.cursor_x = mr.x
-                        state.cursor_y = mr.y
-                        state.cursor_method = mr.method
-                else:
-                    _jitter_reacquire(use_daemon)
+                # If CNN has been failing for >5s, escalate to urgent mode.
+                # This disables jitter probes, motion_track, and reduces
+                # stale threshold so calibrate_to_corner fires faster.
+                low_conf_elapsed = now - _low_confidence_since
+                if low_conf_elapsed > 5.0 and not _cnn_urgent_recheck:
+                    _cnn_urgent_recheck = True
+                    _vision_lockout_until = 0.0  # Clear stale lockout
+                    print(f"[cnn_loop] CNN failing for {low_conf_elapsed:.0f}s "
+                          f"→ urgent recheck mode")
+                # Re-acquisition: only probe when we're NOT in urgent
+                # recheck mode. When _cnn_urgent_recheck is True, we know
+                # the position drifted — probing from wrong position just
+                # finds random blobs and keeps the timestamp fresh,
+                # preventing the stale-position calibrate recovery.
+                if not _cnn_urgent_recheck and not _passive_mode:
+                    if cmd_movement:
+                        mr = cmd_movement.escalate(cx, cy)
+                        if mr:
+                            tracker.set_position(mr.x, mr.y, method=mr.method)
+                            state.cursor_x = mr.x
+                            state.cursor_y = mr.y
+                            state.cursor_method = mr.method
+                    else:
+                        _jitter_reacquire(use_daemon)
 
         except Exception:
             pass  # Non-critical — will retry next cycle
@@ -2412,7 +3092,24 @@ async def escalate_cursor():
     if result:
         return {"cursor": {"x": result[0], "y": result[1]}, "method": "legacy_dual_probe"}
 
-    return {"error": "All recovery methods failed"}
+    # Last resort: calibrate to known corner + move to center
+    try:
+        mouse.calibrate_to_corner('top_left')
+        cx_target = mouse.screen_width // 2
+        cy_target = mouse.screen_height // 2
+        mouse.move(cx_target, cy_target)
+        tracker.set_position(
+            mouse.estimated_x, mouse.estimated_y,
+            method="calibrate_recovery")
+        if sil_tracker:
+            sil_tracker.reset()
+        state.cursor_validated = False
+        return {
+            "cursor": {"x": mouse.estimated_x, "y": mouse.estimated_y},
+            "method": "calibrate_recovery",
+        }
+    except Exception as e:
+        return {"error": f"All recovery methods failed (calibrate: {e})"}
 
 
 @app.get("/api/screenshot")
@@ -2449,6 +3146,151 @@ async def screenshot(label: str = "capture"):
         return {"error": str(e)}
 
 
+@app.get("/api/passive")
+async def get_passive():
+    """Check passive mode status."""
+    return {"passive_mode": _passive_mode}
+
+
+@app.post("/api/passive")
+async def set_passive(request: Request):
+    """Toggle passive mode. Body: {"enabled": true/false}"""
+    global _passive_mode
+    data = await request.json()
+    _passive_mode = bool(data.get("enabled", False))
+    print(f"[api] Passive mode {'enabled' if _passive_mode else 'disabled'}")
+    return {"passive_mode": _passive_mode}
+
+
+@app.get("/api/grid_scan")
+async def api_grid_scan(stride: int = 64, threshold: float = 0.6):
+    """Run CNN grid scan on current frame. Phase 1 visual detection.
+
+    Returns top cursor candidates with position and confidence.
+    No mouse movement required.
+    """
+    if not recognizer:
+        return {"error": "No recognizer available"}
+
+    use_daemon = daemon_client and daemon_client.is_running()
+    try:
+        if use_daemon:
+            jpeg = daemon_client.read_jpeg()
+            if not jpeg:
+                return {"error": "No frame available"}
+            frame = cv2.imdecode(
+                np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        elif sensor:
+            frame = sensor.capture(settle_frames=1)
+        else:
+            return {"error": "No capture source"}
+
+        if frame is None:
+            return {"error": "Frame capture failed"}
+
+        t0 = time.monotonic()
+        hits = recognizer.grid_scan(frame, stride=stride, threshold=threshold)
+        scan_ms = (time.monotonic() - t0) * 1000
+
+        return {
+            "hits": [{"x": x, "y": y, "confidence": round(c, 4)} for x, y, c in hits],
+            "scan_ms": round(scan_ms, 1),
+            "stride": stride,
+            "threshold": threshold,
+            "frame_shape": list(frame.shape[:2]),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/yolo_detect_now")
+async def yolo_detect_now():
+    """Manual YOLO full-frame detection. Updates tracker as ground truth.
+
+    Unlike the continuous YOLO in the motion loop (which uses crop pipeline),
+    this always runs full-frame and treats the result as ground truth —
+    updating tracker position and saving CNN training samples.
+    """
+    global _yolo_lockout_until
+    if not yolo_detector or not yolo_detector.loaded:
+        return {"error": "YOLO detector not loaded"}
+
+    # Grab current frame
+    use_daemon = daemon_client and daemon_client.is_running()
+    try:
+        if use_daemon:
+            jpeg = daemon_client.read_jpeg()
+            if not jpeg:
+                return {"error": "No frame from daemon"}
+            frame = cv2.imdecode(
+                np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        elif sensor:
+            frame = sensor.capture(settle_frames=1)
+        else:
+            with state.lock:
+                frame = state.frame_raw.copy() if state.frame_raw is not None else None
+
+        if frame is None:
+            return {"error": "No frame available"}
+
+        # Full-frame YOLO detection
+        t0 = time.monotonic()
+        detections = yolo_detector.detect(frame)
+        dt_ms = (time.monotonic() - t0) * 1000
+
+        if detections:
+            best = max(detections, key=lambda d: d.confidence)
+            with state.lock:
+                state.yolo_active = True
+                state.yolo_x = int(best.cx)
+                state.yolo_y = int(best.cy)
+                state.yolo_confidence = best.confidence
+                state.yolo_inference_ms = dt_ms
+                state.yolo_detection_count = len(detections)
+                state.yolo_timestamp = time.monotonic()
+                state.yolo_bbox = (int(best.x1), int(best.y1), int(best.x2), int(best.y2))
+
+            # Update tracker as ground truth
+            if tracker:
+                tracker.set_position(state.yolo_x, state.yolo_y, method="yolo_manual")
+            _yolo_lockout_until = time.monotonic() + _YOLO_LOCKOUT_S
+
+            # Collect CNN training sample at confirmed position
+            if collector:
+                collector.collect_from_locate(
+                    frame, state.yolo_x, state.yolo_y,
+                    correlation=state.yolo_confidence,
+                    num_negatives=2, source="yolo_ground_truth",
+                )
+
+            print(f"[yolo_manual] Detected cursor at ({state.yolo_x},{state.yolo_y}) "
+                  f"conf={state.yolo_confidence:.3f} in {dt_ms:.1f}ms "
+                  f"({len(detections)} total detections)")
+
+            return {
+                "active": True,
+                "x": state.yolo_x, "y": state.yolo_y,
+                "confidence": state.yolo_confidence,
+                "inference_ms": round(dt_ms, 1),
+                "count": len(detections),
+                "bbox": [int(best.x1), int(best.y1), int(best.x2), int(best.y2)],
+                "all_detections": [
+                    {"x": int(d.cx), "y": int(d.cy), "conf": round(d.confidence, 3),
+                     "bbox": [int(d.x1), int(d.y1), int(d.x2), int(d.y2)]}
+                    for d in detections
+                ],
+            }
+        else:
+            with state.lock:
+                state.yolo_active = False
+                state.yolo_detection_count = 0
+            print(f"[yolo_manual] No detections in {dt_ms:.1f}ms")
+            return {"active": False, "inference_ms": round(dt_ms, 1), "count": 0}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/api/config")
 async def get_config():
     """Return current dashboard configuration."""
@@ -2459,6 +3301,7 @@ async def get_config():
         "jitter_pixels": config.jitter_pixels,
         "verify_every_n": config.verify_every_n,
         "verify_drift_px": config.verify_drift_px,
+        "passive_mode": _passive_mode,
     }
 
 
@@ -2555,7 +3398,7 @@ async def claude_detect():
                 state.sample_count_neg = collector.negative_count
 
             # Also reset low-confidence clock — Claude Vision is ground truth
-            global _low_confidence_since, _vision_lockout_until
+            global _low_confidence_since, _vision_lockout_until, _cnn_validated_x, _cnn_validated_y, _cnn_urgent_recheck, _cnn_lockout_until
             _low_confidence_since = 0.0
             _vision_lockout_until = time.monotonic() + _VISION_LOCKOUT_S
             if tracker:
@@ -2566,6 +3409,11 @@ async def claude_detect():
                 state.cursor_method = "claude_vision"
                 state.cursor_age_s = 0.0
                 state.cursor_validated = True
+                _cnn_validated_x = result.cursor_x
+                _cnn_validated_y = result.cursor_y
+                _cnn_urgent_recheck = False
+                _stale_recovery_attempts = 0
+                _cnn_lockout_until = time.monotonic() + _CNN_LOCKOUT_S
                 state.cnn_confidence = 1.0  # Claude Vision overrides CNN
             if sil_tracker:
                 sil_tracker.reset()  # Re-lock silhouette to Claude-found position
@@ -4079,8 +4927,14 @@ async def get_tags():
 def _capture_snapshot(profile_id: str, step: int, direction: str,
                       commanded_dx: int, commanded_dy: int,
                       commanded_total_x: float, commanded_total_y: float,
-                      run_dir: Path) -> dict:
+                      run_dir: Path,
+                      velocity_px_s: float = 0.0,
+                      run_yolo: bool = False) -> dict:
     """Capture full sensor state for one velocity test step.
+
+    Args:
+        velocity_px_s: Target velocity for this step (for recording).
+        run_yolo: If True, run YOLO detection on this frame for ground truth.
 
     Returns a dict suitable for JSONL logging.
     """
@@ -4089,23 +4943,52 @@ def _capture_snapshot(profile_id: str, step: int, direction: str,
     # Save frame for CNN training
     frame_name = f"frame_{profile_id}_{direction}_{step:03d}.jpg"
     frame_path = run_dir / "frames" / frame_name
+    frame_np = None
     if daemon_client and daemon_client.is_running():
         jpeg = daemon_client.read_jpeg()
         if jpeg:
             frame_path.parent.mkdir(parents=True, exist_ok=True)
             frame_path.write_bytes(jpeg)
+            # Decode for CNN comparison
+            frame_np = cv2.imdecode(
+                np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
 
     tracked_x = state.cursor_x
     tracked_y = state.cursor_y
     error_px = ((tracked_x - commanded_total_x) ** 2 +
                 (tracked_y - commanded_total_y) ** 2) ** 0.5
 
-    return {
+    # CNN model comparison: evaluate all loaded models on the tracked position patch
+    cnn_comparison = {}
+    if frame_np is not None and recognizer:
+        patch = extract_gray_patch(frame_np, tracked_x, tracked_y)
+        if patch is not None:
+            # Primary recognizer
+            cnn_comparison[recognizer.model_version] = round(
+                recognizer.classify_patch(patch), 4)
+            # Comparison recognizers
+            for ver, rec in _vtest_recognizers.items():
+                cnn_comparison[ver] = round(rec.classify_patch(patch), 4)
+
+    # YOLO ground truth (at key frames)
+    yolo_gt = None
+    if run_yolo and frame_np is not None and yolo_detector is not None:
+        dets = yolo_detector.detect(frame_np)
+        if dets:
+            best = max(dets, key=lambda d: d.confidence)
+            yolo_gt = {
+                "x": int(best.cx), "y": int(best.cy),
+                "confidence": round(float(best.confidence), 4),
+                "inference_ms": round(float(best.inference_ms), 2),
+            }
+
+    result = {
         "utc": utc_now_ms(),
         "monotonic": now_mono,
         "profile": profile_id,
         "step": step,
         "direction": direction,
+        "velocity_px_s": round(velocity_px_s, 1),
         "commanded": {
             "dx": commanded_dx,
             "dy": commanded_dy,
@@ -4131,6 +5014,7 @@ def _capture_snapshot(profile_id: str, step: int, direction: str,
             "validated": state.cursor_validated,
             "model": state.cnn_model_version,
         },
+        "cnn_comparison": cnn_comparison,
         "daemon": {
             "fps": round(state.fps, 1),
             "blob_count": state.blob_count,
@@ -4143,22 +5027,29 @@ def _capture_snapshot(profile_id: str, step: int, direction: str,
             "inference_ms": round(state.yolo_inference_ms, 1),
             "detection_count": state.yolo_detection_count,
         },
+        "esp32": {
+            "x": mouse.estimated_x if mouse else 0,
+            "y": mouse.estimated_y if mouse else 0,
+            "soft_bounds_px": mouse.soft_bounds_px if mouse else 0,
+        },
         "noise_grid": noise_grid_features(),
         "error_px": round(error_px, 1),
         "label": _auto_label(error_px),
         "frame": frame_name,
     }
+    if yolo_gt:
+        result["yolo_ground_truth"] = yolo_gt
+    return result
 
 
 def _run_velocity_test(profiles: list[str]):
     """Background thread: run velocity test profiles sequentially.
 
-    For each profile:
-      1. Establish starting position (current tracker + ESP32 estimated)
-      2. Move RIGHT for N steps, recording at each step
-      3. Return to start
-      4. Move DOWN for N steps, recording at each step
-      5. Return to start
+    New velocity-based approach:
+    - Generates precise HID reports from velocity/duration specs
+    - Sends at 50Hz (20ms per report) for accurate velocity control
+    - Captures snapshots at ~5Hz (every 4th report) to match ring buffer rate
+    - Tests in two directions: RIGHT then DOWN (diagonal profiles go both)
     """
     global _vtest_running, _vtest_results, _vtest_progress, _vtest_summary
 
@@ -4173,88 +5064,169 @@ def _run_velocity_test(profiles: list[str]):
 
     log_path = run_dir / "results.jsonl"
 
+    REPORT_INTERVAL_S = 0.02  # 50Hz HID reports
+    SNAPSHOT_EVERY_N = 4      # Capture snapshot every 4th report (~12.5Hz)
+    SOFT_BOUNDS_PX = 150      # Keep cursor 150px from screen edges
+
     try:
+        # Enable soft bounds for the duration of the test
+        if mouse:
+            mouse.set_soft_bounds(SOFT_BOUNDS_PX)
+            print(f"[vtest] Soft bounds enabled: {SOFT_BOUNDS_PX}px margin")
         for pid in profiles:
             if not _vtest_running:
-                break  # Stopped early
+                break
             if pid not in VELOCITY_PROFILES:
                 continue
 
             prof = VELOCITY_PROFILES[pid]
-            steps = prof["steps"]
-            delay_s = prof["delay_ms"] / 1000.0
-            is_accel = "accel" in prof
-            is_alternate = prof.get("alternate", False)
 
-            # Run test in two directions: RIGHT then DOWN
-            for direction, axis in [("right", 0), ("down", 1)]:
+            # Handle REPLAY profile separately
+            if prof.get("replay"):
+                reports = _replay_loss_event_reports()
+                if not reports:
+                    print(f"[vtest] REPLAY: no loss events to replay")
+                    continue
+                directions = [("replay", reports)]
+            else:
+                velocity = prof.get("velocity_px_s", 0)
+                duration = prof.get("duration_s", 1.0)
+                accel = prof.get("accel_px_s2", 0)
+                jitter = prof.get("jitter_px", 0)
+                is_diagonal = prof.get("diagonal", False)
+
+                if is_diagonal:
+                    # Diagonal: split velocity equally between X and Y
+                    norm = 2 ** 0.5
+                    direction_vec = (1 / norm, 1 / norm)
+                    reports = _generate_hid_reports(
+                        velocity, duration, direction=direction_vec,
+                        accel=accel, jitter_px=jitter)
+                    directions = [("diagonal", reports)]
+                else:
+                    # Generate reports for RIGHT and DOWN
+                    reports_right = _generate_hid_reports(
+                        velocity, duration, direction=(1, 0),
+                        accel=accel, jitter_px=jitter)
+                    reports_down = _generate_hid_reports(
+                        velocity, duration, direction=(0, 1),
+                        accel=accel, jitter_px=jitter)
+                    directions = [("right", reports_right), ("down", reports_down)]
+
+            for direction, reports in directions:
                 if not _vtest_running:
                     break
 
-                total_steps = steps
+                total_reports = len(reports)
                 _vtest_progress = {
                     "profile": pid,
                     "direction": direction,
                     "step": 0,
-                    "total": total_steps,
+                    "total": total_reports,
                     "phase": "testing",
+                    "velocity_px_s": prof.get("velocity_px_s", 0),
                 }
 
                 # Record starting position
                 start_esp_x = mouse.estimated_x if mouse else 0
                 start_esp_y = mouse.estimated_y if mouse else 0
                 cum_dx, cum_dy = 0.0, 0.0
+                bounds_hit_logged = False
 
-                for step_i in range(total_steps):
+                for i, (dx, dy) in enumerate(reports):
                     if not _vtest_running:
                         break
 
-                    # Calculate step displacement.
-                    # Speed magnitude comes from profile; axis selects X or Y.
-                    if is_accel:
-                        t = step_i / max(1, total_steps - 1)
-                        speed = round(prof["start_speed"] + t * (prof["end_speed"] - prof["start_speed"]))
-                    elif is_alternate:
-                        sign = 1 if step_i % 2 == 0 else -1
-                        speed = sign * (prof["dx"] or prof.get("dy", 2))
-                    else:
-                        # Use dx for RIGHT, dy for DOWN (fallback to dx if dy==0)
-                        speed = prof["dx"] if axis == 0 else (prof["dy"] if prof["dy"] else prof["dx"])
-
-                    dx = speed if axis == 0 else 0
-                    dy = speed if axis == 1 else 0
-
-                    # Move mouse
+                    # Send HID report
                     if mouse and (dx != 0 or dy != 0):
-                        actual_dx, actual_dy = mouse.move(dx, dy)
+                        actual_dx, actual_dy = mouse.move(
+                            dx, dy, respect_bounds=True)
                         cum_dx += actual_dx
                         cum_dy += actual_dy
-                    else:
-                        # V0 stationary — no movement, just observe
-                        pass
+                        # Log first time soft bounds clamps movement
+                        if not bounds_hit_logged and (actual_dx != dx or actual_dy != dy):
+                            bounds_hit_logged = True
+                            print(f"[vtest] {pid}_{direction}: soft bounds hit at "
+                                  f"step {i}/{total_reports}, "
+                                  f"ESP ({mouse.estimated_x},{mouse.estimated_y})")
 
-                    # Wait for tracker to process the movement
-                    time.sleep(delay_s)
+                    # Sleep for one HID report interval
+                    time.sleep(REPORT_INTERVAL_S)
 
-                    # Capture state
-                    commanded_x = start_esp_x + cum_dx
-                    commanded_y = start_esp_y + cum_dy
-                    snapshot = _capture_snapshot(
-                        pid, step_i, direction, dx, dy,
-                        commanded_x, commanded_y, run_dir,
-                    )
-                    _vtest_results.append(snapshot)
+                    # Capture snapshot at reduced rate
+                    if i % SNAPSHOT_EVERY_N == 0 or i == total_reports - 1:
+                        commanded_x = start_esp_x + cum_dx
+                        commanded_y = start_esp_y + cum_dy
+                        # Compute instantaneous velocity for this report
+                        inst_vel = ((dx ** 2 + dy ** 2) ** 0.5) / REPORT_INTERVAL_S
+                        # Run YOLO on last frame of each profile for ground truth
+                        run_yolo = (i == total_reports - 1)
+                        snapshot = _capture_snapshot(
+                            pid, i, direction, dx, dy,
+                            commanded_x, commanded_y, run_dir,
+                            velocity_px_s=inst_vel,
+                            run_yolo=run_yolo,
+                        )
+                        _vtest_results.append(snapshot)
 
-                    # Write to JSONL
-                    with open(log_path, "a") as f:
-                        f.write(json.dumps(snapshot) + "\n")
+                        with open(log_path, "a") as f:
+                            f.write(json.dumps(snapshot) + "\n")
 
-                    _vtest_progress["step"] = step_i + 1
+                    _vtest_progress["step"] = i + 1
 
                 # Return to start position after direction run
                 if mouse and (cum_dx != 0 or cum_dy != 0):
                     mouse.move(int(-cum_dx), int(-cum_dy))
                     time.sleep(0.5)  # Settle after return
+
+                # Log per-direction summary
+                dir_results = [r for r in _vtest_results
+                               if r["profile"] == pid and r["direction"] == direction]
+                if dir_results:
+                    acc = sum(1 for r in dir_results if r["label"] == "accurate")
+                    lost = sum(1 for r in dir_results if r["label"] == "lost")
+                    methods = set(r["tracked"]["method"] for r in dir_results)
+                    errors = [r["error_px"] for r in dir_results]
+                    print(f"[vtest] {pid}_{direction}: "
+                          f"acc={acc}/{len(dir_results)} "
+                          f"({100*acc/len(dir_results):.0f}%), "
+                          f"lost={lost}, "
+                          f"err_mean={sum(errors)/len(errors):.1f}, "
+                          f"err_max={max(errors):.1f}, "
+                          f"methods={methods}")
+
+            # Recalibrate between profiles: move to known corner
+            # then position at center for next profile
+            if mouse:
+                _vtest_progress["phase"] = "recalibrating"
+                esp_before = (mouse.estimated_x, mouse.estimated_y)
+                mouse.calibrate_to_corner('top_left')
+                time.sleep(0.3)
+                # Move to center of screen for next test
+                mouse.move(mouse.screen_width // 2,
+                           mouse.screen_height // 2,
+                           respect_bounds=False)
+                time.sleep(0.5)  # Let tracker settle
+                esp_after = (mouse.estimated_x, mouse.estimated_y)
+
+                # Log recalibration event
+                recal_event = {
+                    "type": "recalibration",
+                    "utc": utc_now_ms(),
+                    "profile_completed": pid,
+                    "esp_before": {"x": esp_before[0], "y": esp_before[1]},
+                    "esp_after": {"x": esp_after[0], "y": esp_after[1]},
+                    "tracked_after": {"x": state.cursor_x, "y": state.cursor_y},
+                    "drift_px": round(
+                        ((esp_after[0] - state.cursor_x) ** 2 +
+                         (esp_after[1] - state.cursor_y) ** 2) ** 0.5, 1),
+                }
+                with open(log_path, "a") as f:
+                    f.write(json.dumps(recal_event) + "\n")
+                print(f"[vtest] Recalibrated after {pid}: "
+                      f"ESP ({esp_after[0]},{esp_after[1]}) "
+                      f"tracked ({state.cursor_x},{state.cursor_y}) "
+                      f"drift={recal_event['drift_px']}px")
 
         # Compute summary stats per profile
         _vtest_summary = _compute_vtest_summary(_vtest_results)
@@ -4263,6 +5235,16 @@ def _run_velocity_test(profiles: list[str]):
         with open(run_dir / "summary.json", "w") as f:
             json.dump(_vtest_summary, f, indent=2)
 
+        # Print final summary table
+        print(f"\n[vtest] ═══ VELOCITY TEST COMPLETE ═══")
+        print(f"[vtest] {'Profile':<16} {'Acc%':>6} {'ErrMean':>8} {'ErrMax':>8} {'Methods'}")
+        print(f"[vtest] {'─'*60}")
+        for key in sorted(_vtest_summary.keys()):
+            v = _vtest_summary[key]
+            print(f"[vtest] {key:<16} {v['accuracy_pct']:>5.1f}% "
+                  f"{v['error_mean']:>8.1f} {v['error_max']:>8.1f} "
+                  f"{v['methods']}")
+
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -4270,10 +5252,18 @@ def _run_velocity_test(profiles: list[str]):
     finally:
         _vtest_running = False
         _vtest_progress["phase"] = "done"
+        # Disable soft bounds after test
+        if mouse:
+            mouse.set_soft_bounds(0)
+            print(f"[vtest] Soft bounds disabled")
 
 
 def _compute_vtest_summary(results: list[dict]) -> dict:
-    """Aggregate velocity test results per profile + direction."""
+    """Aggregate velocity test results per profile + direction.
+
+    Includes CNN model comparison stats: mean confidence per model version
+    at each velocity level.
+    """
     from collections import defaultdict
     import statistics
 
@@ -4286,6 +5276,7 @@ def _compute_vtest_summary(results: list[dict]) -> dict:
     for key, records in groups.items():
         errors = [r["error_px"] for r in records]
         labels = [r["label"] for r in records]
+        velocities = [r.get("velocity_px_s", 0) for r in records]
         n = len(records)
         label_counts = {
             "accurate": labels.count("accurate"),
@@ -4293,8 +5284,20 @@ def _compute_vtest_summary(results: list[dict]) -> dict:
             "wrong": labels.count("wrong"),
             "lost": labels.count("lost"),
         }
+
+        # CNN comparison: mean confidence per model version
+        cnn_means = {}
+        all_cnn = defaultdict(list)
+        for r in records:
+            for ver, conf in r.get("cnn_comparison", {}).items():
+                all_cnn[ver].append(conf)
+        for ver, confs in all_cnn.items():
+            cnn_means[ver] = round(statistics.mean(confs), 4) if confs else 0
+
         summary[key] = {
             "count": n,
+            "velocity_px_s_mean": round(statistics.mean(velocities), 1) if velocities else 0,
+            "velocity_px_s_max": round(max(velocities), 1) if velocities else 0,
             "error_mean": round(statistics.mean(errors), 1) if errors else 0,
             "error_max": round(max(errors), 1) if errors else 0,
             "error_min": round(min(errors), 1) if errors else 0,
@@ -4302,6 +5305,7 @@ def _compute_vtest_summary(results: list[dict]) -> dict:
             "labels": label_counts,
             "accuracy_pct": round(100 * label_counts["accurate"] / n, 1) if n > 0 else 0,
             "methods": list(set(r["tracked"]["method"] for r in records)),
+            "cnn_comparison": cnn_means,
         }
 
     return summary
@@ -4311,7 +5315,7 @@ def _compute_vtest_summary(results: list[dict]) -> dict:
 async def start_velocity_test(request: Request):
     """Start velocity/acceleration test in background thread.
 
-    POST body (optional): {"profiles": ["V0","V1","V2","V3","V4","A1","A2","A3"]}
+    POST body (optional): {"profiles": ["V0","V100","V500","V1K","A_UP","D500",...]}
     Omit profiles to run all.
     """
     global _vtest_running
@@ -4569,6 +5573,21 @@ def init_hardware():
     print("  Cursor recognizer: " + recognizer.model_version
           + " (" + str(collector.total_samples) + " samples)")
 
+    # Load all available CNN model versions for velocity test comparison
+    _model_dir = Path(__file__).parent.parent.parent / "data" / "cursor_models"
+    if _model_dir.exists():
+        for mf in sorted(_model_dir.glob("v*_*.pt")):
+            version = mf.stem  # e.g. "v005_20260220"
+            if version != recognizer.model_version:
+                try:
+                    r = CursorRecognizer(model_file=mf)
+                    _vtest_recognizers[version] = r
+                except Exception:
+                    pass
+        if _vtest_recognizers:
+            print("  Velocity test comparison models: "
+                  + ", ".join(sorted(_vtest_recognizers.keys())))
+
     # Phase 2: Silhouette tracker (fast ROI-based cursor following)
     sil_tracker = SilhouetteTracker(recognizer)
     print("  Silhouette tracker initialized (ROI: " + str(sil_tracker.roi_size) + "px)")
@@ -4603,6 +5622,25 @@ def init_hardware():
 
 
 if __name__ == "__main__":
+    import argparse
     import uvicorn
+
+    parser = argparse.ArgumentParser(description="KVM Dashboard")
+    parser.add_argument("--passive", action="store_true",
+                        help="Passive mode: observe only, no mouse movements")
+    parser.add_argument("--port", type=int, default=8766)
+    args = parser.parse_args()
+
+    if args.passive:
+        _passive_mode = True
+        print("*** PASSIVE MODE: no mouse movements will be sent ***")
+
     init_hardware()
-    uvicorn.run(app, host="0.0.0.0", port=8766)
+
+    # Init state log size tracker (for rotation)
+    if _STATE_LOG_PATH.exists():
+        _state_log_bytes = _STATE_LOG_PATH.stat().st_size
+        print(f"  State log: {_state_log_bytes / 1024 / 1024:.1f}MB "
+              f"({_STATE_LOG_PATH})")
+
+    uvicorn.run(app, host="0.0.0.0", port=args.port)

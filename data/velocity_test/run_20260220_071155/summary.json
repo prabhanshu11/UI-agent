@@ -1,0 +1,36 @@
+{
+  "V0_right": {
+    "count": 50,
+    "error_mean": 0.0,
+    "error_max": 0.0,
+    "error_min": 0.0,
+    "error_p95": 0.0,
+    "labels": {
+      "accurate": 50,
+      "drift": 0,
+      "wrong": 0,
+      "lost": 0
+    },
+    "accuracy_pct": 100.0,
+    "methods": [
+      "manual"
+    ]
+  },
+  "V0_down": {
+    "count": 50,
+    "error_mean": 0.0,
+    "error_max": 0.0,
+    "error_min": 0.0,
+    "error_p95": 0.0,
+    "labels": {
+      "accurate": 50,
+      "drift": 0,
+      "wrong": 0,
+      "lost": 0
+    },
+    "accuracy_pct": 100.0,
+    "methods": [
+      "manual"
+    ]
+  }
+}

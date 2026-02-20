@@ -66,8 +66,13 @@ class ESP32Mouse:
         self.estimated_x = screen_width // 2
         self.estimated_y = screen_height // 2
 
+        # Soft bounds: larger margin than buffer, configurable at runtime.
+        # When >0, move() with respect_bounds uses this instead of buffer_x/y.
+        self.soft_bounds_px = 0
+
         # Serial connection (lazy init)
         self._ser: Optional[serial.Serial] = None
+        self._serial_lock = threading.Lock()
 
     @property
     def ser(self) -> serial.Serial:
@@ -220,6 +225,9 @@ class ESP32Mouse:
     def _send_raw(self, dx: int, dy: int):
         """Send raw mouse movement command (single HID report).
 
+        Thread-safe: uses _serial_lock so heartbeat, jitter, and passthrough
+        can all write to serial without corrupting each other.
+
         Also updates dead-reckoning position estimate. Every displacement
         we command is accumulated so we always have a predicted position.
 
@@ -230,8 +238,9 @@ class ESP32Mouse:
         dx = max(-self.HID_MAX, min(self.HID_MAX, dx))
         dy = max(-self.HID_MAX, min(self.HID_MAX, dy))
 
-        self.ser.write(f'MOUSE:{dx},{dy}\n'.encode())
-        self.ser.flush()
+        with self._serial_lock:
+            self.ser.write(f'MOUSE:{dx},{dy}\n'.encode())
+            self.ser.flush()
 
         # Dead reckoning: accumulate every commanded displacement
         self.estimated_x = max(0, min(self.screen_width,
@@ -257,6 +266,17 @@ class ESP32Mouse:
             dx -= chunk_dx
             dy -= chunk_dy
 
+    def set_soft_bounds(self, margin_px: int = 0):
+        """Set soft bounds margin for movement clamping.
+
+        When margin_px > 0, move() with respect_bounds=True keeps the cursor
+        at least margin_px from each screen edge. Set to 0 to disable
+        (falls back to the default ~10px hardware buffer).
+
+        Typical values: 100-200px for velocity tests to keep cursor visible.
+        """
+        self.soft_bounds_px = max(0, margin_px)
+
     def move(self, dx: int, dy: int, respect_bounds: bool = True) -> Tuple[int, int]:
         """Move mouse with optional boundary clamping.
 
@@ -264,18 +284,23 @@ class ESP32Mouse:
             dx: Desired X movement in pixels.
             dy: Desired Y movement in pixels.
             respect_bounds: If True, clamp movement to screen boundaries.
+                Uses soft_bounds_px if set, otherwise buffer_x/buffer_y.
 
         Returns:
             Tuple of (actual_dx, actual_dy) after any clamping.
         """
         if respect_bounds:
+            # Use soft bounds margin if set, otherwise hardware buffer
+            margin_x = max(self.buffer_x, self.soft_bounds_px)
+            margin_y = max(self.buffer_y, self.soft_bounds_px)
+
             # Calculate new position
             new_x = self.estimated_x + dx
             new_y = self.estimated_y + dy
 
-            # Clamp to screen bounds (with small buffer)
-            new_x = max(self.buffer_x, min(self.screen_width - self.buffer_x, new_x))
-            new_y = max(self.buffer_y, min(self.screen_height - self.buffer_y, new_y))
+            # Clamp to screen bounds (with margin)
+            new_x = max(margin_x, min(self.screen_width - margin_x, new_x))
+            new_y = max(margin_y, min(self.screen_height - margin_y, new_y))
 
             # Calculate actual movement after clamping
             dx = new_x - self.estimated_x
@@ -310,8 +335,9 @@ class ESP32Mouse:
         Args:
             button: Button to click ('left', 'right', 'middle').
         """
-        self.ser.write(f'CLICK:{button}\n'.encode())
-        self.ser.flush()
+        with self._serial_lock:
+            self.ser.write(f'CLICK:{button}\n'.encode())
+            self.ser.flush()
         time.sleep(0.05)
 
     def circle(

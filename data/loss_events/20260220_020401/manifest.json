@@ -1,0 +1,33 @@
+{
+  "event_id": "20260220_020401",
+  "trigger": "position_jump_393px",
+  "trigger_utc": "2026-02-20T02:04:01.334999Z",
+  "recovered": false,
+  "duration_s": 24.7,
+  "total_frames": 118,
+  "pre_frames": 43,
+  "post_frames": 75,
+  "total_tracked_patches": 118,
+  "total_blob_patches": 153,
+  "phases": {
+    "had_it": 42,
+    "lost": 76,
+    "recovering": 0,
+    "recovered": 0
+  },
+  "velocity": {
+    "max_velocity_px_s": 1847.3,
+    "max_velocity_at_offset_s": -7.09,
+    "max_accel_px_s2": 9222.1,
+    "max_accel_at_offset_s": -6.89,
+    "avg_velocity_pre": 80.2,
+    "avg_velocity_post": 18.5
+  },
+  "edge_cases_found": [
+    "high_accel",
+    "high_speed",
+    "peak_velocity",
+    "noisy_background",
+    "peak_acceleration"
+  ]
+}
