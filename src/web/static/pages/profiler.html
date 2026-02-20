@@ -24,6 +24,7 @@
         <div><div class="utc-lbl">Browser UTC</div><div class="utc-val" id="browser-utc">--:--:--.---</div></div>
         <div><div class="utc-lbl">Server UTC</div><div class="utc-val" id="server-utc">--:--:--.---</div></div>
         <div><div class="utc-lbl">Clock Delta</div><div class="utc-delta" id="utc-delta">--ms</div></div>
+        <div><div class="utc-lbl">Windows</div><div class="utc-val" id="win-time" style="color:#555">--</div></div>
         <div style="margin-left:auto;"><div class="utc-lbl">Daemon FPS</div><div class="metric-val" id="daemon-fps">--</div></div>
         <div><div class="utc-lbl">Blobs</div><div class="metric-val" id="blob-count">--</div></div>
         <div><div class="utc-lbl">Frame #</div><div class="metric-val" id="frame-count" style="color:#555">--</div></div>
@@ -58,17 +59,25 @@
         </div>
     </div>
 
-    <!-- Pipeline Waterfall (current frame) -->
+    <!-- Resource Volume (RAM + CPU per process/thread) -->
     <div class="row full">
         <div class="card">
-            <div class="card-title">Pipeline Waterfall (current frame)</div>
-            <div class="wf-row"><span class="wf-label">JPEG Decode</span><div class="wf-bar-wrap"><div class="wf-bar decode" id="bar-decode"></div></div><span class="wf-val" id="val-decode">&mdash;</span></div>
-            <div class="wf-row"><span class="wf-label">Sil. Track</span><div class="wf-bar-wrap"><div class="wf-bar track" id="bar-track"></div></div><span class="wf-val" id="val-track">&mdash;</span></div>
-            <div class="wf-row"><span class="wf-label">Overlay Draw</span><div class="wf-bar-wrap"><div class="wf-bar overlay" id="bar-overlay"></div></div><span class="wf-val" id="val-overlay">&mdash;</span></div>
-            <div class="wf-row"><span class="wf-label">JPEG Encode</span><div class="wf-bar-wrap"><div class="wf-bar encode" id="bar-encode"></div></div><span class="wf-val" id="val-encode">&mdash;</span></div>
-            <div class="wf-sep"></div>
-            <div class="wf-row"><span class="wf-label">Frame Total</span><div class="wf-bar-wrap"><div class="wf-bar total" id="bar-total"></div></div><span class="wf-val" id="val-total">&mdash;</span></div>
-            <div class="wf-row"><span class="wf-label">HTTP Round-Trip</span><div class="wf-bar-wrap"><div class="wf-bar http" id="bar-http"></div></div><span class="wf-val" id="val-http">&mdash;</span></div>
+            <div class="card-title">Resource Volume (live — 5min window)</div>
+            <div style="display:flex; gap:1rem;">
+                <div style="flex:1;">
+                    <div style="font-size:0.65rem; color:#888; margin-bottom:4px;">RAM (MB)</div>
+                    <canvas id="ram-chart" style="width:100%; height:120px;"></canvas>
+                    <div style="display:flex; gap:1rem; font-size:0.6rem; color:#555; margin-top:4px;">
+                        <span><span style="color:#e74c3c;">&#9632;</span> Python: <span id="ram-python">--</span>MB</span>
+                        <span><span style="color:#3498db;">&#9632;</span> Daemon: <span id="ram-daemon">--</span>MB</span>
+                    </div>
+                </div>
+                <div style="flex:1;">
+                    <div style="font-size:0.65rem; color:#888; margin-bottom:4px;">CPU (seconds per thread, cumulative)</div>
+                    <canvas id="cpu-chart" style="width:100%; height:120px;"></canvas>
+                    <div id="cpu-legend" style="display:flex; flex-wrap:wrap; gap:6px; font-size:0.55rem; color:#555; margin-top:4px;"></div>
+                </div>
+            </div>
         </div>
     </div>
 

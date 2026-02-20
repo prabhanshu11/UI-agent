@@ -35,6 +35,26 @@
             </div>
         </div>
         <div class="sidebar">
+            <!-- Clocks -->
+            <div class="panel" style="border-color:#3498db;">
+                <div class="panel-title" style="color:#3498db">Clocks</div>
+                <div class="hw-row"><span class="hw-label">Browser UTC</span><span class="hw-value" id="clock-browser-utc" style="font-family:monospace; font-size:0.6rem; color:#888;">--:--:--.---</span></div>
+                <div class="hw-row"><span class="hw-label">Server UTC</span><span class="hw-value" id="clock-server-utc" style="font-family:monospace; font-size:0.6rem; color:#888;">--:--:--.---</span></div>
+                <div class="hw-row"><span class="hw-label">Clock Delta</span><span class="hw-value" id="clock-delta" style="font-family:monospace; font-size:0.6rem;">--ms</span></div>
+                <div style="border-top:1px solid #222; margin:4px 0; padding-top:4px;">
+                    <div class="hw-row">
+                        <span class="hw-label">Windows</span>
+                        <span class="hw-value" id="win-clock" style="font-family:monospace; font-size:0.6rem; color:#555;">--</span>
+                    </div>
+                    <div class="hw-row">
+                        <span class="hw-label">Drift</span>
+                        <span class="hw-value" id="win-drift" style="font-family:monospace; font-size:0.6rem; color:#555;">--</span>
+                    </div>
+                    <div style="text-align:right; font-size:0.5rem;">
+                        <span id="win-clock-tag" style="color:#555;"></span>
+                    </div>
+                </div>
+            </div>
             <!-- Overlay Toggles -->
             <div class="panel">
                 <div class="panel-title" style="color:#3498db">Overlays</div>

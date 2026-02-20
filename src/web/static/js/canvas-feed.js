@@ -41,6 +41,12 @@ var CanvasFeed = (function() {
         frameCtx = frameCanvas.getContext('2d');
         overlayCtx = overlayCanvas.getContext('2d');
 
+        // Set pixel dimensions immediately — createElement('canvas') defaults
+        // to 300x150, and setCanvasSize() only triggers on dimension CHANGE.
+        // Without this, frames get clipped to 300x150 and recordings show
+        // only the top-left corner.
+        setCanvasSize(frameWidth, frameHeight);
+
         feedRunning = true;
         scheduleFrame();
     }

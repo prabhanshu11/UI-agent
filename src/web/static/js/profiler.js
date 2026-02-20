@@ -39,13 +39,7 @@ function tickClock() {
 }
 setInterval(tickClock, 100);
 
-function setBar(name, ms) {
-    var b = document.getElementById('bar-' + name);
-    var v = document.getElementById('val-' + name);
-    if (!b || !v) return;
-    b.style.width = Math.min(100, (ms / barMax) * 100) + '%';
-    v.textContent = ms.toFixed(1) + 'ms';
-}
+// (waterfall bars removed — replaced by resource volume chart)
 
 // ── Timeline scrubber ────────────────────────────────────────
 function addTimelineFrame(data) {
@@ -155,12 +149,14 @@ async function poll() {
         document.getElementById('prof-status').textContent = 'Live';
         document.getElementById('prof-status').style.color = '#2ecc71';
 
-        setBar('decode', d.pipeline.jpeg_decode_ms);
-        setBar('track', d.pipeline.silhouette_ms);
-        setBar('overlay', d.pipeline.overlay_draw_ms);
-        setBar('encode', d.pipeline.jpeg_encode_ms);
-        setBar('total', d.pipeline.frame_total_ms);
-        setBar('http', httpRt);
+        // Windows clock
+        var winEl = document.getElementById('win-time');
+        if (winEl && d.windows_clock) {
+            var wc = d.windows_clock;
+            winEl.textContent = wc.time_str || '--';
+            winEl.style.color = wc.status === 'correlated' ? '#2ecc71' :
+                wc.status === 'raw' ? '#f1c40f' : '#555';
+        }
 
         // Daemon stats
         document.getElementById('daemon-fps').textContent = d.daemon.fps.toFixed(1);
@@ -332,3 +328,173 @@ async function measureLatency() {
 }
 
 poll();
+
+// ── Resource Volume Chart ────────────────────────────────────
+var THREAD_COLORS = {
+    'motion-detect': '#e74c3c', 'jitter': '#2ecc71', 'cursor-validate': '#f1c40f',
+    'clock-cal': '#3498db', 'pi-keyboard': '#9b59b6', 'resource-mon': '#555',
+    'MainThread': '#e67e22',
+};
+var cpuLegendBuilt = false;
+
+function drawResourceCharts(data) {
+    if (!data.samples || data.samples.length < 2) return;
+    var samples = data.samples;
+
+    // RAM chart
+    var ramCanvas = document.getElementById('ram-chart');
+    if (ramCanvas) {
+        var dpr = window.devicePixelRatio || 1;
+        var W = ramCanvas.offsetWidth, H = ramCanvas.offsetHeight;
+        ramCanvas.width = W * dpr; ramCanvas.height = H * dpr;
+        var ctx = ramCanvas.getContext('2d');
+        ctx.scale(dpr, dpr);
+        ctx.clearRect(0, 0, W, H);
+
+        var maxRam = 0;
+        for (var i = 0; i < samples.length; i++) {
+            var total = samples[i].rss_mb + (samples[i].daemon ? samples[i].daemon.rss_mb : 0);
+            if (total > maxRam) maxRam = total;
+        }
+        maxRam = Math.max(maxRam * 1.2, 100);
+
+        // Python RSS area
+        ctx.beginPath();
+        ctx.moveTo(0, H);
+        for (var i = 0; i < samples.length; i++) {
+            var x = (i / (samples.length - 1)) * W;
+            var y = H - (samples[i].rss_mb / maxRam) * H;
+            ctx.lineTo(x, y);
+        }
+        ctx.lineTo(W, H); ctx.closePath();
+        ctx.fillStyle = 'rgba(231, 76, 60, 0.3)';
+        ctx.fill();
+        ctx.strokeStyle = '#e74c3c'; ctx.lineWidth = 1.5; ctx.stroke();
+
+        // Daemon RSS area (stacked)
+        ctx.beginPath();
+        ctx.moveTo(0, H);
+        for (var i = 0; i < samples.length; i++) {
+            var x = (i / (samples.length - 1)) * W;
+            var daemonMb = samples[i].daemon ? samples[i].daemon.rss_mb : 0;
+            var pyBase = H - (samples[i].rss_mb / maxRam) * H;
+            var y = pyBase - (daemonMb / maxRam) * H;
+            ctx.lineTo(x, y);
+        }
+        for (var i = samples.length - 1; i >= 0; i--) {
+            var x = (i / (samples.length - 1)) * W;
+            var pyBase = H - (samples[i].rss_mb / maxRam) * H;
+            ctx.lineTo(x, pyBase);
+        }
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(52, 152, 219, 0.3)';
+        ctx.fill();
+        ctx.strokeStyle = '#3498db'; ctx.lineWidth = 1; ctx.stroke();
+
+        // Y-axis label
+        ctx.fillStyle = '#555'; ctx.font = '10px monospace';
+        ctx.fillText(Math.round(maxRam) + 'MB', 2, 10);
+    }
+
+    // Update RAM values
+    var latest = samples[samples.length - 1];
+    var pyRamEl = document.getElementById('ram-python');
+    var daemonRamEl = document.getElementById('ram-daemon');
+    if (pyRamEl) pyRamEl.textContent = latest.rss_mb;
+    if (daemonRamEl) daemonRamEl.textContent = latest.daemon ? latest.daemon.rss_mb : 0;
+
+    // CPU chart: per-thread CPU delta as stacked area
+    var cpuCanvas = document.getElementById('cpu-chart');
+    if (cpuCanvas && samples.length > 1) {
+        var dpr = window.devicePixelRatio || 1;
+        var W = cpuCanvas.offsetWidth, H = cpuCanvas.offsetHeight;
+        cpuCanvas.width = W * dpr; cpuCanvas.height = H * dpr;
+        var ctx = cpuCanvas.getContext('2d');
+        ctx.scale(dpr, dpr);
+        ctx.clearRect(0, 0, W, H);
+
+        // Collect all thread names from latest sample
+        var threadNames = [];
+        var latestThreads = latest.threads || {};
+        for (var tid in latestThreads) {
+            var name = latestThreads[tid].name;
+            if (threadNames.indexOf(name) === -1) threadNames.push(name);
+        }
+
+        // Compute per-thread CPU delta between consecutive samples
+        var maxCpu = 0.1;
+        var deltas = [];
+        for (var i = 1; i < samples.length; i++) {
+            var prev = samples[i-1].threads || {};
+            var curr = samples[i].threads || {};
+            var d = {};
+            var total = 0;
+            for (var j = 0; j < threadNames.length; j++) {
+                var name = threadNames[j];
+                var prevCpu = 0, currCpu = 0;
+                for (var tid in prev) { if (prev[tid].name === name) prevCpu = prev[tid].cpu_s; }
+                for (var tid in curr) { if (curr[tid].name === name) currCpu = curr[tid].cpu_s; }
+                var delta = Math.max(0, currCpu - prevCpu);
+                d[name] = delta;
+                total += delta;
+            }
+            deltas.push(d);
+            if (total > maxCpu) maxCpu = total;
+        }
+        maxCpu = Math.max(maxCpu * 1.2, 0.5);
+
+        // Draw stacked areas
+        for (var ti = threadNames.length - 1; ti >= 0; ti--) {
+            var name = threadNames[ti];
+            var color = THREAD_COLORS[name] || '#888';
+            ctx.beginPath();
+            ctx.moveTo(0, H);
+            for (var i = 0; i < deltas.length; i++) {
+                var x = (i / Math.max(1, deltas.length - 1)) * W;
+                var stack = 0;
+                for (var j = 0; j <= ti; j++) {
+                    stack += deltas[i][threadNames[j]] || 0;
+                }
+                var y = H - (stack / maxCpu) * H;
+                ctx.lineTo(x, y);
+            }
+            ctx.lineTo(W, H); ctx.closePath();
+            ctx.globalAlpha = 0.4;
+            ctx.fillStyle = color;
+            ctx.fill();
+            ctx.globalAlpha = 1.0;
+            ctx.strokeStyle = color; ctx.lineWidth = 1; ctx.stroke();
+        }
+
+        ctx.fillStyle = '#555'; ctx.font = '10px monospace';
+        ctx.fillText(maxCpu.toFixed(1) + 's', 2, 10);
+
+        // Build legend once using safe DOM methods
+        if (!cpuLegendBuilt) {
+            var legend = document.getElementById('cpu-legend');
+            if (legend) {
+                for (var i = 0; i < threadNames.length; i++) {
+                    var span = document.createElement('span');
+                    var swatch = document.createElement('span');
+                    swatch.textContent = '\u25A0';
+                    swatch.style.color = THREAD_COLORS[threadNames[i]] || '#888';
+                    span.appendChild(swatch);
+                    span.appendChild(document.createTextNode(' ' + threadNames[i]));
+                    legend.appendChild(span);
+                }
+                cpuLegendBuilt = true;
+            }
+        }
+    }
+}
+
+// Poll resources every 5s
+async function pollResources() {
+    try {
+        var r = await fetch('/api/profiler/resources');
+        var d = await r.json();
+        drawResourceCharts(d);
+    } catch(e) {}
+}
+setInterval(pollResources, 5000);
+pollResources();

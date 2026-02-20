@@ -27,7 +27,9 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse, FileRes
 from fastapi.staticfiles import StaticFiles
 
 import httpx
+import os
 import re as _re
+import subprocess
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -133,8 +135,8 @@ state = MotionState()
 class DashboardConfig:
     """Runtime-tunable parameters exposed via /api/config."""
     frame_fps: float = 5.0          # Overlayed video render rate (Hz)
-    cnn_interval_s: float = 30.0    # CNN validation cycle (seconds)
-    jitter_interval_s: float = 30.0 # Anti-sleep jitter interval
+    cnn_interval_s: float = 60.0    # CNN validation cycle (seconds)
+    jitter_interval_s: float = 60.0 # Anti-sleep jitter interval
     jitter_pixels: int = 3          # Jitter amplitude (px)
     verify_every_n: int = 3         # Run verification probe every Nth jitter
     verify_drift_px: int = 100      # Drift threshold: probe vs tracked position
@@ -336,7 +338,7 @@ _CNN_DRIFT_INVALIDATE_PX = 100  # auto-invalidate threshold
 _cnn_urgent_recheck: bool = False
 _stale_recovery_attempts: int = 0  # consecutive probe cycles where CNN still fails
 _VISION_LOCKOUT_S: float = 30.0     # how long Vision position is protected from motion override
-_YOLO_LOCKOUT_S: float = 5.0       # how long a high-confidence YOLO position is protected
+_YOLO_LOCKOUT_S: float = 10.0      # how long a high-confidence YOLO position is protected
 _yolo_lockout_until: float = 0.0   # monotonic time until which YOLO position is protected
 _CNN_LOCKOUT_S: float = 10.0       # protect CNN-validated position from motion overrides
 _cnn_lockout_until: float = 0.0    # monotonic time until which CNN position is protected
@@ -344,7 +346,7 @@ _cnn_lockout_until: float = 0.0    # monotonic time until which CNN position is 
 # Passive mode: observe-only, no mouse movements at all.
 # Silhouette tracking, CNN, YOLO still run for data capture, but
 # no jitter, probes, calibrate_to_corner, or any HID mouse reports.
-_passive_mode: bool = False
+_passive_mode: bool = True   # Start passive — YOLO observes, no mouse movement
 
 # Mouse passthrough: pipe user's mouse through ESP32 pebble
 _passthrough_active: bool = False
@@ -638,6 +640,12 @@ def _daemon_motion_loop():
                 filtered_blobs.append(b)
             cursor_blobs = filtered_blobs
 
+            # YOLO-primary: suppress ALL blob processing when YOLO lockout
+            # is active. YOLO is the trusted detector — blobs only process
+            # when YOLO has no recent detection.
+            if now < _yolo_lockout_until and state.yolo_active:
+                cursor_blobs = []
+
             primary_blob = None
             if cursor_blobs:
                 if pos and (now - pos.timestamp < 10):
@@ -865,35 +873,16 @@ def _daemon_motion_loop():
                                 state.yolo_timestamp = now
                                 state.yolo_detection_count += 1
 
-                                pos = tracker.position if tracker else None
-
-                                # Priority 1: No position / stale / lost → YOLO seeds
-                                if (not pos or
-                                        (now - pos.timestamp > 5) or
-                                        state.silhouette_method == "lost"):
-                                    if tracker and best_yolo.confidence > 0.5:
-                                        tracker.set_position(
-                                            best_yolo.cx, best_yolo.cy,
-                                            method="yolo")
-                                        pos = tracker.position
-                                        if sil_tracker:
-                                            sil_tracker.reset()
-                                        _yolo_lockout_until = now + _YOLO_LOCKOUT_S
-
-                                # Priority 2: YOLO disagrees with silhouette → anchor correction
-                                elif pos and best_yolo.confidence > 0.7:
-                                    drift = ((best_yolo.cx - pos.x) ** 2 +
-                                             (best_yolo.cy - pos.y) ** 2) ** 0.5
-                                    if drift > 80:
-                                        if tracker:
-                                            tracker.set_position(
-                                                best_yolo.cx, best_yolo.cy,
-                                                method="yolo_anchor")
-                                            pos = tracker.position
-                                        if sil_tracker:
-                                            sil_tracker.reset()
-                                        _yolo_lockout_until = now + _YOLO_LOCKOUT_S
-                                        state.cursor_validated = False
+                                # YOLO-primary: any detection > 0.3 sets position
+                                # and activates lockout (suppresses blob processing)
+                                if tracker and best_yolo.confidence > 0.3:
+                                    tracker.set_position(
+                                        best_yolo.cx, best_yolo.cy,
+                                        method="yolo")
+                                    pos = tracker.position
+                                    if sil_tracker:
+                                        sil_tracker.reset()
+                                    _yolo_lockout_until = now + _YOLO_LOCKOUT_S
                             else:
                                 state.yolo_active = False
 
@@ -1074,6 +1063,7 @@ def _python_motion_loop():
       → Full-frame blob detection (existing code, ~5-10ms)
       → Shape-informed or proximity-based blob selection
     """
+    global _yolo_lockout_until
     prev_frame = None
     frame_times = []
 
@@ -1127,17 +1117,15 @@ def _python_motion_loop():
                     state.yolo_timestamp = t0
                     state.yolo_detection_count += 1
 
-                    # Seed position from YOLO if stale or lost
-                    if (not pos or
-                            (t0 - pos.timestamp > 5) or
-                            not state.silhouette_active):
-                        if tracker and best_yolo.confidence > 0.5:
-                            tracker.set_position(
-                                best_yolo.cx, best_yolo.cy, method="yolo")
-                            pos = tracker.position
-                            cursor_pos = (pos.x, pos.y)
-                            if sil_tracker:
-                                sil_tracker.reset()
+                    # YOLO-primary: any detection > 0.3 sets position
+                    if tracker and best_yolo.confidence > 0.3:
+                        tracker.set_position(
+                            best_yolo.cx, best_yolo.cy, method="yolo")
+                        pos = tracker.position
+                        cursor_pos = (pos.x, pos.y)
+                        if sil_tracker:
+                            sil_tracker.reset()
+                        _yolo_lockout_until = t0 + _YOLO_LOCKOUT_S
                 else:
                     state.yolo_active = False
 
@@ -1309,8 +1297,15 @@ def _log_state_line(entry: dict):
     50MB rotation = ~14 hours of data. Enough for any debugging session.
     """
     global _state_log_bytes
+    # Windows clock: raw OCR or interpolated ms-level time
+    wt = None
+    wc = windows_time_now()
+    if wc and wc.get("time_str"):
+        wt = wc["time_str"]
+
     compact = {
         "t": entry.get("utc", ""),
+        "wt": wt,
         "cx": entry.get("cx"), "cy": entry.get("cy"),
         "m": entry.get("method", ""),
         "cnn": round(entry.get("cnn_conf", 0), 3),
@@ -1943,11 +1938,11 @@ def jitter_loop():
             continue
 
         if need_reacquire:
-            # Try YOLO first: if YOLO recently detected cursor, use that position
-            # instead of the slow jitter probe (saves ~2s)
+            # YOLO-primary: if YOLO recently detected cursor, use that position
+            # and skip the disruptive probe entirely
             yolo_age = now - state.yolo_timestamp if state.yolo_timestamp > 0 else 999
             if (yolo_detector and state.yolo_active
-                    and state.yolo_confidence > 0.5 and yolo_age < 5.0):
+                    and state.yolo_confidence > 0.3 and yolo_age < _YOLO_LOCKOUT_S):
                 result = (state.yolo_x, state.yolo_y)
             else:
                 # Correlation probe: the jitter IS the probe signal
@@ -2401,7 +2396,7 @@ def cursor_validation_loop():
         # - never validated (startup / never found cursor) → 5s
         # - validated and stable → normal interval (30s)
         if _cnn_urgent_recheck:
-            interval = 0.5  # Fast recheck — CNN confidence may already be high
+            interval = 5.0  # Recheck — reduced from 0.5s to avoid interrupting user
         elif not state.cursor_validated and _low_confidence_since == 0:
             interval = 5.0  # First-time search
         else:
@@ -2430,10 +2425,10 @@ def cursor_validation_loop():
                 #   4. calibrate_to_corner (last resort, needs mouse)
                 reacquired = False
 
-                # 1. YOLO shortcut
+                # 1. YOLO shortcut (YOLO-primary: lower threshold)
                 yolo_age = now - state.yolo_timestamp if state.yolo_timestamp > 0 else 999
                 if (yolo_detector and state.yolo_active
-                        and state.yolo_confidence > 0.5 and yolo_age < 5.0):
+                        and state.yolo_confidence > 0.3 and yolo_age < _YOLO_LOCKOUT_S):
                     tracker.set_position(state.yolo_x, state.yolo_y, method="yolo")
                     state.cursor_x = state.yolo_x
                     state.cursor_y = state.yolo_y
@@ -2478,8 +2473,11 @@ def cursor_validation_loop():
                     except Exception as e:
                         print(f"[cnn_loop] Grid scan error: {e}")
 
-                # 3. Mouse-based recovery (skip in passive/passthrough mode)
-                if not _passive_mode and not _passthrough_active:
+                # 3. Mouse-based recovery (skip in passive/passthrough mode,
+                #    and skip when YOLO is actively finding cursor)
+                yolo_age = now - state.yolo_timestamp if state.yolo_timestamp > 0 else 999
+                yolo_active_recently = yolo_age < _YOLO_LOCKOUT_S and state.yolo_confidence > 0.3
+                if not _passive_mode and not _passthrough_active and not yolo_active_recently:
                     if not reacquired and cmd_movement and pos:
                         mr = cmd_movement.escalate(pos.x, pos.y)
                         if mr:
@@ -2495,29 +2493,6 @@ def cursor_validation_loop():
                             reacquired = True
                 # Track consecutive stale-recovery cycles
                 _stale_recovery_attempts += 1
-                # Calibrate to known corner: immediately if urgent + probes failed,
-                # or after 3 cycles otherwise
-                calibrate_threshold = 1 if _cnn_urgent_recheck else 3
-                if not _passive_mode and not _passthrough_active and _stale_recovery_attempts >= calibrate_threshold and mouse:
-                    try:
-                        print(f"[cnn_loop] {_stale_recovery_attempts} stale recoveries"
-                              " failed — calibrating to corner")
-                        mouse.calibrate_to_corner('top_left')
-                        cx_target = mouse.screen_width // 2
-                        cy_target = mouse.screen_height // 2
-                        mouse.move(cx_target, cy_target)
-                        if tracker:
-                            tracker.set_position(
-                                mouse.estimated_x, mouse.estimated_y,
-                                method="calibrate_recovery")
-                        if sil_tracker:
-                            sil_tracker.reset()
-                        reacquired = True
-                        _stale_recovery_attempts = 0
-                        print(f"[cnn_loop] Calibrated to ({mouse.estimated_x}, "
-                              f"{mouse.estimated_y})")
-                    except Exception as e:
-                        print(f"[cnn_loop] Calibrate recovery failed: {e}")
                 if reacquired:
                     # Do NOT reset _low_confidence_since — only CNN > 0.7
                     # resets it. Probing a new position doesn't prove the
@@ -2599,7 +2574,9 @@ def cursor_validation_loop():
                 # the position drifted — probing from wrong position just
                 # finds random blobs and keeps the timestamp fresh,
                 # preventing the stale-position calibrate recovery.
-                if not _cnn_urgent_recheck and not _passive_mode:
+                yolo_age_2 = now - state.yolo_timestamp if state.yolo_timestamp > 0 else 999
+                yolo_ok = yolo_age_2 < _YOLO_LOCKOUT_S and state.yolo_confidence > 0.3
+                if not _cnn_urgent_recheck and not _passive_mode and not yolo_ok:
                     if cmd_movement:
                         mr = cmd_movement.escalate(cx, cy)
                         if mr:
@@ -2891,6 +2868,7 @@ async def get_state():
         "fps": round(state.fps, 1),
         "frame_count": state.frame_count,
         "claude_detector": claude_detector.to_dict() if claude_detector else None,
+        "windows_clock": windows_time_now(),
         "error": state.error,
         "timestamp": utc_now_ms(),
     }
@@ -3515,6 +3493,438 @@ def _clock_sync_loop(duration_s: float):
     _clock_sync_running = False
     print(f"[clock_sync] Done: {transition_count} transitions in "
           f"{frame_count} frames over {duration_s}s")
+
+
+# ── Global Clock Calibration ─────────────────────────────────────
+# Runs continuously (not just passthrough). Progressive:
+#   uncalibrated → raw (have OCR) → correlated (3+ transitions, ms precision)
+
+_clock_cal: dict = {
+    "status": "uncalibrated",   # uncalibrated | raw | correlated
+    "readings": [],             # [{ocr_text, monotonic, epoch_ms, our_utc_ms}]
+    "transitions": [],          # [{old, new, monotonic, epoch_ms, our_utc_ms}]
+    "tz_name": None,            # "IST", "EST", etc.
+    "tz_offset_s": None,        # +19800 for IST
+    "utc_offset_ms": None,      # windows_epoch_ms - our_utc_epoch_ms (best calibration)
+    "best_cal_idx": None,       # index into transitions[] used for utc_offset
+    "last_ocr": None,           # last raw OCR string
+    "last_ocr_mono": None,      # monotonic when last OCR was taken
+    "drift": {                  # drift detection (updated every 5min)
+        "last_check_mono": 0,   # monotonic time of last drift check
+        "drift_ms": None,       # predicted - actual (positive = our clock ahead)
+        "drift_history": [],    # [{mono, drift_ms, predicted, actual}]
+        "drift_rate_ppm": None, # drift rate in parts per million
+    },
+}
+
+_DRIFT_CHECK_INTERVAL_S = 300  # 5 minutes
+
+
+def _ocr_to_epoch_ms(ocr_text: str) -> Optional[int]:
+    """Convert OCR time like '5:10 PM' to epoch milliseconds (second=0).
+
+    Uses today's date from our system clock. The result is the epoch ms
+    for the START of that minute (e.g., 5:10 PM → 5:10:00.000).
+    """
+    m = _re.match(r'(\d{1,2}):(\d{2})\s*(AM|PM)?', ocr_text)
+    if not m:
+        return None
+    hour, minute = int(m.group(1)), int(m.group(2))
+    ampm = m.group(3)
+    if ampm:
+        ampm = ampm.upper()
+        if ampm == "PM" and hour != 12:
+            hour += 12
+        elif ampm == "AM" and hour == 12:
+            hour = 0
+    now = datetime.now()
+    t = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return int(t.timestamp() * 1000)
+
+
+def _detect_timezone() -> tuple[Optional[str], Optional[int]]:
+    """Detect Windows timezone by comparing OCR time with our UTC offset.
+
+    If Windows clock matches our local time (within 2 min), they share
+    our timezone. Returns (name, offset_seconds) or (None, None).
+    """
+    import time as _time
+    # Our local UTC offset in seconds
+    local_offset = -_time.timezone if _time.daylight == 0 else -_time.altzone
+    # IST = +19800, EST = -18000, etc.
+    offset_h = local_offset / 3600
+    # Map common offsets to names
+    tz_names = {
+        5.5: "IST", 5.75: "NPT", 0: "UTC", 1: "CET", 2: "EET",
+        -5: "EST", -6: "CST", -7: "MST", -8: "PST",
+        -4: "EDT", 8: "CST(Asia)", 9: "JST", 9.5: "ACST",
+        10: "AEST", 3: "MSK", 3.5: "IRST",
+    }
+    name = tz_names.get(offset_h, f"UTC{'+' if offset_h >= 0 else ''}{offset_h:g}")
+    return name, int(local_offset)
+
+
+def windows_time_now() -> Optional[dict]:
+    """Get current Windows time derived from UTC + offset.
+
+    The offset (windows_epoch_ms - our_utc_epoch_ms) is computed once from
+    the best calibration point (lowest drift). After that, Windows time is
+    derived purely from our current UTC + that offset — no OCR dependency
+    for real-time display.
+
+    Returns dict with:
+      - time_str: "5:10 PM" (raw, no offset yet) or "5:10:58.340 IST" (offset-derived)
+      - status: "uncalibrated" | "raw" | "correlated"
+      - staleness_s: seconds since last OCR (raw mode, no offset)
+      - epoch_ms: derived epoch ms (when offset is available)
+    """
+    cal = _clock_cal
+    if cal["status"] == "uncalibrated":
+        return {"time_str": None, "status": "uncalibrated"}
+
+    offset = cal["utc_offset_ms"]
+    drift = cal["drift"]
+
+    # If we have a UTC offset (even from first raw reading), derive time from UTC
+    if offset is not None:
+        our_utc_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        win_ms = our_utc_ms + offset
+        dt = datetime.fromtimestamp(win_ms / 1000.0)
+        frac_ms = win_ms % 1000
+        tz = cal["tz_name"] or "local"
+        time_str = dt.strftime("%-I:%M:%S") + f".{frac_ms:03d} {tz}"
+        staleness = time.monotonic() - cal["last_ocr_mono"] if cal["last_ocr_mono"] else 999
+        return {
+            "time_str": time_str,
+            "status": cal["status"],
+            "epoch_ms": win_ms,
+            "tz": tz,
+            "staleness_s": round(staleness, 0),
+            "transitions": len(cal["transitions"]),
+            "drift_ms": drift.get("drift_ms"),
+            "drift_rate_ppm": drift.get("drift_rate_ppm"),
+            "utc_offset_ms": offset,
+        }
+
+    # Raw with no offset computed yet — just show OCR text
+    staleness = time.monotonic() - cal["last_ocr_mono"] if cal["last_ocr_mono"] else 999
+    return {
+        "time_str": cal["last_ocr"],
+        "status": "raw",
+        "staleness_s": round(staleness, 0),
+    }
+
+
+def _check_clock_drift(ocr_epoch_ms: int, our_utc_ms: int, mono: float):
+    """Compare predicted Windows time (from UTC+offset) with actual OCR.
+
+    Predicted = our_utc_ms + utc_offset_ms
+    Actual = ocr_epoch_ms (from OCR, minute-level at boundaries)
+
+    Drift = predicted - actual. Positive means our derived time runs fast.
+    At transition boundaries, OCR gives second=0 precision (~33ms from
+    transition detector), so drift measurement is meaningful.
+
+    After each check, picks the lowest-drift calibration point and updates
+    utc_offset_ms from it — self-correcting towards the best offset.
+    """
+    cal = _clock_cal
+    drift = cal["drift"]
+
+    if cal["utc_offset_ms"] is None:
+        return
+
+    # Predicted Windows time from our UTC + stored offset
+    predicted_ms = our_utc_ms + cal["utc_offset_ms"]
+
+    # Drift = predicted - actual
+    drift_ms = predicted_ms - ocr_epoch_ms
+
+    drift["drift_ms"] = round(drift_ms, 1)
+    drift["last_check_mono"] = mono
+
+    entry = {
+        "mono": round(mono, 2),
+        "drift_ms": round(drift_ms, 1),
+        "predicted_epoch_ms": int(predicted_ms),
+        "actual_epoch_ms": ocr_epoch_ms,
+        "our_utc_ms": our_utc_ms,
+        "offset_at_this_point": ocr_epoch_ms - our_utc_ms,
+        "iso": datetime.now().isoformat(timespec="milliseconds"),
+    }
+    drift["drift_history"].append(entry)
+    if len(drift["drift_history"]) > 50:
+        drift["drift_history"] = drift["drift_history"][-50:]
+
+    # Pick the lowest-drift calibration point → update utc_offset_ms
+    best = min(drift["drift_history"], key=lambda e: abs(e["drift_ms"]))
+    new_offset = best["offset_at_this_point"]
+    if new_offset != cal["utc_offset_ms"]:
+        print(f"[clock_cal] Offset updated: {cal['utc_offset_ms']}ms → {new_offset}ms "
+              f"(from point with drift {best['drift_ms']:+.0f}ms)")
+        cal["utc_offset_ms"] = new_offset
+
+    # Compute drift rate if we have 2+ measurements
+    hist = drift["drift_history"]
+    if len(hist) >= 2:
+        first, last = hist[0], hist[-1]
+        time_span_s = last["mono"] - first["mono"]
+        drift_span_ms = last["drift_ms"] - first["drift_ms"]
+        if time_span_s > 60:
+            drift_rate_ppm = (drift_span_ms / time_span_s) * 1000
+            drift["drift_rate_ppm"] = round(drift_rate_ppm, 2)
+
+    print(f"[clock_cal] Drift check: {drift_ms:+.0f}ms "
+          f"(rate: {drift.get('drift_rate_ppm', '?')} ppm)")
+
+
+def _clock_calibration_loop():
+    """Background thread: periodic OCR of Windows clock for auto-calibration.
+
+    Architecture: Windows time is derived from UTC + offset, NOT from OCR.
+    OCR is only used to compute/refine the offset (windows_ms - our_utc_ms).
+
+    First OCR happens immediately (no initial delay). After that, every 30s.
+    At each transition (minute boundary), offset is refined using the
+    lowest-drift calibration point — self-correcting towards the best offset.
+    After 3 transitions, status becomes 'correlated' and timezone is detected.
+    """
+    prev_text = None
+    first_iteration = True
+    # Wait for daemon_client to be initialized (set in init_hardware)
+    while daemon_client is None:
+        time.sleep(1)
+    print(f"[clock_cal] daemon_client ready, is_running={daemon_client.is_running()}")
+
+    while True:
+        # Sleep at start of loop, but skip on first iteration for immediate OCR
+        if not first_iteration:
+            time.sleep(30)
+        first_iteration = False
+
+        if not daemon_client.is_running():
+            time.sleep(5)
+            continue
+
+        try:
+            jpeg = daemon_client.read_jpeg()
+            if jpeg is None:
+                time.sleep(5)
+                continue
+
+            frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+            if frame is None:
+                time.sleep(5)
+                continue
+
+            text = _ocr_windows_clock(frame)
+            mono = time.monotonic()
+            our_utc_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+            if text:
+                _clock_cal["last_ocr"] = text
+                _clock_cal["last_ocr_mono"] = mono
+
+                epoch_ms = _ocr_to_epoch_ms(text)
+
+                if _clock_cal["status"] == "uncalibrated":
+                    _clock_cal["status"] = "raw"
+                    # Compute initial UTC offset from first reading (minute-level precision)
+                    if epoch_ms:
+                        _clock_cal["utc_offset_ms"] = epoch_ms - our_utc_ms
+                        _clock_cal["drift"]["last_check_mono"] = mono
+                        tz_name, tz_offset = _detect_timezone()
+                        _clock_cal["tz_name"] = tz_name
+                        _clock_cal["tz_offset_s"] = tz_offset
+                        print(f"[clock_cal] First reading: {text} "
+                              f"(offset {_clock_cal['utc_offset_ms']}ms, tz={tz_name})")
+                    else:
+                        print(f"[clock_cal] First reading: {text} (could not parse epoch)")
+
+                # Reject OCR if offset is wildly different (misread)
+                # Do NOT update prev_text — keep last accepted reading
+                if epoch_ms and _clock_cal["utc_offset_ms"] is not None:
+                    new_offset = epoch_ms - our_utc_ms
+                    delta = abs(new_offset - _clock_cal["utc_offset_ms"])
+                    if delta > 3600_000:  # >1 hour difference = garbage OCR
+                        print(f"[clock_cal] REJECTED '{text}' — offset {new_offset}ms "
+                              f"differs by {delta/1000:.0f}s from current "
+                              f"{_clock_cal['utc_offset_ms']}ms")
+                        continue
+
+                if epoch_ms:
+                    _clock_cal["readings"].append({
+                        "ocr_text": text,
+                        "monotonic": mono,
+                        "epoch_ms": epoch_ms,
+                        "our_utc_ms": our_utc_ms,
+                    })
+                    if len(_clock_cal["readings"]) > 20:
+                        _clock_cal["readings"] = _clock_cal["readings"][-20:]
+
+                # Detect transition (minute boundary)
+                if prev_text and prev_text != text and epoch_ms:
+                    # At transition: Windows clock just rolled to second=0
+                    # This is our most precise calibration point
+                    offset_at_transition = epoch_ms - our_utc_ms
+                    _clock_cal["transitions"].append({
+                        "old": prev_text,
+                        "new": text,
+                        "monotonic": mono,
+                        "epoch_ms": epoch_ms,
+                        "our_utc_ms": our_utc_ms,
+                        "offset_ms": offset_at_transition,
+                    })
+                    n = len(_clock_cal["transitions"])
+                    print(f"[clock_cal] Transition #{n}: "
+                          f"{prev_text} → {text}  offset={offset_at_transition}ms")
+
+                    # Only update offset if new calibration is better (lower drift)
+                    # than current. On first transition, always accept.
+                    if _clock_cal["utc_offset_ms"] is None:
+                        _clock_cal["utc_offset_ms"] = offset_at_transition
+                        _clock_cal["best_cal_idx"] = n - 1
+                    else:
+                        # Compare: would this new offset produce lower drift
+                        # than the current one?
+                        cur_drift = abs(offset_at_transition -
+                                        _clock_cal["utc_offset_ms"])
+                        # Transition offsets are precise (second=0 boundary),
+                        # so accept if within 90s of current offset
+                        if cur_drift <= 90_000:
+                            _clock_cal["utc_offset_ms"] = offset_at_transition
+                            _clock_cal["best_cal_idx"] = n - 1
+                        else:
+                            print(f"[clock_cal] Transition offset {offset_at_transition}ms "
+                                  f"rejected — {cur_drift/1000:.0f}s from current")
+
+                    if n >= 3 and _clock_cal["status"] != "correlated":
+                        tz_name, tz_offset = _detect_timezone()
+                        _clock_cal["tz_name"] = tz_name
+                        _clock_cal["tz_offset_s"] = tz_offset
+                        _clock_cal["status"] = "correlated"
+                        print(f"[clock_cal] CORRELATED — {tz_name} "
+                              f"(offset {tz_offset}s), "
+                              f"{n} transitions")
+
+                    # Drift check at transition
+                    _check_clock_drift(epoch_ms, our_utc_ms, mono)
+
+                # Periodic drift check (every 5min) even without transition
+                if (_clock_cal["utc_offset_ms"] is not None and epoch_ms and
+                        mono - _clock_cal["drift"]["last_check_mono"]
+                        >= _DRIFT_CHECK_INTERVAL_S):
+                    _check_clock_drift(epoch_ms, our_utc_ms, mono)
+
+                prev_text = text
+
+        except Exception as e:
+            print(f"[clock_cal] Error: {e}")
+
+
+# ── Resource Monitor ─────────────────────────────────────────────
+# Samples RAM/CPU every 2s. Ring buffer of ~150 samples (5 min).
+
+_RESOURCE_MAX_SAMPLES = 150
+_resource_samples: list[dict] = []
+_CLK_TCK = os.sysconf("SC_CLK_TCK")
+
+
+def _read_process_rss_mb() -> float:
+    """Read current RSS from /proc/self/status (not peak)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024  # KB → MB
+    except Exception:
+        pass
+    return 0.0
+
+
+def _read_thread_cpu() -> dict[str, dict]:
+    """Read per-thread CPU seconds from /proc/self/task/*/stat.
+
+    Returns {tid_str: {name, cpu_s, utime_s, stime_s}}.
+    Maps kernel TIDs to Python thread names via threading.enumerate().
+    """
+    # Build TID→name map from Python threading
+    tid_names: dict[int, str] = {}
+    for t in threading.enumerate():
+        nid = getattr(t, "native_id", None)
+        if nid:
+            tid_names[nid] = t.name
+
+    threads: dict[str, dict] = {}
+    task_dir = "/proc/self/task"
+    try:
+        for tid_s in os.listdir(task_dir):
+            try:
+                with open(f"{task_dir}/{tid_s}/stat") as f:
+                    parts = f.read().split()
+                utime = int(parts[13]) / _CLK_TCK
+                stime = int(parts[14]) / _CLK_TCK
+                kname = parts[1].strip("()")
+                tid = int(tid_s)
+                threads[tid_s] = {
+                    "name": tid_names.get(tid, kname),
+                    "cpu_s": round(utime + stime, 2),
+                    "utime_s": round(utime, 2),
+                    "stime_s": round(stime, 2),
+                }
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return threads
+
+
+def _read_daemon_resources() -> dict:
+    """Read daemon (cursor-daemon) RSS and CPU from /proc."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "cursor-daemon"],
+            capture_output=True, text=True, timeout=1)
+        pids = result.stdout.strip().split("\n")
+        if not pids or not pids[0]:
+            return {"rss_mb": 0, "cpu_s": 0}
+        pid = pids[0]
+        rss_mb = 0.0
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    rss_mb = int(line.split()[1]) / 1024
+                    break
+        with open(f"/proc/{pid}/stat") as f:
+            parts = f.read().split()
+            cpu_s = (int(parts[13]) + int(parts[14])) / _CLK_TCK
+        return {"rss_mb": round(rss_mb, 1), "cpu_s": round(cpu_s, 1)}
+    except Exception:
+        return {"rss_mb": 0, "cpu_s": 0}
+
+
+def _resource_monitor_loop():
+    """Background thread: sample process resources every 2s."""
+    while True:
+        try:
+            rss = _read_process_rss_mb()
+            threads = _read_thread_cpu()
+            daemon = _read_daemon_resources()
+
+            sample = {
+                "mono": round(time.monotonic(), 2),
+                "iso": datetime.now().isoformat(timespec="milliseconds"),
+                "rss_mb": round(rss, 1),
+                "daemon": daemon,
+                "threads": threads,
+            }
+            _resource_samples.append(sample)
+            if len(_resource_samples) > _RESOURCE_MAX_SAMPLES:
+                _resource_samples.pop(0)
+
+        except Exception:
+            pass
+        time.sleep(2)
 
 
 def _record_frame_correlation(sess: dict):
@@ -5263,6 +5673,7 @@ async def get_profiler():
             "heartbeat_active": state.heartbeat_active,
         },
         "noise_grid": noise_grid_features(),
+        "windows_clock": windows_time_now(),
     }
 
 
@@ -5554,6 +5965,32 @@ async def profiler_snapshot():
         f.write(json.dumps(snapshot) + "\n")
 
     return snapshot
+
+
+@app.get("/api/profiler/resources")
+async def profiler_resources():
+    """Per-thread CPU/RAM resource samples for volume chart.
+
+    Returns the last N samples (2s intervals, ~5min window).
+    Each sample has: process RSS, daemon RSS, per-thread CPU seconds.
+    Frontend diffs consecutive cpu_s values to compute per-interval usage.
+    """
+    # Compact: only include latest thread list + full sample history
+    latest_threads = {}
+    if _resource_samples:
+        latest_threads = _resource_samples[-1].get("threads", {})
+
+    return {
+        "samples": _resource_samples,
+        "sample_count": len(_resource_samples),
+        "latest": {
+            "rss_mb": _resource_samples[-1]["rss_mb"] if _resource_samples else 0,
+            "daemon_rss_mb": _resource_samples[-1]["daemon"]["rss_mb"]
+                if _resource_samples else 0,
+            "threads": latest_threads,
+        },
+        "windows_clock": windows_time_now(),
+    }
 
 
 # ── Manual tagging endpoint ─────────────────────────────────────────
@@ -6280,7 +6717,7 @@ def init_hardware():
 
     # Anti-sleep jitter is handled by jitter_loop() — not ESP32Mouse's built-in thread.
     # This allows us to piggyback correlation probes on jitter when confidence is low.
-    print("  Anti-sleep jitter started (30s)")  # managed by jitter_loop()
+    print("  Anti-sleep jitter started (60s)")  # managed by jitter_loop()
 
     tracker = CursorTracker(mouse, sensor, check_interval=999.0, stale_threshold=9999.0)
     tracker.set_position(6, 15, method="manual")
@@ -6334,13 +6771,25 @@ def init_hardware():
     claude_detector = ClaudeVisionCursorDetector(model="haiku")
     print("  Claude Vision detector initialized (haiku)")
 
-    threading.Thread(target=motion_detection_loop, daemon=True).start()
+    threading.Thread(target=motion_detection_loop, daemon=True,
+                     name="motion-detect").start()
     print("  Motion detection loop started")
 
-    threading.Thread(target=jitter_loop, daemon=True).start()
-    threading.Thread(target=pi_keyboard_monitor_loop, daemon=True).start()
-    threading.Thread(target=cursor_validation_loop, daemon=True).start()
+    threading.Thread(target=jitter_loop, daemon=True,
+                     name="jitter").start()
+    threading.Thread(target=pi_keyboard_monitor_loop, daemon=True,
+                     name="pi-keyboard").start()
+    threading.Thread(target=cursor_validation_loop, daemon=True,
+                     name="cursor-validate").start()
     print("  Cursor validation loop started (30s cycle)")
+
+    threading.Thread(target=_clock_calibration_loop, daemon=True,
+                     name="clock-cal").start()
+    print("  Clock calibration loop started (30s OCR cycle)")
+
+    threading.Thread(target=_resource_monitor_loop, daemon=True,
+                     name="resource-mon").start()
+    print("  Resource monitor started (2s sample cycle)")
 
     print("\nDashboard: http://localhost:8766")
 

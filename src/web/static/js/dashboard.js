@@ -76,6 +76,65 @@ async function updateState() {
 
         document.getElementById('fps-display').textContent = s.fps + ' FPS';
 
+        // Clocks card (RHS sidebar)
+        var browserUtcEl = document.getElementById('clock-browser-utc');
+        var serverUtcEl = document.getElementById('clock-server-utc');
+        var deltaEl = document.getElementById('clock-delta');
+        if (browserUtcEl) {
+            browserUtcEl.textContent = new Date().toISOString().slice(11, 23);
+        }
+        if (serverUtcEl && s.timestamp) {
+            serverUtcEl.textContent = s.timestamp.slice(11, 23);
+            if (deltaEl) {
+                var delta = Date.now() - new Date(s.timestamp).getTime();
+                deltaEl.textContent = delta + 'ms';
+                deltaEl.style.color = Math.abs(delta) < 100 ? '#2ecc71' :
+                    Math.abs(delta) < 500 ? '#f1c40f' : '#e74c3c';
+            }
+        }
+
+        // Windows clock (progressive calibration)
+        var wc = s.windows_clock;
+        var clockEl = document.getElementById('win-clock');
+        var clockTag = document.getElementById('win-clock-tag');
+        if (clockEl && wc && wc.time_str) {
+            clockEl.textContent = wc.time_str;
+            if (wc.status === 'correlated') {
+                clockEl.style.color = '#2ecc71';
+                clockTag.textContent = 'correlated (' + (wc.transitions || 0) + ' pts)';
+                clockTag.style.color = '#2ecc71';
+            } else if (wc.status === 'raw') {
+                // Raw with UTC offset = derived ms time; raw without = OCR text
+                clockEl.style.color = wc.epoch_ms ? '#e67e22' : '#f1c40f';
+                clockTag.textContent = wc.epoch_ms
+                    ? 'raw offset (' + Math.round(wc.staleness_s) + 's since OCR)'
+                    : wc.staleness_s + 's ago';
+                clockTag.style.color = '#888';
+            } else {
+                clockEl.style.color = '#555';
+                clockTag.textContent = '';
+            }
+        } else if (clockEl) {
+            clockEl.textContent = '--';
+            clockEl.style.color = '#555';
+            if (clockTag) clockTag.textContent = 'waiting for OCR';
+        }
+
+        // Drift indicator
+        var driftEl = document.getElementById('win-drift');
+        if (driftEl && wc && wc.drift_ms !== null && wc.drift_ms !== undefined) {
+            var driftStr = (wc.drift_ms >= 0 ? '+' : '') + Math.round(wc.drift_ms) + 'ms';
+            if (wc.drift_rate_ppm !== null && wc.drift_rate_ppm !== undefined) {
+                driftStr += ' (' + wc.drift_rate_ppm.toFixed(1) + ' ppm)';
+            }
+            driftEl.textContent = driftStr;
+            driftEl.style.color = Math.abs(wc.drift_ms) < 1000 ? '#2ecc71' :
+                Math.abs(wc.drift_ms) < 5000 ? '#f1c40f' : '#e74c3c';
+        } else if (driftEl) {
+            driftEl.textContent = '--';
+            driftEl.style.color = '#555';
+        }
+
         setDot('dot-mouse', s.hardware.mouse_connected ? 'green' : 'red');
         setDot('dot-heartbeat', s.hardware.heartbeat_active ? 'green' : 'gray');
         setDot('dot-jitter', s.hardware.anti_sleep_active ? 'green' : 'gray');
