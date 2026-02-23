@@ -45,7 +45,10 @@ from src.hardware.cursor_vision_detector import ClaudeVisionCursorDetector
 from src.hardware.silhouette_tracker import SilhouetteTracker, CandidateBlob
 from src.hardware.commanded_movement import CommandedMovement
 from src.hardware.yolo_detector import YOLOCursorDetector
+from src.hardware.sahi_yolo import SAHIYOLODetector
+from src.hardware.temporal_yolo import TemporalYOLODetector
 from src.hardware.experience_logger import ExperienceLogger
+from src.hardware.motion_trail import MotionTrail
 from src.agents.storyline_logger import StorylineLogger
 
 def utc_now_ms() -> str:
@@ -112,6 +115,12 @@ class MotionState:
     yolo_inference_ms: float = 0.0
     yolo_timestamp: float = 0.0  # monotonic time of last detection
     yolo_detection_count: int = 0
+    # Blob gate diagnostics (per-cycle rejection counts)
+    blob_gate_size_rejects: int = 0
+    blob_gate_aspect_rejects: int = 0
+    blob_gate_bbox_rejects: int = 0
+    blob_gate_noise_rejects: int = 0
+    blob_gate_passed: int = 0
     # Claude Vision (ground truth)
     vision_x: int = 0
     vision_y: int = 0
@@ -319,6 +328,8 @@ claude_detector: Optional[ClaudeVisionCursorDetector] = None
 sil_tracker: Optional[SilhouetteTracker] = None
 cmd_movement: Optional[CommandedMovement] = None
 yolo_detector: Optional[YOLOCursorDetector] = None
+sahi_detector: Optional[SAHIYOLODetector] = None
+temporal_yolo: Optional[TemporalYOLODetector] = None
 
 # CNN model comparison for velocity tests (loaded at startup if models exist)
 _vtest_recognizers: dict[str, CursorRecognizer] = {}  # version -> recognizer
@@ -342,6 +353,9 @@ _YOLO_LOCKOUT_S: float = 10.0      # how long a high-confidence YOLO position is
 _yolo_lockout_until: float = 0.0   # monotonic time until which YOLO position is protected
 _CNN_LOCKOUT_S: float = 10.0       # protect CNN-validated position from motion overrides
 _cnn_lockout_until: float = 0.0    # monotonic time until which CNN position is protected
+
+# Motion trail: unified position history for trail-informed detection
+motion_trail = MotionTrail(max_points=120)
 
 # Passive mode: observe-only, no mouse movements at all.
 # Silhouette tracking, CNN, YOLO still run for data capture, but
@@ -368,7 +382,7 @@ _active_recordings: dict[str, dict] = {}  # recording_id -> {file, path, start_t
 _NOISE_GRID_W, _NOISE_GRID_H = 48, 27
 _NOISE_CELL_PX = 40
 _NOISE_THRESHOLD = 8
-_noise_grid: list[list[int]] = [[_NOISE_THRESHOLD] * _NOISE_GRID_W for _ in range(_NOISE_GRID_H)]
+_noise_grid: list[list[int]] = [[0] * _NOISE_GRID_W for _ in range(_NOISE_GRID_H)]
 
 
 def noise_grid_features() -> dict:
@@ -569,7 +583,10 @@ def _daemon_motion_loop():
     # every frame. Cursor regions clear quickly because cursor motion
     # is transient (only during movement).
     global _noise_grid, _yolo_lockout_until
-    _noise_grid = [[_NOISE_THRESHOLD] * _NOISE_GRID_W for _ in range(_NOISE_GRID_H)]
+    # Start grid at 0 (all cells "clear"). Cells accumulate to threshold
+    # naturally as persistent UI animations appear. Previous design started
+    # at THRESHOLD which made all blobs rejected for the first ~0.4s.
+    _noise_grid = [[0] * _NOISE_GRID_W for _ in range(_NOISE_GRID_H)]
 
     while True:
         try:
@@ -588,23 +605,52 @@ def _daemon_motion_loop():
                 state.error = f"Daemon frozen (seq={ds.frame_count} for {now - last_daemon_seq_time:.0f}s)"
 
             # ── Fast path: cursor tracking from daemon blobs (~20Hz) ──
-            # Tighter blob filter: real cursor is 5-200px at 1080p.
-            # Also reject very elongated blobs (UI text redraws, scrollbars).
+            # Blob size filter: cursor is 5-60px at 1080p, but fast motion
+            # creates larger blobs (frame-diff trail). Allow up to 2000px
+            # and let the scoring function below prioritize cursor-sized blobs.
+            # Reject very elongated blobs (text/scrollbar) and oversized bbox.
             pos = tracker.position if tracker else None
             cursor_blobs = []
+            _gate_rejects = [0, 0, 0]  # [size, aspect, bbox] counters
             for b in ds.blobs:
-                if b.pixel_count < 5 or b.pixel_count > 200:
+                if b.pixel_count < 5 or b.pixel_count > 2000:
+                    _gate_rejects[0] += 1
                     continue
                 bx0, by0, bx1, by1 = b.bbox
                 bw = max(1, bx1 - bx0)
                 bh = max(1, by1 - by0)
-                # Reject very elongated blobs (aspect < 0.2 = text/scrollbar)
-                if min(bw, bh) / max(bw, bh) < 0.2:
+                # Reject very elongated blobs (aspect < 0.15 = text/scrollbar)
+                if min(bw, bh) / max(bw, bh) < 0.15:
+                    _gate_rejects[1] += 1
                     continue
-                # Reject very large bounding boxes (UI element redraws)
-                if bw > 80 or bh > 80:
+                # Reject very large bounding boxes (full UI element redraws)
+                if bw > 200 or bh > 200:
+                    _gate_rejects[2] += 1
                     continue
                 cursor_blobs.append(b)
+
+            # ── Pre-filter velocity feed ──
+            # Even before noise/lockout filtering, estimate velocity from
+            # blob centroids near the tracker position. This feeds the
+            # silhouette tracker's ROI scaling so it expands during fast
+            # motion, even if individual blobs get rejected by later gates.
+            if cursor_blobs and pos and sil_tracker:
+                near_blobs = [
+                    b for b in cursor_blobs
+                    if ((b.centroid[0] - pos.x) ** 2 +
+                        (b.centroid[1] - pos.y) ** 2) ** 0.5 < 500
+                ]
+                if near_blobs:
+                    # Use the nearest blob's displacement as velocity hint
+                    nearest = min(near_blobs,
+                                  key=lambda b: ((b.centroid[0] - pos.x) ** 2 +
+                                                 (b.centroid[1] - pos.y) ** 2))
+                    blob_dist = ((nearest.centroid[0] - pos.x) ** 2 +
+                                 (nearest.centroid[1] - pos.y) ** 2) ** 0.5
+                    # Estimate velocity: displacement / frame interval (~50ms)
+                    est_vel = blob_dist / 0.05 if blob_dist > 5 else 0
+                    if est_vel > sil_tracker._velocity_px_s:
+                        sil_tracker.set_velocity(est_vel)
 
             # ── Persistent blob filter ──
             # Update noise grid: mark cells that have blobs this frame
@@ -622,46 +668,77 @@ def _daemon_motion_loop():
                         _noise_grid[gy][gx] = max(0, _noise_grid[gy][gx] - 1)
 
             # Remove blobs in persistent-motion cells (UI animations)
-            # BUT exempt blobs near the VALIDATED cursor position — the cursor
-            # itself creates persistent motion during continuous movement.
-            # Radius 200px (was 400) + require CNN validation to prevent
-            # noise blobs (e.g. UTC clock milliseconds) from self-reinforcing
-            # as the "cursor position".
+            # BUT exempt blobs near ANY known cursor position to break the
+            # circular dependency where blobs can't update position without
+            # CNN validation, but CNN can't validate without position updates.
+            #
+            # Exemption sources (any one is sufficient):
+            #   1. CNN-validated position (highest trust)
+            #   2. Current tracker position (sil_template, motion_track, etc.)
+            #   3. Motion trail extrapolation (even if tracker is stale)
             filtered_blobs = []
+            _gate4_rejects = 0
+            _trail_pos = motion_trail.extrapolate(dt=0.0) if motion_trail.length() >= 2 else None
             for b in cursor_blobs:
                 gx = min(_NOISE_GRID_W - 1, b.centroid[0] // _NOISE_CELL_PX)
                 gy = min(_NOISE_GRID_H - 1, b.centroid[1] // _NOISE_CELL_PX)
                 if _noise_grid[gy][gx] >= _NOISE_THRESHOLD:
-                    # Only exempt if cursor position is CNN-validated and close
-                    if (pos and (now - pos.timestamp < 5) and
-                            state.cursor_validated):
-                        blob_dist = ((b.centroid[0] - pos.x) ** 2 +
-                                     (b.centroid[1] - pos.y) ** 2) ** 0.5
-                        if blob_dist < 200:
-                            filtered_blobs.append(b)
-                            continue
-                    continue  # Skip: persistent motion = UI animation
+                    exempt = False
+                    blob_x, blob_y = b.centroid
+
+                    # Exemption 1: CNN-validated position (original logic)
+                    if (not exempt and pos and (now - pos.timestamp < 5)
+                            and state.cursor_validated):
+                        d = ((blob_x - pos.x) ** 2 + (blob_y - pos.y) ** 2) ** 0.5
+                        if d < 200:
+                            exempt = True
+
+                    # Exemption 2: Current tracker position (even if not CNN-validated)
+                    # Use larger radius (300px) since position may be slightly stale
+                    if (not exempt and pos and (now - pos.timestamp < 10)):
+                        d = ((blob_x - pos.x) ** 2 + (blob_y - pos.y) ** 2) ** 0.5
+                        if d < 300:
+                            exempt = True
+
+                    # Exemption 3: Motion trail extrapolation
+                    if not exempt and _trail_pos:
+                        d = ((blob_x - _trail_pos[0]) ** 2 +
+                             (blob_y - _trail_pos[1]) ** 2) ** 0.5
+                        if d < 300:
+                            exempt = True
+
+                    if not exempt:
+                        _gate4_rejects += 1
+                        continue
                 filtered_blobs.append(b)
             cursor_blobs = filtered_blobs
 
-            # YOLO-primary: suppress ALL blob processing when YOLO lockout
-            # is active. YOLO is the trusted detector — blobs only process
-            # when YOLO has no recent detection.
+            # YOLO-primary: during YOLO lockout, keep blobs near YOLO
+            # position (they confirm/refine it) but reject distant ones.
+            # Previous design suppressed ALL blobs, killing velocity feed.
             if now < _yolo_lockout_until and state.yolo_active:
-                cursor_blobs = []
+                yolo_near = []
+                for b in cursor_blobs:
+                    d = ((b.centroid[0] - state.yolo_x) ** 2 +
+                         (b.centroid[1] - state.yolo_y) ** 2) ** 0.5
+                    if d < 300:
+                        yolo_near.append(b)
+                cursor_blobs = yolo_near
+
+            # Update gate diagnostic counters
+            state.blob_gate_size_rejects = _gate_rejects[0]
+            state.blob_gate_aspect_rejects = _gate_rejects[1]
+            state.blob_gate_bbox_rejects = _gate_rejects[2]
+            state.blob_gate_noise_rejects = _gate4_rejects
+            state.blob_gate_passed = len(cursor_blobs)
 
             primary_blob = None
             if cursor_blobs:
                 if pos and (now - pos.timestamp < 10):
-                    # Predict next position from velocity history
-                    pred_x, pred_y = pos.x, pos.y
-                    if len(velocity_history) >= 2:
-                        recent = velocity_history[-MAX_VELOCITY_SAMPLES:]
-                        avg_dx = sum(v[0] for v in recent) / len(recent)
-                        avg_dy = sum(v[1] for v in recent) / len(recent)
-                        dt = now - pos.timestamp
-                        pred_x = pos.x + int(avg_dx * min(dt * 20, 3))
-                        pred_y = pos.y + int(avg_dy * min(dt * 20, 3))
+                    # Predict next position from motion trail (replaces inline velocity_history)
+                    pred_x, pred_y = motion_trail.extrapolate(dt=0.0)
+                    if motion_trail.length() < 2:
+                        pred_x, pred_y = pos.x, pos.y
 
                     def _blob_score(b):
                         # Distance from predicted AND last-known, use smaller
@@ -685,15 +762,7 @@ def _daemon_motion_loop():
                             (best.centroid[1] - pos.y) ** 2) ** 0.5
                     # Velocity-scaled distance threshold: at high speed,
                     # cursor moves further between frames
-                    _vel_est = 0.0
-                    if len(velocity_history) >= 2:
-                        _recent = velocity_history[-3:]
-                        _dt = _recent[-1][2] - _recent[0][2]
-                        if _dt > 0:
-                            _avg_d = sum(
-                                (v[0]**2 + v[1]**2)**0.5 for v in _recent
-                            ) / len(_recent)
-                            _vel_est = _avg_d / (_dt / len(_recent))
+                    _vel_est = motion_trail.speed_estimate(window_s=0.5)
                     blob_dist_limit = min(800, 300 + _vel_est * 0.3)
                     if dist < blob_dist_limit:
                         # Silhouette confidence gate: if tracker is confident,
@@ -709,11 +778,14 @@ def _daemon_motion_loop():
 
                         # Vision lockout: don't let motion blobs override
                         # a Vision-confirmed position for _VISION_LOCKOUT_S
+                        # Use velocity-scaled radius: at high speed, cursor
+                        # legitimately moves far from the locked position.
+                        _lockout_radius = max(80, min(600, 80 + _vel_est * 0.5))
                         if accept and now < _vision_lockout_until:
                             blob_dist_from_vision = (
                                 (best.centroid[0] - state.vision_x) ** 2 +
                                 (best.centroid[1] - state.vision_y) ** 2) ** 0.5
-                            if blob_dist_from_vision > 80:
+                            if blob_dist_from_vision > _lockout_radius:
                                 accept = False  # Blob too far from Vision truth
 
                         # YOLO lockout: don't let blobs override YOLO-confirmed pos
@@ -721,27 +793,51 @@ def _daemon_motion_loop():
                             blob_dist_from_yolo = (
                                 (best.centroid[0] - state.yolo_x) ** 2 +
                                 (best.centroid[1] - state.yolo_y) ** 2) ** 0.5
-                            if blob_dist_from_yolo > 80:
+                            if blob_dist_from_yolo > _lockout_radius:
                                 accept = False  # Blob too far from YOLO detection
 
                         # CNN lockout: protect CNN-validated position from
-                        # random blobs — only accept within 80px
+                        # random blobs — use velocity-scaled radius
                         if accept and now < _cnn_lockout_until:
                             blob_dist_from_cnn = (
                                 (best.centroid[0] - _cnn_validated_x) ** 2 +
                                 (best.centroid[1] - _cnn_validated_y) ** 2) ** 0.5
-                            if blob_dist_from_cnn > 80:
+                            if blob_dist_from_cnn > _lockout_radius:
                                 accept = False
 
-                        # Urgent recheck lockout: don't let random blobs
-                        # refresh position when CNN has flagged it wrong.
-                        # Let position go stale so calibrate_to_corner fires.
+                        # Urgent recheck: CNN flagged position as wrong.
+                        # Instead of blocking ALL blobs (which creates a dead
+                        # loop — the cursor IS in the blob data but gets
+                        # suppressed), use CNN to validate this blob candidate.
+                        # Analysis showed: 21 blobs/frame, 95% noise, but CNN
+                        # is 100% accurate at real cursor position.
                         if accept and _cnn_urgent_recheck:
-                            accept = False
+                            if recognizer and state.frame_raw is not None:
+                                bp = extract_gray_patch(
+                                    state.frame_raw, best.centroid[0], best.centroid[1])
+                                if bp is not None:
+                                    bc = recognizer.classify_patch(bp)
+                                    if bc > 0.7:
+                                        # CNN confirms cursor at this blob!
+                                        _cnn_urgent_recheck = False
+                                        state.cursor_validated = True
+                                        _cnn_validated_x = best.centroid[0]
+                                        _cnn_validated_y = best.centroid[1]
+                                        _cnn_lockout_until = time.monotonic() + _CNN_LOCKOUT_S
+                                    else:
+                                        accept = False  # Not cursor, skip
+                                else:
+                                    accept = False
+                            else:
+                                accept = False
 
                         if accept:
                             primary_blob = best
                             bx, by = best.centroid
+                            # Feed motion trail (unified position history)
+                            motion_trail.append(bx, by,
+                                                pixel_count=best.pixel_count,
+                                                source="daemon_blob")
                             # Update velocity history
                             dx = bx - pos.x
                             dy = by - pos.y
@@ -749,13 +845,9 @@ def _daemon_motion_loop():
                             if len(velocity_history) > MAX_VELOCITY_SAMPLES * 2:
                                 velocity_history = velocity_history[-MAX_VELOCITY_SAMPLES:]
                             # Feed velocity to silhouette tracker for ROI scaling
-                            if sil_tracker and len(velocity_history) >= 2:
-                                recent = velocity_history[-3:]
-                                dt_sum = recent[-1][2] - recent[0][2]
-                                if dt_sum > 0:
-                                    avg_dx = sum(v[0] for v in recent) / len(recent)
-                                    avg_dy = sum(v[1] for v in recent) / len(recent)
-                                    vel = ((avg_dx ** 2 + avg_dy ** 2) ** 0.5) / (dt_sum / len(recent))
+                            if sil_tracker:
+                                vel = motion_trail.speed_estimate(window_s=0.3)
+                                if vel > 0:
                                     sil_tracker.set_velocity(vel)
                             if tracker:
                                 tracker.set_position(bx, by, method="motion_track")
@@ -766,7 +858,38 @@ def _daemon_motion_loop():
                     # No known position — use Vision as anchor if recent,
                     # otherwise pick blob closest to typical cursor size
                     if _cnn_urgent_recheck:
-                        pass  # Don't pick random blobs during recovery
+                        # CNN-guided blob discovery: scan cursor-sized blobs
+                        # with CNN to find the cursor among noise.
+                        if recognizer and state.frame_raw is not None:
+                            for b in cursor_blobs:
+                                if 10 <= b.pixel_count <= 60:
+                                    bp = extract_gray_patch(
+                                        state.frame_raw,
+                                        b.centroid[0], b.centroid[1])
+                                    if bp is not None:
+                                        bc = recognizer.classify_patch(bp)
+                                        if bc > 0.7:
+                                            primary_blob = b
+                                            bx, by = b.centroid
+                                            _cnn_urgent_recheck = False
+                                            state.cursor_validated = True
+                                            _cnn_validated_x = bx
+                                            _cnn_validated_y = by
+                                            _cnn_lockout_until = now + _CNN_LOCKOUT_S
+                                            velocity_history.clear()
+                                            if tracker:
+                                                tracker.set_position(
+                                                    bx, by,
+                                                    method="cnn_blob_discover")
+                                            pos = tracker.position
+                                            motion_trail.append(
+                                                bx, by,
+                                                pixel_count=b.pixel_count,
+                                                confidence=bc,
+                                                source="cnn_blob_discover")
+                                            if sil_tracker:
+                                                sil_tracker.reset()
+                                            break
                     elif now < _vision_lockout_until:
                         pass  # Don't pick random blobs during Vision lockout
                     elif (state.vision_x > 0 and state.vision_timestamp > 0
@@ -876,6 +999,12 @@ def _daemon_motion_loop():
                                 state.yolo_inference_ms = float(best_yolo.inference_ms)
                                 state.yolo_timestamp = now
                                 state.yolo_detection_count += 1
+
+                                # Feed YOLO detection to motion trail
+                                motion_trail.append(
+                                    int(best_yolo.cx), int(best_yolo.cy),
+                                    confidence=float(best_yolo.confidence),
+                                    source="yolo")
 
                                 # YOLO-primary: any detection > 0.3 sets position
                                 # and activates lockout (suppresses blob processing)
@@ -1101,14 +1230,23 @@ def _python_motion_loop():
                             best_yolo = crop_dets[0]
                             break
 
-                # Full-frame fallback for discovery
+                # Full-frame fallback: SAHI tiled detection (finds small cursors),
+                # then single-shot YOLO if SAHI unavailable
                 if best_yolo is None:
-                    yolo_dets = yolo_detector.detect(frame)
+                    if sahi_detector:
+                        sahi_result = sahi_detector.detect(frame)
+                        yolo_dets = sahi_result.detections
+                    else:
+                        yolo_dets = yolo_detector.detect(frame)
                     if yolo_dets:
                         if pos and len(yolo_dets) > 1:
                             yolo_dets.sort(key=lambda d: (
                                 (d.cx - pos.x) ** 2 + (d.cy - pos.y) ** 2))
                         best_yolo = yolo_dets[0]
+
+                # Feed frame to temporal buffer for velocity tracking
+                if temporal_yolo:
+                    temporal_yolo.push_frame(frame)
 
                 if best_yolo:
                     state.yolo_active = True
@@ -1120,6 +1258,12 @@ def _python_motion_loop():
                     state.yolo_inference_ms = float(best_yolo.inference_ms)
                     state.yolo_timestamp = t0
                     state.yolo_detection_count += 1
+
+                    # Feed YOLO detection to motion trail
+                    motion_trail.append(
+                        int(best_yolo.cx), int(best_yolo.cy),
+                        confidence=float(best_yolo.confidence),
+                        source="yolo")
 
                     # YOLO-primary: any detection > 0.3 sets position
                     if tracker and best_yolo.confidence > 0.3:
@@ -1433,21 +1577,8 @@ def _check_cnn_drift():
 
 
 def _estimate_velocity() -> float:
-    """Estimate cursor velocity (px/s) from last 3 frames in loss history."""
-    if len(_loss_history) < 2:
-        return 0.0
-    # Use up to last 3 frames for smoothing
-    recent = list(_loss_history)[-3:]
-    velocities = []
-    for i in range(1, len(recent)):
-        dt = recent[i]["t"] - recent[i - 1]["t"]
-        if dt <= 0:
-            continue
-        ddx = recent[i]["x"] - recent[i - 1]["x"]
-        ddy = recent[i]["y"] - recent[i - 1]["y"]
-        dist = (ddx * ddx + ddy * ddy) ** 0.5
-        velocities.append(dist / dt)
-    return sum(velocities) / len(velocities) if velocities else 0.0
+    """Estimate cursor velocity (px/s) from motion trail."""
+    return motion_trail.speed_estimate(window_s=0.5)
 
 
 def _check_loss_trigger(now: float):
@@ -2440,7 +2571,7 @@ def cursor_validation_loop():
                     state.cursor_age_s = 0.0
                     reacquired = True
 
-                # 2. CNN grid scan — Phase 1 visual detection (no mouse needed)
+                # 1b. Visual detection cascade: SAHI → ViT-S → CNN grid scan
                 if not reacquired and recognizer:
                     try:
                         if use_daemon:
@@ -2456,26 +2587,26 @@ def cursor_validation_loop():
 
                         if scan_frame is not None:
                             t_scan = time.monotonic()
-                            hits = recognizer.grid_scan(
-                                scan_frame, stride=64, threshold=0.85)
+                            result = recognizer.visual_detect(
+                                scan_frame, sahi_detector=sahi_detector)
                             scan_ms = (time.monotonic() - t_scan) * 1000
 
-                            if hits:
-                                gx, gy, gconf = hits[0]
-                                print(f"[cnn_loop] Grid scan found cursor at "
-                                      f"({gx},{gy}) conf={gconf:.3f} "
-                                      f"({len(hits)} hits, {scan_ms:.0f}ms)")
-                                tracker.set_position(gx, gy, method="grid_scan")
-                                state.cursor_x = gx
-                                state.cursor_y = gy
-                                state.cursor_method = "grid_scan"
+                            if result:
+                                vx, vy, vconf, vmethod = result
+                                print(f"[cnn_loop] visual_detect found cursor "
+                                      f"at ({vx},{vy}) conf={vconf:.3f} "
+                                      f"via {vmethod} ({scan_ms:.0f}ms)")
+                                tracker.set_position(vx, vy, method=vmethod)
+                                state.cursor_x = vx
+                                state.cursor_y = vy
+                                state.cursor_method = vmethod
                                 state.cursor_age_s = 0.0
                                 reacquired = True
                             else:
-                                print(f"[cnn_loop] Grid scan: no hits "
+                                print(f"[cnn_loop] visual_detect: no hits "
                                       f"({scan_ms:.0f}ms)")
                     except Exception as e:
-                        print(f"[cnn_loop] Grid scan error: {e}")
+                        print(f"[cnn_loop] visual_detect error: {e}")
 
                 # 3. Mouse-based recovery (skip in passive/passthrough mode,
                 #    and skip when YOLO is actively finding cursor)
@@ -2525,11 +2656,64 @@ def cursor_validation_loop():
             else:
                 frame = sensor.capture(settle_frames=1)
 
-            patch = extract_gray_patch(frame, cx, cy)
+            # Trail-guided: use motion trail to predict current position
+            # If cursor moved since last blob acceptance, stored (cx,cy) is stale
+            trail_x, trail_y = motion_trail.extrapolate(dt=0.0)
+            if motion_trail.length() >= 2:
+                # Trail has data — check at predicted position first
+                check_x, check_y = trail_x, trail_y
+            else:
+                check_x, check_y = cx, cy
+
+            patch = extract_gray_patch(frame, check_x, check_y)
             if patch is None:
                 continue
 
             confidence = recognizer.classify_patch(patch)
+
+            # Retro CNN recovery: if confidence low at predicted position,
+            # also try at stored position (cursor may have stopped there)
+            if confidence < 0.7 and (check_x != cx or check_y != cy):
+                patch_stored = extract_gray_patch(frame, cx, cy)
+                if patch_stored is not None:
+                    conf_stored = recognizer.classify_patch(patch_stored)
+                    if conf_stored > confidence:
+                        confidence = conf_stored
+                        check_x, check_y = cx, cy
+                        patch = patch_stored
+
+            # Blob-guided CNN probe: when CNN fails at known positions,
+            # try CNN at each recent daemon blob position. The cursor IS
+            # in the blob data (analysis shows 100% detection rate) but
+            # it's 1 out of ~21 blobs. CNN is 100% accurate at the right
+            # spot — so probe each blob to find which one is the cursor.
+            if confidence < 0.7 and state.blob_count > 0:
+                blob_positions = []
+                # Get blob centroids from shared state
+                for bi in range(min(state.blob_count, 10)):
+                    try:
+                        bx = state.blobs[bi].centroid[0]
+                        by = state.blobs[bi].centroid[1]
+                        bpx = state.blobs[bi].pixel_count
+                        # Only check cursor-sized blobs (10-60px)
+                        if 10 <= bpx <= 60:
+                            blob_positions.append((bx, by, bpx))
+                    except (IndexError, AttributeError):
+                        break
+
+                best_blob_conf = confidence
+                for bx, by, bpx in blob_positions:
+                    bp = extract_gray_patch(frame, bx, by)
+                    if bp is not None:
+                        bc = recognizer.classify_patch(bp)
+                        if bc > best_blob_conf:
+                            best_blob_conf = bc
+                            check_x, check_y = bx, by
+                            patch = bp
+                            confidence = bc
+                            if bc > 0.7:
+                                break  # Found cursor, stop searching
+
             inference_ms = (time.monotonic() - t0) * 1000
 
             state.cnn_confidence = confidence
@@ -2544,13 +2728,20 @@ def cursor_validation_loop():
                 _cnn_lockout_until = time.monotonic() + _CNN_LOCKOUT_S
                 recognizer.update_cursor_template(patch)
                 state.cursor_validated = True
-                _cnn_validated_x = cx
-                _cnn_validated_y = cy
+                _cnn_validated_x = check_x
+                _cnn_validated_y = check_y
+                # If confirmed at trail-predicted position (different from stored),
+                # update tracker to the confirmed position
+                if (check_x != cx or check_y != cy) and tracker:
+                    tracker.set_position(check_x, check_y, method="cnn_trail")
+                    motion_trail.append(check_x, check_y,
+                                        confidence=confidence,
+                                        source="cnn_verify")
                 if sil_tracker:
                     sil_tracker.reset()
                 if collector:
                     collector.collect_from_tracking(
-                        frame, cx, cy, confidence=confidence)
+                        frame, check_x, check_y, confidence=confidence)
                     state.sample_count_pos = collector.positive_count
                     state.sample_count_neg = collector.negative_count
             else:
@@ -2838,6 +3029,15 @@ async def get_state():
                 if state.yolo_timestamp > 0 else -1,
             "detection_count": state.yolo_detection_count,
         },
+        "sahi": sahi_detector.status() if sahi_detector else None,
+        "temporal": temporal_yolo.status() if temporal_yolo else None,
+        "blob_gates": {
+            "size_rejects": state.blob_gate_size_rejects,
+            "aspect_rejects": state.blob_gate_aspect_rejects,
+            "bbox_rejects": state.blob_gate_bbox_rejects,
+            "noise_rejects": state.blob_gate_noise_rejects,
+            "passed": state.blob_gate_passed,
+        },
         "silhouette": {
             "active": state.silhouette_active,
             "method": state.silhouette_method,
@@ -2873,6 +3073,7 @@ async def get_state():
             "x": mouse.estimated_x if mouse else 0,
             "y": mouse.estimated_y if mouse else 0,
         },
+        "trail": motion_trail.to_api_dict(max_age_s=4.0),
         "fps": round(state.fps, 1),
         "frame_count": state.frame_count,
         "claude_detector": claude_detector.to_dict() if claude_detector else None,
@@ -6778,10 +6979,132 @@ async def yolo_gallery_page():
     return _serve_page("yolo.html")
 
 
+# ── Daily Report ───────────────────────────────────────────────────
+
+_DAILY_REPORTS_DIR = Path(__file__).parent.parent.parent / "data" / "daily_reports"
+
+
+@app.get("/daily-report", response_class=HTMLResponse)
+async def daily_report_page():
+    """Daily analysis report page."""
+    return _serve_page("daily-report.html")
+
+
+@app.get("/api/daily-report")
+async def get_daily_report(date: Optional[str] = None):
+    """Get a daily report by date (YYYYMMDD). Latest if no date specified."""
+    _DAILY_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Find available reports
+    md_files = sorted(_DAILY_REPORTS_DIR.glob("????????.md"), reverse=True)
+    available_dates = [f.stem for f in md_files]
+
+    if not available_dates:
+        return {"error": "No daily reports found. Run the daily analysis agent first.",
+                "available_dates": []}
+
+    # Select report
+    target_date = date if date and date in available_dates else available_dates[0]
+    report_path = _DAILY_REPORTS_DIR / f"{target_date}.md"
+    actions_path = _DAILY_REPORTS_DIR / f"{target_date}_actions.json"
+
+    if not report_path.exists():
+        return {"error": f"Report for {target_date} not found",
+                "available_dates": available_dates}
+
+    content = report_path.read_text()
+    actions = []
+    if actions_path.exists():
+        try:
+            actions = json.loads(actions_path.read_text())
+        except (json.JSONDecodeError, Exception):
+            pass
+
+    return {
+        "date": target_date,
+        "content": content,
+        "actions": actions,
+        "available_dates": available_dates,
+    }
+
+
+@app.post("/api/daily-report/generate")
+async def generate_daily_report():
+    """Trigger daily report generation (runs daily_analysis_agent.py)."""
+    script = Path(__file__).parent.parent.parent / "scripts" / "daily_analysis_agent.py"
+    if not script.exists():
+        return {"error": "daily_analysis_agent.py not found"}
+
+    try:
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            capture_output=True, text=True, timeout=120,
+            cwd=str(script.parent.parent),
+        )
+        if result.returncode == 0:
+            # Find the latest report
+            _DAILY_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+            md_files = sorted(_DAILY_REPORTS_DIR.glob("????????.md"), reverse=True)
+            if md_files:
+                return {"date": md_files[0].stem, "status": "ok"}
+            return {"error": "Report generated but file not found"}
+        return {"error": f"Script failed: {result.stderr[:500]}"}
+    except subprocess.TimeoutExpired:
+        return {"error": "Report generation timed out (120s)"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Visual Detection API ───────────────────────────────────────────
+
+@app.get("/api/visual_detect")
+async def api_visual_detect():
+    """Run the full visual detection cascade and return cursor position.
+
+    Tries SAHI YOLO -> ViT-S regression -> CNN grid scan.
+    Returns position in <500ms.
+    """
+    if not recognizer:
+        return {"error": "No recognizer available"}
+
+    # Grab current frame
+    frame = None
+    if daemon_client and daemon_client.is_running():
+        jpeg = daemon_client.read_jpeg()
+        if jpeg:
+            frame = cv2.imdecode(
+                np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+    elif sensor:
+        frame = sensor.capture(settle_frames=1)
+
+    if frame is None:
+        return {"error": "No frame available"}
+
+    t0 = time.monotonic()
+    result = recognizer.visual_detect(frame, sahi_detector=sahi_detector)
+    elapsed_ms = (time.monotonic() - t0) * 1000
+
+    if result:
+        x, y, conf, method = result
+        return {
+            "x": x, "y": y,
+            "confidence": round(conf, 3),
+            "method": method,
+            "latency_ms": round(elapsed_ms, 1),
+        }
+    return {
+        "x": None, "y": None,
+        "confidence": 0.0,
+        "method": "none",
+        "latency_ms": round(elapsed_ms, 1),
+        "error": "Cursor not found by any method",
+    }
+
+
 # ── Startup ─────────────────────────────────────────────────────────
 
 def init_hardware():
-    global mouse, sensor, tracker, recognizer, collector, daemon_client, claude_detector, sil_tracker, cmd_movement, yolo_detector
+    global mouse, sensor, tracker, recognizer, collector, daemon_client, claude_detector, sil_tracker, cmd_movement, yolo_detector, sahi_detector, temporal_yolo
 
     print("Initializing hardware...")
     mouse = ESP32Mouse('/dev/ttyUSB0', screen_width=1920, screen_height=1080)
@@ -6820,6 +7143,12 @@ def init_hardware():
     print("  Cursor recognizer: " + recognizer.model_version
           + " (" + str(collector.total_samples) + " samples)")
 
+    # Load ViT-S cursor regression model (for visual_detect cascade)
+    if recognizer.load_vit_model():
+        print("  ViT-S cursor model loaded: " + recognizer._vit_version)
+    else:
+        print("  ViT-S cursor model: not available (train with scripts/train_phase1_model.py)")
+
     # Load all available CNN model versions for velocity test comparison
     _model_dir = Path(__file__).parent.parent.parent / "data" / "cursor_models"
     if _model_dir.exists():
@@ -6852,6 +7181,17 @@ def init_hardware():
     else:
         print("  YOLO cursor detector: no model loaded (will use pretrained)")
         yolo_detector = None
+
+    # SAHI tiled YOLO (finds small cursors that single-shot YOLO misses)
+    if yolo_detector:
+        sahi_detector = SAHIYOLODetector(
+            yolo_detector, tile_size=384, overlap_ratio=0.25)
+        print("  SAHI tiled detector initialized (384px tiles, 0.25 overlap)")
+
+        # Temporal YOLO (dual-frame velocity estimation)
+        temporal_yolo = TemporalYOLODetector(
+            yolo_detector, lag_s=1.0, buffer_size=16)
+        print("  Temporal YOLO initialized (1.0s lag, 16-frame buffer)")
 
     # Claude Vision cursor detector (uses subscription, no API key)
     claude_detector = ClaudeVisionCursorDetector(model="haiku")

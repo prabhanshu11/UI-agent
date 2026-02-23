@@ -353,12 +353,16 @@ def save_checkpoint(
     """Save model checkpoint with versioned naming."""
     models_dir.mkdir(parents=True, exist_ok=True)
 
-    # Find next version
+    # Find next version — extract NNN from cursor_vit_vNNN_...
+    import re as _re
     existing = sorted(models_dir.glob("cursor_vit_v*.pt"))
     if existing:
-        last = existing[-1].stem
-        last_num = int(last.split("_v")[1].split("_")[0])
-        next_num = last_num + 1
+        nums = []
+        for f in existing:
+            m = _re.search(r"cursor_vit_v(\d+)", f.stem)
+            if m:
+                nums.append(int(m.group(1)))
+        next_num = max(nums) + 1 if nums else 1
     else:
         next_num = 1
 

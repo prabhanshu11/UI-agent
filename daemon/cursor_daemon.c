@@ -33,6 +33,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <inttypes.h>
 
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -55,6 +56,8 @@ typedef struct {
     const char *record_dir;
     int         no_record;
     int         verbose;
+    const char *blob_log_dir;
+    int         no_blob_log;
 } Config;
 
 static Config cfg = {
@@ -65,6 +68,8 @@ static Config cfg = {
     .record_dir = NULL,  /* set in main() based on project root */
     .no_record  = 0,
     .verbose    = 0,
+    .blob_log_dir = NULL,  /* set in main() based on project root */
+    .no_blob_log  = 0,
 };
 
 /* ── Globals ──────────────────────────────────────────────────── */
@@ -85,6 +90,20 @@ typedef struct {
 
 static FrameRing g_ring;
 
+/* Blob JSONL ring buffer (SPSC: capture thread → blob_log_thread) */
+#define BLOB_RING_SIZE 64
+
+typedef struct {
+    uint64_t timestamp_ns;         /* CLOCK_REALTIME (wall-clock for dataset) */
+    uint64_t frame_number;
+    int      blob_count;
+    ShmBlob  blobs[MAX_BLOBS];     /* 32 * 24 = 768 bytes */
+} BlobSnapshot;                    /* ~792 bytes * 64 = ~50 KB total */
+
+static BlobSnapshot g_blob_ring[BLOB_RING_SIZE];
+static _Atomic uint32_t g_blob_head = 0;  /* written by capture thread */
+static _Atomic uint32_t g_blob_tail = 0;  /* read by blob_log_thread */
+
 /* ── Signal Handling ──────────────────────────────────────────── */
 
 static void signal_handler(int sig) {
@@ -97,6 +116,12 @@ static void signal_handler(int sig) {
 static uint64_t now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t realtime_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
@@ -573,6 +598,108 @@ static void enqueue_frame(AVFrame *frame) {
     atomic_fetch_add(&g_ring.write_idx, 1);
 }
 
+/* ── Blob JSONL Logging ──────────────────────────────────────── */
+
+static void enqueue_blob_snapshot(const ShmBlob *blobs, int count,
+                                  uint64_t frame_number) {
+    uint32_t head = atomic_load(&g_blob_head);
+    uint32_t tail = atomic_load(&g_blob_tail);
+
+    /* Drop if ring is full (writer ahead by BLOB_RING_SIZE) */
+    if (head - tail >= BLOB_RING_SIZE) return;
+
+    uint32_t slot = head % BLOB_RING_SIZE;
+    g_blob_ring[slot].timestamp_ns  = realtime_ns();
+    g_blob_ring[slot].frame_number  = frame_number;
+    g_blob_ring[slot].blob_count    = count;
+    memcpy(g_blob_ring[slot].blobs, blobs, count * sizeof(ShmBlob));
+
+    atomic_store_explicit(&g_blob_head, head + 1, memory_order_release);
+}
+
+static void *blob_log_thread(void *arg) {
+    (void)arg;
+
+    ensure_dir(cfg.blob_log_dir);
+
+    FILE *fp = NULL;
+    time_t file_start = 0;
+    char current_path[512] = {0};
+
+    while (g_running || atomic_load(&g_blob_tail) < atomic_load(&g_blob_head)) {
+        uint32_t tail = atomic_load_explicit(&g_blob_tail, memory_order_acquire);
+        uint32_t head = atomic_load(&g_blob_head);
+
+        if (tail >= head) {
+            /* No data — sleep 10ms (100Hz drain rate) */
+            struct timespec ts = {0, 10000000};
+            nanosleep(&ts, NULL);
+            continue;
+        }
+
+        /* Open/rotate file aligned with CHUNK_DURATION_S */
+        time_t now = time(NULL);
+        if (!fp || (now - file_start >= CHUNK_DURATION_S)) {
+            if (fp) fclose(fp);
+            struct tm *t = localtime(&now);
+            snprintf(current_path, sizeof(current_path),
+                     "%s/blobs_%04d%02d%02d_%02d%02d%02d.jsonl",
+                     cfg.blob_log_dir,
+                     t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+                     t->tm_hour, t->tm_min, t->tm_sec);
+            fp = fopen(current_path, "a");
+            if (!fp) {
+                fprintf(stderr, "blob_log: failed to open %s\n", current_path);
+                struct timespec ts = {1, 0};
+                nanosleep(&ts, NULL);
+                continue;
+            }
+            setvbuf(fp, NULL, _IOFBF, 8192);  /* 8 KB write buffer */
+            file_start = now;
+            if (cfg.verbose)
+                printf("blob_log: opened %s\n", current_path);
+        }
+
+        /* Drain all available snapshots */
+        while (tail < head) {
+            uint32_t slot = tail % BLOB_RING_SIZE;
+            BlobSnapshot *snap = &g_blob_ring[slot];
+
+            /* Write compact JSONL line */
+            fprintf(fp, "{\"ts\":%" PRIu64 ",\"fn\":%" PRIu64 ",\"bc\":%d",
+                    snap->timestamp_ns, snap->frame_number, snap->blob_count);
+
+            if (snap->blob_count > 0) {
+                fprintf(fp, ",\"b\":[");
+                for (int i = 0; i < snap->blob_count; i++) {
+                    ShmBlob *b = &snap->blobs[i];
+                    if (i > 0) fputc(',', fp);
+                    fprintf(fp,
+                        "{\"cx\":%d,\"cy\":%d,\"a\":%.3f,\"px\":%d,"
+                        "\"bx\":[%d,%d,%d,%d]}",
+                        b->centroid_x, b->centroid_y,
+                        b->angle, b->pixel_count,
+                        b->bbox_x_min, b->bbox_y_min,
+                        b->bbox_x_max, b->bbox_y_max);
+                }
+                fputc(']', fp);
+            }
+
+            fprintf(fp, "}\n");
+
+            tail++;
+            atomic_store_explicit(&g_blob_tail, tail, memory_order_release);
+        }
+
+        /* Flush periodically (once per drain cycle) */
+        fflush(fp);
+    }
+
+    if (fp) fclose(fp);
+    printf("blob_log: thread exiting\n");
+    return NULL;
+}
+
 /* ── Shared Memory Setup ──────────────────────────────────────── */
 
 static int setup_shm(void) {
@@ -686,6 +813,8 @@ static void print_usage(const char *prog) {
         "  --threshold N      Motion threshold on Y channel (default: 12)\n"
         "  --record-dir PATH  Recording output directory\n"
         "  --no-record        Disable recording\n"
+        "  --blob-log-dir P   Blob JSONL output directory\n"
+        "  --no-blob-log      Disable blob JSONL logging\n"
         "  --verbose          Print per-frame stats\n"
         "  -h, --help         Show this help\n",
         prog);
@@ -693,23 +822,27 @@ static void print_usage(const char *prog) {
 
 static void parse_args(int argc, char **argv) {
     static struct option long_opts[] = {
-        {"device",     required_argument, NULL, 'd'},
-        {"threshold",  required_argument, NULL, 't'},
-        {"record-dir", required_argument, NULL, 'r'},
-        {"no-record",  no_argument,       NULL, 'n'},
-        {"verbose",    no_argument,       NULL, 'v'},
-        {"help",       no_argument,       NULL, 'h'},
+        {"device",       required_argument, NULL, 'd'},
+        {"threshold",    required_argument, NULL, 't'},
+        {"record-dir",   required_argument, NULL, 'r'},
+        {"no-record",    no_argument,       NULL, 'n'},
+        {"blob-log-dir", required_argument, NULL, 'b'},
+        {"no-blob-log",  no_argument,       NULL, 'B'},
+        {"verbose",      no_argument,       NULL, 'v'},
+        {"help",         no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "d:t:r:nvh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:t:r:nb:Bvh", long_opts, NULL)) != -1) {
         switch (opt) {
-        case 'd': cfg.device     = optarg; break;
-        case 't': cfg.threshold  = atoi(optarg); break;
-        case 'r': cfg.record_dir = optarg; break;
-        case 'n': cfg.no_record  = 1; break;
-        case 'v': cfg.verbose    = 1; break;
+        case 'd': cfg.device       = optarg; break;
+        case 't': cfg.threshold    = atoi(optarg); break;
+        case 'r': cfg.record_dir   = optarg; break;
+        case 'n': cfg.no_record    = 1; break;
+        case 'b': cfg.blob_log_dir = optarg; break;
+        case 'B': cfg.no_blob_log  = 1; break;
+        case 'v': cfg.verbose      = 1; break;
         case 'h': print_usage(argv[0]); exit(0);
         default:  print_usage(argv[0]); exit(1);
         }
@@ -741,11 +874,32 @@ int main(int argc, char **argv) {
         cfg.record_dir = default_record_dir;
     }
 
+    /* Default blob log dir: project_root/data/blob_log/ */
+    char default_blob_log_dir[512];
+    if (!cfg.blob_log_dir && !cfg.no_blob_log) {
+        char *exe_dir = realpath("/proc/self/exe", NULL);
+        if (exe_dir) {
+            char *slash = strrchr(exe_dir, '/');
+            if (slash) *slash = '\0';
+            slash = strrchr(exe_dir, '/');
+            if (slash) *slash = '\0';
+            snprintf(default_blob_log_dir, sizeof(default_blob_log_dir),
+                     "%s/data/blob_log", exe_dir);
+            free(exe_dir);
+        } else {
+            strncpy(default_blob_log_dir, "/tmp/kvm_blob_log",
+                    sizeof(default_blob_log_dir) - 1);
+        }
+        cfg.blob_log_dir = default_blob_log_dir;
+    }
+
     printf("cursor-daemon starting\n");
     printf("  device:     %s\n", cfg.device);
     printf("  threshold:  %d\n", cfg.threshold);
     printf("  record-dir: %s\n", cfg.record_dir);
     printf("  recording:  %s\n", cfg.no_record ? "disabled" : "enabled");
+    printf("  blob-log:   %s\n", cfg.no_blob_log ? "disabled" :
+           (cfg.blob_log_dir ? cfg.blob_log_dir : "(default)"));
 
     /* Signal handlers */
     signal(SIGTERM, signal_handler);
@@ -837,6 +991,15 @@ int main(int argc, char **argv) {
         if (pthread_create(&rec_tid, NULL, recording_thread, NULL) != 0) {
             fprintf(stderr, "Failed to create recording thread\n");
             rec_tid = 0;
+        }
+    }
+
+    /* Start blob JSONL logging thread */
+    pthread_t blob_tid = 0;
+    if (!cfg.no_blob_log && cfg.blob_log_dir) {
+        if (pthread_create(&blob_tid, NULL, blob_log_thread, NULL) != 0) {
+            fprintf(stderr, "Failed to create blob log thread\n");
+            blob_tid = 0;
         }
     }
 
@@ -944,6 +1107,12 @@ int main(int argc, char **argv) {
         g_shm->frame_count++;
         g_shm->timestamp_ns  = now_ns();
 
+        /* Enqueue blob snapshot for JSONL logging */
+        if (!cfg.no_blob_log && blob_count > 0) {
+            enqueue_blob_snapshot(local_blobs, blob_count,
+                                 g_shm->frame_count);
+        }
+
         atomic_thread_fence(memory_order_release);
         memcpy((void *)&g_shm->seq_end, &seq, sizeof(seq));
 
@@ -974,6 +1143,11 @@ cleanup:
     /* Wait for recording thread to finish */
     if (rec_tid) {
         pthread_join(rec_tid, NULL);
+    }
+
+    /* Wait for blob log thread to finish */
+    if (blob_tid) {
+        pthread_join(blob_tid, NULL);
     }
 
     /* Free resources */

@@ -1,0 +1,159 @@
+.report-controls {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.75rem 1rem;
+  background: #1a1a2e;
+  border-bottom: 1px solid #333;
+}
+
+.report-controls button {
+  padding: 0.4rem 0.8rem;
+  background: #2a2a4a;
+  color: #ccc;
+  border: 1px solid #444;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+.report-controls button:hover {
+  background: #3a3a5a;
+  color: #fff;
+}
+
+.report-controls button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+#date-display {
+  font-family: monospace;
+  color: #7af;
+  font-size: 0.95rem;
+}
+
+.report-content {
+  padding: 1.5rem 2rem;
+  max-width: 900px;
+  line-height: 1.6;
+  color: #ddd;
+}
+
+.report-content h1 {
+  color: #7af;
+  font-size: 1.4rem;
+  margin-top: 1.5rem;
+  border-bottom: 1px solid #333;
+  padding-bottom: 0.3rem;
+}
+
+.report-content h2 {
+  color: #8bf;
+  font-size: 1.15rem;
+  margin-top: 1.2rem;
+}
+
+.report-content h3 {
+  color: #9cf;
+  font-size: 1rem;
+  margin-top: 1rem;
+}
+
+.report-content code {
+  background: #2a2a3e;
+  padding: 0.15rem 0.35rem;
+  border-radius: 3px;
+  font-size: 0.85em;
+  color: #f8a;
+}
+
+.report-content ul {
+  padding-left: 1.5rem;
+}
+
+.report-content li {
+  margin: 0.3rem 0;
+}
+
+.report-content strong {
+  color: #fff;
+}
+
+.report-content p {
+  margin: 0.5rem 0;
+}
+
+.loading {
+  color: #666;
+  font-style: italic;
+}
+
+.error {
+  color: #f66;
+  background: #2a1a1a;
+  padding: 1rem;
+  border-radius: 4px;
+  border: 1px solid #633;
+}
+
+.actions-panel {
+  padding: 1rem 2rem;
+  max-width: 900px;
+  border-top: 1px solid #333;
+  margin-top: 1rem;
+}
+
+.actions-panel h2 {
+  color: #fa7;
+  font-size: 1.1rem;
+  margin-bottom: 0.75rem;
+}
+
+.action-item {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.5rem 0.75rem;
+  margin: 0.3rem 0;
+  border-radius: 4px;
+  background: #1a1a2e;
+  border: 1px solid #333;
+}
+
+.action-priority {
+  font-size: 0.75rem;
+  font-weight: bold;
+  padding: 0.15rem 0.5rem;
+  border-radius: 3px;
+  text-transform: uppercase;
+}
+
+.priority-high .action-priority {
+  background: #633;
+  color: #faa;
+}
+
+.priority-medium .action-priority {
+  background: #553;
+  color: #fda;
+}
+
+.priority-low .action-priority {
+  background: #335;
+  color: #adf;
+}
+
+.action-text {
+  color: #ccc;
+  font-size: 0.9rem;
+}
+
+.report-date {
+  font-family: monospace;
+  color: #7af;
+  font-size: 0.85rem;
+  background: #2a2a4a;
+  padding: 0.2rem 0.6rem;
+  border-radius: 3px;
+}

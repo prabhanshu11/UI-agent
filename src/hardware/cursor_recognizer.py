@@ -26,6 +26,7 @@ PATCH_SIZE = 64
 # Default model directory
 _PROJECT_ROOT = Path(__file__).parent.parent.parent
 MODEL_DIR = _PROJECT_ROOT / "data" / "cursor_models"
+VIT_MODEL_DIR = _PROJECT_ROOT / "data" / "phase1_models"
 
 
 def _make_arrow_template(size: int = 32) -> np.ndarray:
@@ -345,3 +346,143 @@ class CursorRecognizer:
     def reload_model(self):
         """Re-check for new CNN model files and load the latest."""
         self._load_cnn_model()
+
+    # ── ViT-S cursor regression model ──────────────────────────────
+
+    def load_vit_model(self) -> bool:
+        """Load the latest ViT-S cursor regression model.
+
+        These models predict (x, y) from a full 384x384 frame.
+        Returns True if a model was loaded.
+        """
+        if not VIT_MODEL_DIR.exists():
+            return False
+
+        model_files = sorted(VIT_MODEL_DIR.glob("cursor_vit_v*.pt"), reverse=True)
+        if not model_files:
+            return False
+
+        try:
+            import torch
+
+            checkpoint = torch.load(
+                model_files[0], map_location="cpu", weights_only=False)
+            from scripts.train_phase1_model import CursorViT
+            vit = CursorViT()
+            vit.load_state_dict(checkpoint["model_state_dict"])
+            # Set to inference mode (no dropout, frozen batchnorm)
+            vit.train(False)
+            self._vit_model = vit
+            self._vit_version = model_files[0].stem
+            self._vit_mode = checkpoint.get("mode", "full")
+            return True
+        except Exception:
+            return False
+
+    def vit_predict(self, frame: np.ndarray) -> Optional[tuple[int, int, float]]:
+        """Predict cursor position using ViT-S regression model.
+
+        Args:
+            frame: Full color frame (H, W, 3).
+
+        Returns:
+            (x, y, confidence) or None if model not loaded or prediction failed.
+        """
+        if not hasattr(self, '_vit_model') or self._vit_model is None:
+            return None
+
+        try:
+            import torch
+            import torchvision.transforms as T
+
+            h, w = frame.shape[:2]
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if len(frame.shape) == 3 else frame
+
+            resized = cv2.resize(rgb, (384, 384))
+
+            transform = T.Compose([
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225]),
+            ])
+            tensor = transform(resized).unsqueeze(0)
+
+            with torch.no_grad():
+                pred = self._vit_model(tensor)
+
+            nx, ny = pred[0, 0].item(), pred[0, 1].item()
+            px = max(0, min(w - 1, int(nx * w)))
+            py = max(0, min(h - 1, int(ny * h)))
+
+            return (px, py, 0.5)
+        except Exception:
+            return None
+
+    def visual_detect(
+        self,
+        frame: np.ndarray,
+        sahi_detector=None,
+    ) -> Optional[tuple[int, int, float, str]]:
+        """Full visual detection cascade — find cursor without mouse.
+
+        Tries methods in order of speed, returns first success:
+          1. SAHI tiled YOLO (~50ms, best for visible cursors)
+          2. ViT-S regression (~30ms, predicts from full frame)
+          3. CNN grid scan (~200ms, exhaustive search)
+
+        Args:
+            frame: Full color frame (H, W, 3).
+            sahi_detector: Optional SAHIYOLODetector instance.
+
+        Returns:
+            (x, y, confidence, method) or None if cursor not found.
+        """
+        # 1. SAHI tiled YOLO detection
+        if sahi_detector is not None:
+            try:
+                result = sahi_detector.detect(frame)
+                if result.detections:
+                    det = result.detections[0]
+                    return (int(det.cx), int(det.cy),
+                            float(det.confidence), "sahi_yolo")
+            except Exception:
+                pass
+
+        # 2. ViT-S regression + CNN validation
+        vit_result = self.vit_predict(frame)
+        if vit_result is not None:
+            vx, vy, _ = vit_result
+            patch = self._extract_vit_patch(frame, vx, vy)
+            if patch is not None:
+                conf = self.classify_patch(patch)
+                if conf > 0.6:
+                    return (vx, vy, conf, "vit_s")
+
+        # 3. CNN grid scan (slowest but most thorough)
+        hits = self.grid_scan(frame, stride=64, threshold=0.85)
+        if hits:
+            gx, gy, gc = hits[0]
+            return (gx, gy, gc, "cnn_grid")
+
+        return None
+
+    def _extract_vit_patch(self, frame: np.ndarray,
+                           x: int, y: int) -> Optional[np.ndarray]:
+        """Extract a 64x64 grayscale patch for CNN validation."""
+        if len(frame.shape) == 3:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = frame
+
+        h, w = gray.shape[:2]
+        half = PATCH_SIZE // 2
+        x0, y0 = max(0, x - half), max(0, y - half)
+        x1, y1 = min(w, x + half), min(h, y + half)
+
+        patch = gray[y0:y1, x0:x1]
+        if patch.shape != (PATCH_SIZE, PATCH_SIZE):
+            padded = np.zeros((PATCH_SIZE, PATCH_SIZE), dtype=np.uint8)
+            ph, pw = patch.shape[:2]
+            padded[:ph, :pw] = patch
+            return padded
+        return patch

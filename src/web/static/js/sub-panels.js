@@ -28,6 +28,9 @@ var SubPanels = (function() {
     var lastFrameImg = null;
     var frameSeq = 0;
 
+    // ── Motion trail API data ─────────────────────────────────
+    var lastTrailData = null;
+
     function init() {
         blobCanvas = document.getElementById('blob-map-canvas');
         inferCanvas = document.getElementById('inference-canvas');
@@ -101,6 +104,11 @@ var SubPanels = (function() {
         ptActive = nowActive;
         if (ptActive && (ptAccumX > 0 || ptAccumY > 0)) {
             pushTrail(passthroughTrail, ptAccumX, ptAccumY);
+        }
+
+        // Capture trail API data for velocity visualization
+        if (state.trail) {
+            lastTrailData = state.trail;
         }
 
         drawBlobMap(state);
@@ -202,6 +210,52 @@ var SubPanels = (function() {
         drawTrailDot(ctx, esp32Trail, '#2ecc71', sx, sy);
         drawTrailDot(ctx, passthroughTrail, '#ff6b35', sx, sy);
 
+        // Velocity arrow from trail API
+        var trail = lastTrailData;
+        if (trail && trail.moving && trail.last_x != null) {
+            var tx = trail.last_x * sx;
+            var ty = trail.last_y * sy;
+            var vx = trail.velocity.vx;
+            var vy = trail.velocity.vy;
+            var speed = trail.speed;
+            // Scale arrow length: 100 px/s = 30px arrow
+            var arrowLen = Math.min(60, speed * 0.3) * sx;
+            if (arrowLen > 3) {
+                var angle = Math.atan2(vy, vx);
+                var ex = tx + Math.cos(angle) * arrowLen;
+                var ey = ty + Math.sin(angle) * arrowLen;
+                ctx.strokeStyle = '#ff0';
+                ctx.lineWidth = 2;
+                ctx.globalAlpha = 0.9;
+                ctx.beginPath();
+                ctx.moveTo(tx, ty);
+                ctx.lineTo(ex, ey);
+                ctx.stroke();
+                // Arrowhead
+                var headLen = 5;
+                ctx.beginPath();
+                ctx.moveTo(ex, ey);
+                ctx.lineTo(ex - headLen * Math.cos(angle - 0.4),
+                           ey - headLen * Math.sin(angle - 0.4));
+                ctx.moveTo(ex, ey);
+                ctx.lineTo(ex - headLen * Math.cos(angle + 0.4),
+                           ey - headLen * Math.sin(angle + 0.4));
+                ctx.stroke();
+                ctx.globalAlpha = 1.0;
+            }
+        }
+
+        // Speed + source HUD (top-right)
+        if (trail) {
+            ctx.font = '9px monospace';
+            ctx.fillStyle = '#ff0';
+            ctx.textAlign = 'right';
+            ctx.fillText(Math.round(trail.speed) + ' px/s', w - 4, 12);
+            ctx.fillStyle = '#888';
+            ctx.fillText(trail.total_points + ' pts', w - 4, 22);
+            ctx.textAlign = 'left';
+        }
+
         // Legend
         ctx.font = '9px monospace';
         var legendY = h - 22;
@@ -211,6 +265,10 @@ var SubPanels = (function() {
         ctx.fillText('\u25CF ESP32', 6, legendY + 10);
         ctx.fillStyle = '#ff6b35';
         ctx.fillText('\u25CF Passthrough', 80, legendY + 10);
+        if (trail && trail.moving) {
+            ctx.fillStyle = '#ff0';
+            ctx.fillText('\u25CF Velocity', 80, legendY);
+        }
     }
 
     function drawTrailDot(ctx, trail, color, sx, sy) {

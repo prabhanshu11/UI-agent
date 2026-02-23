@@ -115,3 +115,64 @@ Check the "Proven vs Untested" table in the research doc (§11) before choosing 
 find ~/Programs/UI-agent/data/recordings/ -name "kvm_*.mkv" -mtime +7 -delete
 find ~/Programs/UI-agent/data/loss_events/ -maxdepth 1 -type d -mtime +3 -exec rm -rf {} +
 ```
+
+## GPU and Resource Management — BINDING RULES
+
+> **Context:** Two system-killing incidents on 2026-02-23. (1) `build_phase1_dataset.py` consumed 19.6 GB RSS in 7 minutes → OOM swap thrash → hard reboot. (2) `kvm_dashboard` at 94.5% CPU for 72 minutes → Vega 8 iGPU starved → compositor froze 10 minutes. Full analysis: `~/Programs/utilities/freeze-monitor/analysis/incident-20260223-*.md`
+
+### Rule 1: The iGPU Is Shared — Do Not Overload It
+
+The AMD Vega 8 is an integrated GPU with no dedicated VRAM. Shared by Hyprland, Ghostty, Chrome, and ML inference. NEVER run all simultaneously at high load.
+
+**Before launching GPU-touching workloads:**
+```bash
+ps aux --sort=-%cpu | head -20
+```
+If kvm_dashboard + Chrome GPU + Ghostty all active, do NOT add ML inference. Stagger or defer.
+
+### Rule 2: Rate-Limit Frame Serving to 2-3 FPS
+
+- Cap frame serving at **2-3 fps max** (`time.sleep(0.3)` or `Cache-Control` headers)
+- Use **one browser tab**, not multiple
+- For API-only access: Chrome `--headless=new`
+
+### Rule 3: Never Run kvm_dashboard at Full CPU Indefinitely
+
+Must not sustain >50% CPU for >10 minutes. Disable motion detection in `--passive` mode. Lower JPEG quality to 60-70. Add `time.sleep()` between inference cycles.
+
+### Rule 4: ML Training/Inference — Prefer Discrete GPU
+
+```bash
+nvidia-smi 2>/dev/null || echo "No discrete GPU — iGPU only"
+```
+- **Discrete GPU:** Use it. No special throttling.
+- **iGPU only:** Limit batch sizes. Never run training and dashboard simultaneously.
+
+### Rule 5: Check Available RAM Before Memory-Intensive Processes
+
+**MANDATORY before** `build_phase1_dataset.py`, training scripts, or frame-loading processes:
+```bash
+free -h | grep -E "Mem:|Swap:"
+```
+| Available RAM | Action |
+|---|---|
+| >20 GB | Proceed, monitor |
+| 10-20 GB | Reduce batch size proportionally |
+| <10 GB | DO NOT LAUNCH |
+
+### Rule 6: Never Load All Frames Into RAM
+
+Stream frames from disk one at a time, or in small batches (50-100). Use generators (`yield`). Calculate memory footprint before running:
+```
+4000 frames x 1920 x 1080 x 3 bytes = 24.8 GB ← WILL KILL SYSTEM
+```
+
+### Rule 7: Monitor Memory Velocity — Abort Early
+
+**Abort conditions (kill immediately):**
+- Swap climbing >500 MB/min
+- Available RAM < 4 GB
+- iowait > 30%
+- Blocked processes > 12
+
+OOM killer failed in the 2026-02-23 incident. Kill offending process proactively.

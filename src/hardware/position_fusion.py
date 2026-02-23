@@ -209,19 +209,38 @@ class PositionFusionEngine:
 
     This is the main orchestrator. Call update() with each new frame
     to get a continuously refined position estimate.
+
+    Track D enhancements:
+      D3. Trail-informed YOLO scoring (1.5x boost near trail, 0.6x far)
+      D4. Confidence gate (high/medium/low replaces 3.0s stale threshold)
+      D5. Dead reckoning feeds motion trail for velocity even without vision
     """
 
-    def __init__(self, recognizer=None, yolo_detector=None):
+    # D3: Trail-informed scoring parameters
+    TRAIL_BOOST = 1.5          # Multiplier for detections near trail prediction
+    TRAIL_REDUCE = 0.6         # Multiplier for detections far from prediction during stillness
+    TRAIL_NEAR_PX = 100        # "Near" = within 100px of trail prediction
+    TRAIL_FAR_PX = 300         # "Far" = beyond 300px of trail prediction
+
+    # D4: Confidence gate levels
+    CONF_HIGH = 0.7            # CNN + YOLO agree
+    CONF_MEDIUM = 0.3          # One source only
+    CONF_LOW = 0.1             # No recent confirmation
+
+    def __init__(self, recognizer=None, yolo_detector=None, motion_trail=None):
         """
         Args:
             recognizer: CursorRecognizer for CNN verification.
             yolo_detector: YOLOCursorDetector for ground truth anchoring.
+            motion_trail: MotionTrail instance for trail-informed scoring (D3/D5).
         """
         self._verifier = CursorVerifier(recognizer) if recognizer else None
         self._yolo_anchor = YOLOAnchor(yolo_detector) if yolo_detector else None
+        self._trail = motion_trail
         self._position: Optional[FusedPosition] = None
         self._prev_frame: Optional[np.ndarray] = None
         self._cnn_ema = 0.0
+        self._confidence_level = "low"  # D4: high, medium, low
 
     @property
     def position(self) -> Optional[FusedPosition]:
@@ -233,6 +252,11 @@ class PositionFusionEngine:
         """Current fused confidence (0.0-1.0)."""
         return self._position.confidence if self._position else 0.0
 
+    @property
+    def confidence_level(self) -> str:
+        """D4: Current confidence gate level (high, medium, low)."""
+        return self._confidence_level
+
     def set_position(self, x: int, y: int, source: str = "external"):
         """Set position from external source (e.g., Lissajous locate)."""
         self._position = FusedPosition(
@@ -240,6 +264,7 @@ class PositionFusionEngine:
             timestamp=time.monotonic(),
         )
         self._cnn_ema = 0.5  # Reset EMA to neutral
+        self._confidence_level = "medium"
 
     def update(self, frame: np.ndarray,
                dr_x: Optional[int] = None,
@@ -266,10 +291,13 @@ class PositionFusionEngine:
         pos = self._position
         now = time.monotonic()
 
-        # Step 1: Apply dead reckoning if available
+        # D5: Feed dead reckoning to motion trail for velocity estimation
         if dr_x is not None and dr_y is not None:
             pos.x = dr_x
             pos.y = dr_y
+            if self._trail:
+                self._trail.append(
+                    dr_x, dr_y, source="dead_reckoning")
 
         # Step 2: CNN verification at predicted position
         cnn_conf = 0.0
@@ -287,12 +315,21 @@ class PositionFusionEngine:
             yolo_result = self._yolo_anchor.check(frame, pos.x, pos.y)
             if yolo_result:
                 yolo_x, yolo_y, yolo_conf = yolo_result
+
+                # D3: Trail-informed scoring
+                yolo_conf = self._trail_score_yolo(
+                    yolo_x, yolo_y, yolo_conf)
+
                 # Correct position to YOLO ground truth
                 pos.x = yolo_x
                 pos.y = yolo_y
 
         # Step 4: Fuse confidence
         fused_conf = self._fuse_confidence(self._cnn_ema, yolo_conf)
+
+        # D4: Update confidence gate
+        self._confidence_level = self._compute_confidence_level(
+            self._cnn_ema, yolo_conf, now - pos.timestamp)
 
         # Determine primary source
         if yolo_conf > 0.7:
@@ -317,6 +354,42 @@ class PositionFusionEngine:
         self._prev_frame = frame
         return self._position
 
+    def _trail_score_yolo(self, yolo_x: int, yolo_y: int,
+                          raw_conf: float) -> float:
+        """D3: Adjust YOLO confidence based on motion trail prediction.
+
+        Boost if detection is near the predicted position (consistent trajectory).
+        Reduce if far from prediction during stillness (likely false positive).
+        """
+        if not self._trail:
+            return raw_conf
+
+        pred_x, pred_y = self._trail.extrapolate(dt=0.0)
+        dist = ((yolo_x - pred_x) ** 2 + (yolo_y - pred_y) ** 2) ** 0.5
+
+        is_still = not self._trail.is_moving(threshold_px_s=10.0)
+
+        if dist < self.TRAIL_NEAR_PX:
+            # Near trail prediction — boost confidence
+            return min(1.0, raw_conf * self.TRAIL_BOOST)
+        elif dist > self.TRAIL_FAR_PX and is_still:
+            # Far from prediction during stillness — likely false positive
+            return raw_conf * self.TRAIL_REDUCE
+
+        return raw_conf
+
+    def _compute_confidence_level(self, cnn_ema: float, yolo_conf: float,
+                                  age_s: float) -> str:
+        """D4: Compute confidence gate level from fused signals.
+
+        Replaces the old age-based 3.0s stale threshold with signal-based levels.
+        """
+        if cnn_ema >= self.CONF_HIGH and yolo_conf >= 0.3:
+            return "high"
+        if cnn_ema >= self.CONF_MEDIUM or yolo_conf >= 0.3:
+            return "medium"
+        return "low"
+
     def _fuse_confidence(self, cnn_ema: float, yolo_conf: float) -> float:
         """Combine CNN and YOLO confidences into a single score."""
         if yolo_conf > 0:
@@ -325,3 +398,16 @@ class PositionFusionEngine:
 
         # CNN only
         return cnn_ema
+
+    def to_dict(self) -> dict:
+        """Status dict for /api/state integration."""
+        pos = self._position
+        return {
+            "x": pos.x if pos else 0,
+            "y": pos.y if pos else 0,
+            "confidence": round(self.confidence, 3),
+            "confidence_level": self._confidence_level,
+            "source": pos.source if pos else "none",
+            "cnn_ema": round(self._cnn_ema, 3),
+            "age_s": round(time.monotonic() - pos.timestamp, 1) if pos else -1,
+        }

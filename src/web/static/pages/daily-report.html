@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Daily Analysis Report</title>
+<link rel="stylesheet" href="/static/css/base.css">
+<link rel="stylesheet" href="/static/css/daily-report.css">
+</head>
+<body>
+<div class="header">
+  <div style="display:flex;align-items:center;gap:1rem;">
+    <h1>DAILY ANALYSIS REPORT</h1>
+    <span class="report-date" id="report-date"></span>
+  </div>
+  <div class="nav">
+    <a href="/">Dashboard</a>
+    <a href="/validation">Validation</a>
+    <a href="/profiler">Profiler</a>
+    <a href="/loss_events">Loss Events</a>
+    <a href="/yolo">YOLO Gallery</a>
+    <a href="/daily-report" class="active">Daily Report</a>
+  </div>
+</div>
+
+<div class="report-controls" id="report-controls">
+  <button id="btn-prev" onclick="navigate(-1)">&larr; Previous</button>
+  <span id="date-display">Loading...</span>
+  <button id="btn-next" onclick="navigate(1)">Next &rarr;</button>
+  <button id="btn-generate" onclick="generateReport()">Generate New Report</button>
+</div>
+
+<div class="report-content" id="report-content">
+  <p class="loading">Loading report...</p>
+</div>
+
+<div class="actions-panel" id="actions-panel" style="display:none">
+  <h2>Recommended Actions</h2>
+  <div id="actions-list"></div>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script>
+// NOTE: All content rendered here comes from locally-generated markdown files
+// (data/daily_reports/), not from user input. Safe for innerHTML.
+const reportContent = document.getElementById('report-content');
+const actionsPanel = document.getElementById('actions-panel');
+const actionsList = document.getElementById('actions-list');
+const dateDisplay = document.getElementById('date-display');
+const reportDate = document.getElementById('report-date');
+
+let currentDate = null;
+let availableDates = [];
+
+async function loadReport(date) {
+  reportContent.textContent = 'Loading report...';
+  actionsPanel.style.display = 'none';
+
+  try {
+    const url = date ? `/api/daily-report?date=${date}` : '/api/daily-report';
+    const resp = await fetch(url);
+    const data = await resp.json();
+
+    if (data.error) {
+      reportContent.textContent = data.error;
+      reportContent.className = 'report-content error';
+      return;
+    }
+
+    currentDate = data.date;
+    availableDates = data.available_dates || [];
+    dateDisplay.textContent = currentDate;
+    reportDate.textContent = currentDate;
+
+    reportContent.className = 'report-content';
+    renderMarkdownToDOM(reportContent, data.content);
+
+    if (data.actions && data.actions.length > 0) {
+      actionsPanel.style.display = 'block';
+      actionsList.replaceChildren();
+      data.actions.forEach(function(a) {
+        const item = document.createElement('div');
+        item.className = 'action-item priority-' + (a.priority || 'medium');
+        const pri = document.createElement('span');
+        pri.className = 'action-priority';
+        pri.textContent = a.priority || 'medium';
+        const txt = document.createElement('span');
+        txt.className = 'action-text';
+        txt.textContent = a.action || a.description || JSON.stringify(a);
+        item.appendChild(pri);
+        item.appendChild(txt);
+        actionsList.appendChild(item);
+      });
+    }
+  } catch (err) {
+    reportContent.textContent = 'Failed to load: ' + err.message;
+    reportContent.className = 'report-content error';
+  }
+}
+
+function navigate(delta) {
+  if (!availableDates.length) return;
+  const idx = availableDates.indexOf(currentDate);
+  const newIdx = idx + delta;
+  if (newIdx >= 0 && newIdx < availableDates.length) {
+    loadReport(availableDates[newIdx]);
+  }
+}
+
+async function generateReport() {
+  const btn = document.getElementById('btn-generate');
+  btn.disabled = true;
+  btn.textContent = 'Generating...';
+  try {
+    const resp = await fetch('/api/daily-report/generate', { method: 'POST' });
+    const data = await resp.json();
+    if (data.date) {
+      await loadReport(data.date);
+    } else {
+      alert(data.error || 'Failed to generate report');
+    }
+  } catch (err) {
+    alert('Error: ' + err.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Generate New Report';
+  }
+}
+
+function renderMarkdownToDOM(container, md) {
+  container.replaceChildren();
+  const lines = md.split('\n');
+  let currentList = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    if (line.startsWith('### ')) {
+      flushList();
+      const h = document.createElement('h3');
+      h.textContent = line.slice(4);
+      container.appendChild(h);
+    } else if (line.startsWith('## ')) {
+      flushList();
+      const h = document.createElement('h2');
+      h.textContent = line.slice(3);
+      container.appendChild(h);
+    } else if (line.startsWith('# ')) {
+      flushList();
+      const h = document.createElement('h1');
+      h.textContent = line.slice(2);
+      container.appendChild(h);
+    } else if (line.startsWith('- ')) {
+      if (!currentList) {
+        currentList = document.createElement('ul');
+      }
+      const li = document.createElement('li');
+      li.textContent = line.slice(2);
+      currentList.appendChild(li);
+    } else if (line.trim() === '') {
+      flushList();
+    } else {
+      flushList();
+      const p = document.createElement('p');
+      p.textContent = line;
+      container.appendChild(p);
+    }
+  }
+  flushList();
+
+  function flushList() {
+    if (currentList) {
+      container.appendChild(currentList);
+      currentList = null;
+    }
+  }
+}
+
+loadReport();
+</script>
+</body>
+</html>
