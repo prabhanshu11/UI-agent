@@ -574,6 +574,13 @@ def _daemon_motion_loop():
     velocity_history: list[tuple[float, float, float]] = []  # (dx, dy, timestamp)
     MAX_VELOCITY_SAMPLES = 5
 
+    # Consecutive blob rejection counter: breaks the self-reinforcing
+    # false lock where sil_template + CNN validate a wrong position
+    # (e.g. a UI element that looks cursor-like) while real cursor blobs
+    # are consistently rejected for being too far away.
+    _blob_reject_streak = 0
+    _BLOB_REJECT_RESET_THRESHOLD = 8  # after 8 rejected frames, reset position
+
     # Persistent blob filter: detects UI animations (clocks, tickers, etc.)
     # Grid of 48x27 cells (40px each at 1920x1080). Each cell tracks
     # consecutive frames where blobs appear in that region.
@@ -734,6 +741,11 @@ def _daemon_motion_loop():
 
             primary_blob = None
             if cursor_blobs:
+                _pos_age = (now - pos.timestamp) if pos else 999
+                if len(cursor_blobs) >= 1 and _pos_age > 2:
+                    _cb0 = cursor_blobs[0]
+                    print(f"[blob_sel] {len(cursor_blobs)} blobs, pos_age={_pos_age:.1f}s, "
+                          f"blob0=({_cb0.centroid[0]},{_cb0.centroid[1]}) px={_cb0.pixel_count}")
                 if pos and (now - pos.timestamp < 10):
                     # Predict next position from motion trail (replaces inline velocity_history)
                     pred_x, pred_y = motion_trail.extrapolate(dt=0.0)
@@ -764,6 +776,38 @@ def _daemon_motion_loop():
                     # cursor moves further between frames
                     _vel_est = motion_trail.speed_estimate(window_s=0.5)
                     blob_dist_limit = min(800, 300 + _vel_est * 0.3)
+                    if dist >= blob_dist_limit and len(cursor_blobs) >= 1:
+                        _blob_reject_streak += 1
+                        if _blob_reject_streak % 5 == 1:
+                            print(f"[blob_sel] REJECT streak={_blob_reject_streak}: "
+                                  f"dist={dist:.0f} > limit={blob_dist_limit:.0f} "
+                                  f"pos=({pos.x},{pos.y}) blob=({best.centroid[0]},{best.centroid[1]})")
+                        # Break false lock: if blobs consistently appear far
+                        # from tracker, the tracker is wrong. Reset to the
+                        # blob centroid and let tracking restart fresh.
+                        if _blob_reject_streak >= _BLOB_REJECT_RESET_THRESHOLD:
+                            bx, by = best.centroid
+                            print(f"[blob_sel] FALSE LOCK BREAK: {_blob_reject_streak} "
+                                  f"consecutive rejects. Resetting from ({pos.x},{pos.y}) "
+                                  f"to blob ({bx},{by})")
+                            _blob_reject_streak = 0
+                            # Full state reset to break the self-reinforcing
+                            # loop: sil_template + CNN + lockouts all collude
+                            # to keep the wrong position "trusted".
+                            state.cursor_validated = False
+                            state.cnn_confidence = 0.0
+                            state.silhouette_confidence = 0.0
+                            state.silhouette_latency_ms = 999.0
+                            _cnn_lockout_until = 0.0
+                            _cnn_urgent_recheck = False
+                            velocity_history.clear()
+                            motion_trail.clear()
+                            if tracker:
+                                tracker.set_position(bx, by, method="blob_reset")
+                            pos = tracker.position
+                            if sil_tracker:
+                                sil_tracker.reset()
+                            primary_blob = best
                     if dist < blob_dist_limit:
                         # Silhouette confidence gate: if tracker is confident,
                         # reject blobs too far from silhouette position
@@ -831,7 +875,13 @@ def _daemon_motion_loop():
                             else:
                                 accept = False
 
+                        if not accept and dist < blob_dist_limit:
+                            print(f"[blob_sel] ACCEPT_BLOCKED: dist={dist:.0f} ok but rejected by post-checks "
+                                  f"blob=({best.centroid[0]},{best.centroid[1]}) px={best.pixel_count}")
                         if accept:
+                            _blob_reject_streak = 0  # Reset streak on acceptance
+                            print(f"[blob_sel] ACCEPTED: ({best.centroid[0]},{best.centroid[1]}) "
+                                  f"px={best.pixel_count} dist={dist:.0f}")
                             primary_blob = best
                             bx, by = best.centroid
                             # Feed motion trail (unified position history)
@@ -857,6 +907,11 @@ def _daemon_motion_loop():
                 else:
                     # No known position — use Vision as anchor if recent,
                     # otherwise pick blob closest to typical cursor size
+                    _vl = now < _vision_lockout_until
+                    _va = state.vision_x > 0 and state.vision_timestamp > 0 and now - state.vision_timestamp < 120
+                    print(f"[blob_sel] ELSE: cnn_urgent={_cnn_urgent_recheck} "
+                          f"vision_lock={_vl} vision_anchor={_va} "
+                          f"blobs={len(cursor_blobs)}")
                     if _cnn_urgent_recheck:
                         # CNN-guided blob discovery: scan cursor-sized blobs
                         # with CNN to find the cursor among noise.
@@ -917,6 +972,8 @@ def _daemon_motion_loop():
                         best = min(cursor_blobs, key=_cursor_likelihood)
                         primary_blob = best
                         bx, by = best.centroid
+                        print(f"[blob_sel] FALLBACK: picked blob ({bx},{by}) "
+                              f"px={best.pixel_count} from {len(cursor_blobs)} blobs")
                         velocity_history.clear()
                         if tracker:
                             tracker.set_position(bx, by, method="motion_track")
